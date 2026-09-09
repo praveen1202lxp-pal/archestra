@@ -115,3 +115,81 @@ def test_orchestrator_all_providers_unhealthy():
     assert result.task.status == TaskStatus.FAILED
     assert "unavailable" in result.final_answer.lower()
     db.close()
+
+
+def test_orchestrator_autonomous_edit_flow(tmp_path):
+    """Verify end-to-end autonomous editing loop with isolation, tests, and peer review."""
+    from unittest.mock import MagicMock, patch
+    from fusion_agent.models.deliberation import ReviewStatus
+    from fusion_agent.models.strategy import StrategyType
+    from fusion_agent.workspace.session import WorkspaceState
+    from fusion_agent.workspace.verifier import VerificationResult
+
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="EditTest")
+    config.project_root = str(tmp_path)
+
+    patch_output = "### File: src/math.py\n```python\ndef add(a, b):\n    return a + b\n```"
+    agent_1 = MockProvider(name="coder", default_response=patch_output)
+    agent_2 = MockProvider(name="reviewer", default_response="[APPROVED]\nLGTM, clean implementation.")
+
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    mock_verif = VerificationResult(
+        passed=True,
+        exit_code=0,
+        stdout="1 passed",
+        stderr="",
+        duration_seconds=0.1,
+        command="pytest",
+    )
+
+    with patch("fusion_agent.workspace.session.WorkspaceSession.prepare"), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.run_tests", return_value=mock_verif), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.get_diff", return_value="diff --git a/src/math.py b/src/math.py"):
+
+        result = orchestrator.run_task("Implement a math helper function in Python")
+
+        assert result.routing.strategy == StrategyType.AUTONOMOUS_EDIT
+        assert result.task.status == TaskStatus.COMPLETED
+        assert result.workspace_session is not None
+        assert result.verification_result.passed is True
+        assert result.diff is not None
+        assert result.review_result.status == ReviewStatus.APPROVED
+        assert "math.py" in result.final_answer
+
+    db.close()
+
+
+def test_orchestrator_autonomous_edit_dirty_tree_refusal(tmp_path):
+    """Verify strict refusal when starting autonomous edit on a dirty repository."""
+    from unittest.mock import patch
+    from fusion_agent.workspace.session import DirtyWorkingTreeError
+
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="DirtyRefusalTest")
+    config.project_root = str(tmp_path)
+
+    agent_1 = MockProvider(name="coder", default_response="code")
+    agent_2 = MockProvider(name="reviewer", default_response="review")
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    with patch(
+        "fusion_agent.workspace.session.WorkspaceSession.prepare",
+        side_effect=DirtyWorkingTreeError("Uncommitted changes detected in repo."),
+    ):
+        result = orchestrator.run_task("Implement a feature in Python")
+
+        assert result.task.status == TaskStatus.FAILED
+        assert "Uncommitted changes detected" in result.final_answer
+
+    db.close()
+

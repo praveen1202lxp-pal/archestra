@@ -49,6 +49,7 @@ class FusionConfig:
     optimization_mode: OptimizationMode = OptimizationMode.BALANCED
     agents: Dict[str, AgentConfig] = field(default_factory=dict)
     deliberation: DeliberationConfig = field(default_factory=DeliberationConfig)
+    verification_command: Optional[str] = None
     log_level: str = "INFO"
 
     def to_dict(self) -> Dict[str, Any]:

@@ -104,8 +104,8 @@ class TaskRouter:
             rationale = "High-complexity design benefits from cross-agent proposal and critique."
 
         elif task_type == TaskType.CODE_MODIFICATION:
-            base_strategy = StrategyType.EXECUTE_AND_REVIEW
-            rationale = "Code modification benefits from single implementation with cross-model review."
+            base_strategy = StrategyType.AUTONOMOUS_EDIT
+            rationale = "Code modification executes in an isolated workspace with test verification and peer diff review."
 
         else:
             base_strategy = StrategyType.EXECUTE_AND_REVIEW
@@ -116,7 +116,7 @@ class TaskRouter:
             if base_strategy in (StrategyType.PROPOSE_CRITIQUE_REFINE, StrategyType.INDEPENDENT_INVESTIGATION):
                 base_strategy = StrategyType.EXECUTE_AND_REVIEW
                 rationale += " (Adjusted to EXECUTE_AND_REVIEW for FASTEST mode)"
-            elif base_strategy == StrategyType.EXECUTE_AND_REVIEW:
+            elif base_strategy in (StrategyType.EXECUTE_AND_REVIEW, StrategyType.AUTONOMOUS_EDIT):
                 base_strategy = StrategyType.DIRECT
                 rationale += " (Adjusted to DIRECT for FASTEST mode)"
 

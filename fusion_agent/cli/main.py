@@ -10,7 +10,9 @@ from fusion_agent.config.loader import ConfigLoader
 from fusion_agent.config.schema import AgentConfig, FusionConfig, OptimizationMode
 from fusion_agent.core.orchestrator import FusionOrchestrator
 from fusion_agent.memory.database import Database
+from fusion_agent.models.deliberation import ReviewStatus
 from fusion_agent.providers.registry import ProviderRegistry
+from fusion_agent.workspace.promotion import PromotionEngine
 
 
 # Configure UTF-8 stdout/stderr on Windows if possible
@@ -183,6 +185,72 @@ def cmd_run(args) -> int:
     # Unified Single Agent Response
     print(f"\n{BOLD}{GREEN}Fusion:{RESET}")
     print(f"{result.final_answer}\n")
+
+    # Autonomous Edit Inspection & Mandatory User Confirmation Gate
+    if getattr(result, "workspace_session", None) is not None:
+        session = result.workspace_session
+        verif = result.verification_result
+        diff = result.diff
+        review = result.review_result
+        promo = PromotionEngine()
+
+        print(f"{BOLD}{CYAN}=== ISOLATED REPOSITORY EDIT INSPECTION ==={RESET}")
+        print(f"Task Branch:  {session.task_branch}")
+        print(f"Base Commit:  {session.base_commit[:8] if session.base_commit else 'unknown'}")
+
+        if verif:
+            v_color = GREEN if verif.passed else RED
+            print(f"Verification: {v_color}{'PASSED' if verif.passed else 'FAILED'}{RESET} (exit code {verif.exit_code}, {verif.duration_seconds:.2f}s)")
+            if verif.stderr:
+                print(f"{YELLOW}Test Stderr:{RESET}\n{verif.stderr}")
+
+        if review:
+            r_color = GREEN if review.status == ReviewStatus.APPROVED else RED
+            print(f"Peer Review:  {r_color}[{review.status.value}]{RESET} by {review.reviewer_agent}")
+            print(f"{BOLD}Comments:{RESET}\n{review.comments}")
+
+        if diff:
+            print(f"\n{BOLD}{YELLOW}--- GENERATED UNIFIED DIFF ---{RESET}")
+            print(diff)
+            print(f"{BOLD}{YELLOW}------------------------------{RESET}\n")
+        else:
+            print(f"\n{YELLOW}Notice: No file modifications detected in isolated worktree.{RESET}\n")
+
+        # Confirmation Gate: Requires tests passed, peer review approved, and non-empty diff
+        eligible = (
+            (verif is not None and verif.passed)
+            and (review is not None and review.status == ReviewStatus.APPROVED)
+            and bool(diff)
+        )
+
+        if eligible:
+            try:
+                target_b = getattr(session, "base_branch", "master") or "master"
+                prompt_msg = f"{BOLD}Apply and merge verified changes into branch '{target_b}'? [y/N]: {RESET}"
+                choice = input(prompt_msg).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                choice = "n"
+
+            if choice in ("y", "yes"):
+                res = promo.promote(session)
+                if res.success:
+                    print(f"\n{BOLD}{GREEN}[SUCCESS]{RESET} {res.message}\n")
+                else:
+                    print(f"\n{BOLD}{RED}[PROMOTION FAILED]{RESET} {res.message}\n")
+            else:
+                promo.discard(session)
+                print(f"\n{YELLOW}Promotion declined. Isolated worktree and branch cleanly discarded.{RESET}\n")
+        else:
+            promo.discard(session)
+            reasons = []
+            if not (verif and verif.passed):
+                reasons.append("automated verification failed")
+            if not (review and review.status == ReviewStatus.APPROVED):
+                reasons.append("peer review was not approved")
+            if not diff:
+                reasons.append("no modifications generated")
+            print(f"\n{RED}Changes not eligible for promotion ({', '.join(reasons)}). Isolated worktree discarded.{RESET}\n")
+
     return 0
 
 
