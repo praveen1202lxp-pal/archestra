@@ -24,7 +24,11 @@ from fusion_agent.providers.base import (
     HealthCheckResult,
     ReviewResponse,
 )
-from fusion_agent.providers.capabilities import ProviderCapabilities
+from fusion_agent.providers.capabilities import (
+    CapabilityStrength,
+    CostTier,
+    ProviderCapabilities,
+)
 from fusion_agent.providers.normalizer import (
     StructuredAgentOutput,
     StructuredOutputNormalizer,
@@ -198,6 +202,9 @@ class CodexCLIProvider(AgentProvider):
             reasoning=True,
             structured_output=True,
             streaming=False,
+            reasoning_strength=CapabilityStrength.HIGH,
+            coding_strength=CapabilityStrength.EXPERT,
+            review_strength=CapabilityStrength.HIGH,
             tool_calling=False,
             repository_read=True,
             repository_write=False,
@@ -205,10 +212,13 @@ class CodexCLIProvider(AgentProvider):
             git=False,
             local=False,
             is_cli=True,
+            cost_tier=CostTier.SUBSCRIPTION,
             context_window=200_000,
+            typical_latency_ms=22_000.0,
+            native_token_baseline=15_000,
             estimated_cost_per_1k_input=0.0,  # Uses existing subscription
             estimated_cost_per_1k_output=0.0,
-            preferred_task_types=["ARCHITECTURE_DESIGN", "CODE_REVIEW", "BUG_INVESTIGATION"],
+            preferred_task_types=["CODE_MODIFICATION", "CODE_REVIEW", "ARCHITECTURE_DESIGN", "BUG_INVESTIGATION"],
         )
 
     def _execute_cli(self, prompt: str, cwd: Optional[str] = None) -> CodexExecutionResult:

@@ -36,6 +36,13 @@ class Database:
         conn = self._connection or sqlite3.connect(self.db_path)
         with conn:
             conn.executescript(CREATE_TABLES_SQL)
+            # Ensure new columns exist on existing databases
+            for col in ("verification_passed INTEGER DEFAULT 0", "repair_rounds INTEGER DEFAULT 0"):
+                try:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {col};")
+                except sqlite3.OperationalError:
+                    pass
+
             cursor = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;")
             row = cursor.fetchone()
             if not row:

@@ -23,7 +23,11 @@ from fusion_agent.providers.base import (
     HealthCheckResult,
     ReviewResponse,
 )
-from fusion_agent.providers.capabilities import ProviderCapabilities
+from fusion_agent.providers.capabilities import (
+    CapabilityStrength,
+    CostTier,
+    ProviderCapabilities,
+)
 from fusion_agent.providers.normalizer import StructuredAgentOutput, StructuredOutputNormalizer
 
 
@@ -189,6 +193,9 @@ class AntigravityCLIProvider(AgentProvider):
             reasoning=True,
             structured_output=True,
             streaming=False,
+            reasoning_strength=CapabilityStrength.HIGH,
+            coding_strength=CapabilityStrength.HIGH,
+            review_strength=CapabilityStrength.HIGH,
             tool_calling=False,
             repository_read=True,
             repository_write=False,
@@ -196,10 +203,13 @@ class AntigravityCLIProvider(AgentProvider):
             git=False,
             local=False,
             is_cli=True,
+            cost_tier=CostTier.SUBSCRIPTION,
             context_window=1_000_000,
+            typical_latency_ms=35_000.0,
+            native_token_baseline=20_000,
             estimated_cost_per_1k_input=0.0,
             estimated_cost_per_1k_output=0.0,
-            preferred_task_types=["ARCHITECTURE_DESIGN", "CODE_REVIEW", "BUG_INVESTIGATION"],
+            preferred_task_types=["ARCHITECTURE_DESIGN", "CODE_REVIEW", "BUG_INVESTIGATION", "CODE_MODIFICATION"],
         )
 
     def _execute_cli(self, prompt: str, cwd: Optional[str] = None) -> CLIExecutionResult:

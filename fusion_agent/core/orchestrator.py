@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from fusion_agent.config.schema import FusionConfig
+from fusion_agent.core.budget import TaskBudgetController
 from fusion_agent.core.deliberation import DeliberationEngine
 from fusion_agent.core.router import RoutingDecision, TaskRouter
 from fusion_agent.memory.database import Database
@@ -91,12 +92,25 @@ class FusionOrchestrator:
     def _run_autonomous_edit(
         self,
         task: Task,
-        primary_agent: AgentProvider,
-        secondary_agent: Optional[AgentProvider],
-        context: Optional[Any],
-        emit: Callable,
+        primary_agent: Optional[AgentProvider] = None,
+        secondary_agent: Optional[AgentProvider] = None,
+        context: Optional[Any] = None,
+        emit: Optional[Callable] = None,
+        implementer: Optional[AgentProvider] = None,
+        reviewer: Optional[AgentProvider] = None,
+        budget: Optional[TaskBudgetController] = None,
     ) -> Tuple[DeliberationResult, WorkspaceSession, VerificationResult, str, Optional[ReviewResult]]:
         """Execute safe repository editing loop within an isolated worktree."""
+        impl = implementer or primary_agent
+        if not impl:
+            raise ValueError("An implementer provider must be specified for autonomous edit.")
+        rev = reviewer if reviewer is not None else secondary_agent
+
+        if emit is None:
+            emit = lambda event, data: None
+        if budget is None:
+            budget = TaskBudgetController(self.config.deliberation)
+
         repo_path = Path(self.config.project_root).resolve()
         session = WorkspaceSession(task_id=task.id, repo_root=repo_path)
 
@@ -108,17 +122,18 @@ class FusionOrchestrator:
         broker = ExecutionBroker(session)
         verifier = WorkspaceVerifier()
 
-        max_repair_rounds = getattr(self.config.deliberation, "max_repair_rounds", 2)
-        max_provider_calls = getattr(self.config.deliberation, "max_provider_calls", getattr(self.config.deliberation, "max_model_calls", 8))
         max_feedback_chars = getattr(self.config.deliberation, "max_feedback_chars", 2000)
-        total_provider_calls = 0
 
         stage_metrics: List[Dict[str, Any]] = []
         proposals: List[Proposal] = []
         reviews: List[ReviewResult] = []
 
-        # 2. Structured patch formulation from primary agent (Initial Implementation)
-        emit("status", {"message": f"{primary_agent.name} is formulating structured code modifications..."})
+        # 2. Structured patch formulation from implementer (Initial Implementation)
+        can_call, call_reason = budget.can_call_provider()
+        if not can_call:
+            raise RuntimeError(f"Budget ceiling reached before implementation: {call_reason}")
+
+        emit("status", {"message": f"{impl.name} is formulating structured code modifications..."})
         patch_prompt = (
             f"Task: {task.title}\n{task.description}\n\n"
             "RESPONSE CONTRACT:\n"
@@ -131,13 +146,19 @@ class FusionOrchestrator:
             "Provide complete, valid, syntactically correct code. Do not use placeholder comments."
         )
         t_start = time.perf_counter()
-        prop_resp = primary_agent.invoke(patch_prompt, context=context)
+        prop_resp = impl.invoke(patch_prompt, context=context)
         t_prop = (time.perf_counter() - t_start) * 1000.0
-        total_provider_calls += 1
+        budget.record_call(
+            provider_name=impl.name,
+            duration_ms=prop_resp.duration_ms or t_prop,
+            input_tokens=prop_resp.input_tokens,
+            output_tokens=prop_resp.output_tokens,
+            stage="Initial Implementation",
+        )
 
         proposals.append(
             Proposal(
-                agent_name=primary_agent.name,
+                agent_name=impl.name,
                 summary="Initial implementation patch",
                 content=prop_resp.content,
                 duration_ms=prop_resp.duration_ms or t_prop,
@@ -147,7 +168,7 @@ class FusionOrchestrator:
         )
         stage_metrics.append({
             "stage": "Initial Implementation",
-            "provider": primary_agent.name,
+            "provider": impl.name,
             "role": "proposer",
             "duration_ms": prop_resp.duration_ms or t_prop,
             "input_tokens": prop_resp.input_tokens,
@@ -170,8 +191,9 @@ class FusionOrchestrator:
 
         # 6. Peer review diff (Round 1)
         review_result = None
-        if secondary_agent and total_provider_calls < max_provider_calls:
-            emit("status", {"message": f"{secondary_agent.name} is conducting peer diff review (Round 1)..."})
+        can_rev, _ = budget.can_call_provider()
+        if rev and can_rev:
+            emit("status", {"message": f"{rev.name} is conducting peer diff review (Round 1)..."})
             rev_content = (
                 f"### UNIFIED DIFF\n{diff if diff else 'No changes detected in worktree.'}\n\n"
                 f"### VERIFICATION RESULT\n"
@@ -179,12 +201,12 @@ class FusionOrchestrator:
                 f"Exit Code: {verif_result.exit_code}\n"
             )
             if verif_result.stderr:
-                rev_content += f"Stderr:\n{verif_result.stderr}\n"
+                rev_content += f"Stderr:\n{verif_result.stderr[:1000]}\n"
             if verif_result.stdout:
-                rev_content += f"Stdout:\n{verif_result.stdout}\n"
+                rev_content += f"Stdout:\n{verif_result.stdout[:1000]}\n"
 
             t_start = time.perf_counter()
-            review_resp = secondary_agent.review(
+            review_resp = rev.review(
                 content=rev_content,
                 criteria=(
                     "Evaluate git diff and test results thoroughly for correctness, security, syntax, edge cases, and regressions. "
@@ -194,11 +216,17 @@ class FusionOrchestrator:
                 context=context,
             )
             t_rev = (time.perf_counter() - t_start) * 1000.0
-            total_provider_calls += 1
+            budget.record_call(
+                provider_name=rev.name,
+                duration_ms=review_resp.duration_ms or t_rev,
+                input_tokens=review_resp.input_tokens,
+                output_tokens=review_resp.output_tokens,
+                stage="Review Round 1",
+            )
 
             review_result = ReviewResult(
-                reviewer_agent=secondary_agent.name,
-                subject_agent=primary_agent.name,
+                reviewer_agent=rev.name,
+                subject_agent=impl.name,
                 status=review_resp.status,
                 comments=review_resp.comments,
                 suggested_fixes=review_resp.suggested_fixes,
@@ -209,7 +237,7 @@ class FusionOrchestrator:
             reviews.append(review_result)
             stage_metrics.append({
                 "stage": "Review Round 1",
-                "provider": secondary_agent.name,
+                "provider": rev.name,
                 "role": "critic",
                 "duration_ms": review_resp.duration_ms or t_rev,
                 "input_tokens": review_resp.input_tokens,
@@ -218,7 +246,7 @@ class FusionOrchestrator:
         else:
             review_result = ReviewResult(
                 reviewer_agent="System",
-                subject_agent=primary_agent.name,
+                subject_agent=impl.name,
                 status=ReviewStatus.APPROVED if verif_result.passed else ReviewStatus.NEEDS_REVISION,
                 comments="Automated verification passed." if verif_result.passed else "Automated verification failed.",
             )
@@ -228,12 +256,17 @@ class FusionOrchestrator:
         repair_rounds = 0
         while (
             (review_result.status == ReviewStatus.NEEDS_REVISION or not verif_result.passed)
-            and repair_rounds < max_repair_rounds
-            and total_provider_calls < max_provider_calls
+            and budget.can_attempt_repair(repair_rounds)[0]
         ):
+            can_call, call_reason = budget.can_call_provider()
+            if not can_call:
+                emit("status", {"message": f"Budget ceiling reached ({call_reason}); halting repair loop."})
+                break
+
             repair_rounds += 1
+            budget.record_repair_round()
             bounded_critique = review_result.comments[:max_feedback_chars]
-            emit("status", {"message": f"Peer review requested revision. {primary_agent.name} is attempting targeted repair (Round {repair_rounds}/{max_repair_rounds})..."})
+            emit("status", {"message": f"Peer review requested revision. {impl.name} is attempting targeted repair (Round {repair_rounds}/{budget.max_repair_rounds})..."})
 
             repair_prompt = (
                 f"Task: {task.title}\n{task.description}\n\n"
@@ -245,9 +278,9 @@ class FusionOrchestrator:
                 f"Command: {verif_result.command}\n"
             )
             if verif_result.stderr:
-                repair_prompt += f"Stderr:\n{verif_result.stderr}\n"
+                repair_prompt += f"Stderr:\n{verif_result.stderr[:1000]}\n"
             if verif_result.stdout:
-                repair_prompt += f"Stdout:\n{verif_result.stdout}\n"
+                repair_prompt += f"Stdout:\n{verif_result.stdout[:1000]}\n"
             repair_prompt += (
                 f"\n### CURRENT UNIFIED DIFF:\n"
                 f"{diff if diff else 'None'}\n\n"
@@ -261,13 +294,20 @@ class FusionOrchestrator:
             )
 
             t_start = time.perf_counter()
-            repair_resp = primary_agent.invoke(repair_prompt, context=context)
+            # Token containment: Pass context=None on repair rounds to avoid duplicating static architecture snapshot
+            repair_resp = impl.invoke(repair_prompt, context=None)
             t_repair = (time.perf_counter() - t_start) * 1000.0
-            total_provider_calls += 1
+            budget.record_call(
+                provider_name=impl.name,
+                duration_ms=repair_resp.duration_ms or t_repair,
+                input_tokens=repair_resp.input_tokens,
+                output_tokens=repair_resp.output_tokens,
+                stage=f"Repair Round {repair_rounds}",
+            )
 
             proposals.append(
                 Proposal(
-                    agent_name=primary_agent.name,
+                    agent_name=impl.name,
                     summary=f"Repair Round {repair_rounds}",
                     content=repair_resp.content,
                     duration_ms=repair_resp.duration_ms or t_repair,
@@ -277,7 +317,7 @@ class FusionOrchestrator:
             )
             stage_metrics.append({
                 "stage": f"Repair Round {repair_rounds}",
-                "provider": primary_agent.name,
+                "provider": impl.name,
                 "role": "proposer",
                 "duration_ms": repair_resp.duration_ms or t_repair,
                 "input_tokens": repair_resp.input_tokens,
@@ -295,9 +335,10 @@ class FusionOrchestrator:
             verif_result = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
             diff = verifier.get_diff(session)
 
-            if secondary_agent and total_provider_calls < max_provider_calls:
+            can_rev, _ = budget.can_call_provider()
+            if rev and can_rev:
                 review_round_num = repair_rounds + 1
-                emit("status", {"message": f"{secondary_agent.name} is re-reviewing updated diff (Round {review_round_num})..."})
+                emit("status", {"message": f"{rev.name} is re-reviewing updated diff (Round {review_round_num})..."})
                 rev_content = (
                     f"### UNIFIED DIFF (After Repair Round {repair_rounds})\n{diff if diff else 'No changes detected in worktree.'}\n\n"
                     f"### VERIFICATION RESULT\n"
@@ -305,12 +346,12 @@ class FusionOrchestrator:
                     f"Exit Code: {verif_result.exit_code}\n"
                 )
                 if verif_result.stderr:
-                    rev_content += f"Stderr:\n{verif_result.stderr}\n"
+                    rev_content += f"Stderr:\n{verif_result.stderr[:1000]}\n"
                 if verif_result.stdout:
-                    rev_content += f"Stdout:\n{verif_result.stdout}\n"
+                    rev_content += f"Stdout:\n{verif_result.stdout[:1000]}\n"
 
                 t_start = time.perf_counter()
-                review_resp = secondary_agent.review(
+                review_resp = rev.review(
                     content=rev_content,
                     criteria=(
                         "Evaluate git diff and test results thoroughly for correctness, security, syntax, edge cases, and regressions. "
@@ -320,11 +361,17 @@ class FusionOrchestrator:
                     context=context,
                 )
                 t_rev = (time.perf_counter() - t_start) * 1000.0
-                total_provider_calls += 1
+                budget.record_call(
+                    provider_name=rev.name,
+                    duration_ms=review_resp.duration_ms or t_rev,
+                    input_tokens=review_resp.input_tokens,
+                    output_tokens=review_resp.output_tokens,
+                    stage=f"Review Round {review_round_num}",
+                )
 
                 review_result = ReviewResult(
-                    reviewer_agent=secondary_agent.name,
-                    subject_agent=primary_agent.name,
+                    reviewer_agent=rev.name,
+                    subject_agent=impl.name,
                     status=review_resp.status,
                     comments=review_resp.comments,
                     suggested_fixes=review_resp.suggested_fixes,
@@ -335,16 +382,16 @@ class FusionOrchestrator:
                 reviews.append(review_result)
                 stage_metrics.append({
                     "stage": f"Review Round {review_round_num}",
-                    "provider": secondary_agent.name,
+                    "provider": rev.name,
                     "role": "critic",
                     "duration_ms": review_resp.duration_ms or t_rev,
                     "input_tokens": review_resp.input_tokens,
                     "output_tokens": review_resp.output_tokens,
                 })
-            elif not secondary_agent:
+            elif not rev:
                 review_result = ReviewResult(
                     reviewer_agent="System",
-                    subject_agent=primary_agent.name,
+                    subject_agent=impl.name,
                     status=ReviewStatus.APPROVED if verif_result.passed else ReviewStatus.NEEDS_REVISION,
                     comments="Automated verification passed." if verif_result.passed else "Automated verification failed.",
                 )
@@ -368,7 +415,7 @@ class FusionOrchestrator:
             synthesized_output=summary_msg,
             proposals=proposals,
             reviews=reviews,
-            participating_providers=[primary_agent.name] + ([secondary_agent.name] if secondary_agent else []),
+            participating_providers=[impl.name] + ([rev.name] if rev else []),
             rounds_executed=repair_rounds + 1,
             total_input_tokens=tot_in,
             total_output_tokens=tot_out,
@@ -403,6 +450,9 @@ class FusionOrchestrator:
             "primary": routing.primary_provider,
             "secondary": routing.secondary_provider,
             "rationale": routing.rationale,
+            "task_assessment": routing.task_assessment.to_dict() if routing.task_assessment else None,
+            "role_assignments": routing.role_assignments,
+            "scoring_breakdown": routing.scoring_breakdown,
         })
 
         # 2. Record Task in SQLite
@@ -420,10 +470,21 @@ class FusionOrchestrator:
         context = self.state_manager.build_context_snapshot(self.project["id"], current_task=task)
 
         # 4. Resolve Providers & Health Verification
-        primary_agent = self.providers.get(routing.primary_provider)
+        budget = TaskBudgetController(self.config.deliberation)
+
+        impl_key = routing.role_assignments.get("implementer") or routing.primary_provider
+        rev_key = routing.role_assignments.get("reviewer") or routing.secondary_provider
+        lead_key = routing.role_assignments.get("lead") or routing.primary_provider
+
+        implementer_agent = self.providers.get(impl_key)
+        reviewer_agent = self.providers.get(rev_key) if rev_key else None
+        lead_agent = self.providers.get(lead_key)
+
+        primary_agent = implementer_agent if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_agent
+        secondary_agent = reviewer_agent
+
         if not primary_agent:
-            raise RuntimeError(f"Primary provider '{routing.primary_provider}' not found.")
-        secondary_agent = self.providers.get(routing.secondary_provider) if routing.secondary_provider else None
+            raise RuntimeError(f"Primary provider '{impl_key if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_key}' not found.")
 
         active_strategy = routing.strategy
         health_primary = primary_agent.health_check()
@@ -465,10 +526,11 @@ class FusionOrchestrator:
                 deliberation, workspace_session, verification_result, diff, review_result = (
                     self._run_autonomous_edit(
                         task=task,
-                        primary_agent=primary_agent,
-                        secondary_agent=secondary_agent,
+                        implementer=implementer_agent,
+                        reviewer=reviewer_agent,
                         context=context,
                         emit=emit,
+                        budget=budget,
                     )
                 )
             except DirtyWorkingTreeError as exc:
@@ -604,7 +666,12 @@ class FusionOrchestrator:
 
         # 7. Update Task Status
         task.status = TaskStatus.COMPLETED
-        self.state_manager.update_task_status(task.id, TaskStatus.COMPLETED)
+        self.state_manager.update_task_status(
+            task.id,
+            TaskStatus.COMPLETED,
+            verification_passed=(verification_result.passed if verification_result else True),
+            repair_rounds=getattr(deliberation, "rounds_executed", 1) - 1 if deliberation else 0,
+        )
         emit("status", {"message": "Task completed successfully."})
 
         return OrchestratorResult(

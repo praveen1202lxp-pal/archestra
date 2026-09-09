@@ -145,6 +145,15 @@ def cmd_run(args) -> int:
             print(f"  {BLUE}{ICON_BULLET}{RESET} {data.get('message')}")
         elif event_type == "deliberation_step":
             print(f"    {GRAY}{ICON_ARROW} {data.get('step')}{RESET}")
+        elif event_type == "routing_decision":
+            roles = data.get("role_assignments", {})
+            impl = roles.get("implementer") or data.get("primary")
+            rev = roles.get("reviewer") or data.get("secondary")
+            print(f"  {CYAN}{ICON_ARROW} Strategy: {data.get('strategy')} | Implementer: {impl} | Reviewer: {rev or 'None'}{RESET}")
+            if data.get("task_assessment"):
+                ass = data["task_assessment"]
+                print(f"    {GRAY}Assessment: {ass.get('task_type')} | Complexity: {ass.get('complexity')} | Scope: {ass.get('estimated_scope')} | Risk: {ass.get('review_risk')}{RESET}")
+            print(f"    {GRAY}Rationale: {data.get('rationale')}{RESET}")
         elif event_type == "routing" and args.debug:
             print(f"  {YELLOW}[DEBUG Router]{RESET} Strategy: {data.get('strategy')} | Complexity: {data.get('complexity')}")
             print(f"    Rationale: {data.get('rationale')}")

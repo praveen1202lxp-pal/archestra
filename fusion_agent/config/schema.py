@@ -30,7 +30,7 @@ class AgentConfig:
 
 @dataclass
 class DeliberationConfig:
-    """Limits and guardrails for multi-agent deliberation and review repair loops."""
+    """Limits and guardrails for multi-agent deliberation, budget control, and review repair loops."""
     max_rounds: int = 3
     max_repair_rounds: int = 2          # Maximum iterations of patch-review-repair
     max_provider_calls: int = 8         # Hard ceiling on total provider calls per task
@@ -38,6 +38,11 @@ class DeliberationConfig:
     max_feedback_chars: int = 2000      # Bounds reviewer feedback passed into repair prompt
     timeout_seconds: float = 120.0      # Per-stage timeout ceiling
     auto_synthesize: bool = True
+    max_total_input_tokens: Optional[int] = None    # Optional ceiling on native input tokens
+    max_total_output_tokens: Optional[int] = None   # Optional ceiling on native output tokens
+    max_task_duration_seconds: float = 300.0        # End-to-end task duration ceiling
+    max_premium_provider_calls: int = 4             # Ceiling on calls to paid/premium providers
+    skip_peer_review_for_low_risk: bool = True      # Skip second-model review if review risk is LOW
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

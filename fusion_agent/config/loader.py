@@ -78,6 +78,11 @@ class ConfigLoader:
             max_feedback_chars=delib_raw.get("max_feedback_chars", 2000),
             timeout_seconds=delib_raw.get("timeout_seconds", 120.0),
             auto_synthesize=delib_raw.get("auto_synthesize", True),
+            max_total_input_tokens=delib_raw.get("max_total_input_tokens"),
+            max_total_output_tokens=delib_raw.get("max_total_output_tokens"),
+            max_task_duration_seconds=delib_raw.get("max_task_duration_seconds", 300.0),
+            max_premium_provider_calls=delib_raw.get("max_premium_provider_calls", 4),
+            skip_peer_review_for_low_risk=delib_raw.get("skip_peer_review_for_low_risk", True),
         )
 
         # Optimization mode

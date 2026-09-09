@@ -134,23 +134,31 @@ class ProjectStateManager:
         task_id: str,
         status: TaskStatus,
         selected_strategy: Optional[str] = None,
+        verification_passed: Optional[bool] = None,
+        repair_rounds: Optional[int] = None,
     ) -> None:
-        """Update task status and optional completion timestamp."""
+        """Update task status and optional completion timestamp and metrics."""
         conn = self.db.connect()
         now = datetime.now(timezone.utc).isoformat()
         completed_at = now if status in (TaskStatus.COMPLETED, TaskStatus.FAILED) else None
         
+        updates = ["status = ?", "completed_at = ?"]
+        params: List[Any] = [status.value, completed_at]
+        
+        if selected_strategy:
+            updates.append("selected_strategy = ?")
+            params.append(selected_strategy)
+        if verification_passed is not None:
+            updates.append("verification_passed = ?")
+            params.append(1 if verification_passed else 0)
+        if repair_rounds is not None:
+            updates.append("repair_rounds = ?")
+            params.append(repair_rounds)
+            
+        params.append(task_id)
+        sql = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?;"
         with conn:
-            if selected_strategy:
-                conn.execute(
-                    "UPDATE tasks SET status = ?, selected_strategy = ?, completed_at = ? WHERE id = ?;",
-                    (status.value, selected_strategy, completed_at, task_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?;",
-                    (status.value, completed_at, task_id),
-                )
+            conn.execute(sql, params)
 
     def get_task(self, task_id: str) -> Optional[Task]:
         """Fetch a task by ID."""

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_type TEXT NOT NULL,
     complexity TEXT NOT NULL,
     selected_strategy TEXT,
+    verification_passed INTEGER DEFAULT 0,
+    repair_rounds INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id)
