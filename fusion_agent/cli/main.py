@@ -26,6 +26,7 @@ if sys.platform == "win32":
 # Terminal styling & cross-platform glyphs
 BOLD = "\033[1m"
 GREEN = "\033[92m"
+RED = "\033[91m"
 BLUE = "\033[94m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
