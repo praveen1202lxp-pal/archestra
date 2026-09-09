@@ -479,6 +479,10 @@ class FusionOrchestrator:
                     final_answer=err_msg,
                 )
             except Exception as exc:
+                try:
+                    WorkspaceSession(task_id=task.id, repo_root=Path(self.config.project_root).resolve()).teardown(delete_branch=True)
+                except Exception:
+                    pass
                 self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
                 task.status = TaskStatus.FAILED
                 err_msg = f"Autonomous edit failed: {exc}"

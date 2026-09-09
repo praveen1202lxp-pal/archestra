@@ -46,7 +46,7 @@ class CodexExecutionResult:
 class CodexCLIProvider(AgentProvider):
     """Adapter allowing Fusion Agent to orchestrate OpenAI's Codex CLI ('codex')."""
 
-    DEFAULT_TIMEOUT_SECONDS = 120.0
+    DEFAULT_TIMEOUT_SECONDS = 180.0
 
     # Common auth error patterns
     AUTH_ERROR_PATTERNS = [

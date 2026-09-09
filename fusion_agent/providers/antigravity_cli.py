@@ -45,7 +45,7 @@ class CLIExecutionResult:
 class AntigravityCLIProvider(AgentProvider):
     """Adapter allowing Fusion Agent to orchestrate Google's Antigravity CLI ('agy')."""
 
-    DEFAULT_TIMEOUT_SECONDS = 120.0
+    DEFAULT_TIMEOUT_SECONDS = 180.0
 
     # Output patterns indicating authentication or login requirements
     AUTH_ERROR_PATTERNS = [
@@ -323,10 +323,11 @@ class AntigravityCLIProvider(AgentProvider):
             sections.append(context.to_prompt_context())
 
         sections.append(f"### TASK\n{prompt}")
-        sections.append(
-            "Provide a concrete engineering analysis and solution with clear headings:\n"
-            "- **Summary**\n- **Findings**\n- **Proposal**\n- **Implementation Plan**\n- **Next Action**"
-        )
+        if "RESPONSE CONTRACT" not in prompt and "### File:" not in prompt:
+            sections.append(
+                "Provide a concrete engineering analysis and solution with clear headings:\n"
+                "- **Summary**\n- **Findings**\n- **Proposal**\n- **Implementation Plan**\n- **Next Action**"
+            )
 
         final_prompt = "\n\n".join(sections)
         exec_result = self._execute_cli(final_prompt)
