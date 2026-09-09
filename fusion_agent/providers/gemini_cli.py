@@ -292,7 +292,10 @@ class GeminiCLIProvider(AgentProvider):
 
         if context:
             if hasattr(context, "to_prompt_context"):
-                full_prompt_sections.append(context.to_prompt_context())
+                try:
+                    full_prompt_sections.append(context.to_prompt_context(include_task_requirements=False))
+                except TypeError:
+                    full_prompt_sections.append(context.to_prompt_context())
             else:
                 full_prompt_sections.append(str(context))
 

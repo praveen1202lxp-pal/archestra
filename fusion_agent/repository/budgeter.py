@@ -1,16 +1,17 @@
 """Strict, deterministic context budgeter and omission manifest tracker for Milestone 7."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fusion_agent.models.context import (
     CodeContext,
     ContextBudgetConfig,
+    ContextSliceType,
     OmissionManifest,
     SelectedFile,
     SymbolReference,
 )
 from fusion_agent.repository.indexer import RepositoryIndex
-from fusion_agent.repository.selector import RankedCandidate
+from fusion_agent.repository.selector import MatchConfidence, RankedCandidate
 
 
 class ContextBudgeter:
@@ -48,12 +49,22 @@ class ContextBudgeter:
             if not node:
                 continue
 
+            is_high_priority = getattr(candidate, "confidence", None) in (
+                MatchConfidence.EXPLICIT_PATH,
+                MatchConfidence.EXACT_SYMBOL,
+                MatchConfidence.EXACT_FILENAME,
+            )
+
             # Check max_files limit
             if len(selected_files) >= self.config.max_files:
-                omissions.omitted_files.append({
-                    "path": rel_path,
-                    "reason": f"Exceeded max_files budget ({self.config.max_files})",
-                })
+                if is_high_priority:
+                    omissions.omitted_files.append({
+                        "path": rel_path,
+                        "reason": f"Exceeded max_files budget ({self.config.max_files})",
+                        "high_priority": True,
+                    })
+                else:
+                    omissions.omitted_low_confidence_count += 1
                 continue
 
             # Retrieve content: worktree override takes precedence (e.g. during repair)
@@ -72,15 +83,49 @@ class ContextBudgeter:
             # Check if file fits within total_source_chars
             remaining_total_budget = self.config.total_source_chars - current_source_chars
             if remaining_total_budget <= 0:
-                omissions.omitted_files.append({
-                    "path": rel_path,
-                    "reason": f"Exceeded total_source_chars budget ({self.config.total_source_chars})",
-                })
+                if is_high_priority:
+                    omissions.omitted_files.append({
+                        "path": rel_path,
+                        "reason": f"Exceeded total_source_chars budget ({self.config.total_source_chars})",
+                        "high_priority": True,
+                    })
+                else:
+                    omissions.omitted_low_confidence_count += 1
                 continue
 
             effective_file_budget = min(self.config.max_chars_per_file, remaining_total_budget)
 
-            if orig_len <= effective_file_budget:
+            # Determine whether to use symbol slicing, convention slicing, or full file
+            cand_conf = getattr(candidate, "confidence", None)
+            file_symbols = symbols_by_file.get(rel_path, [])
+
+            if cand_conf == MatchConfidence.SIBLING_CONVENTION:
+                slice_type = ContextSliceType.CONVENTION_SLICE
+            elif file_symbols and orig_len > 2_000:
+                slice_type = ContextSliceType.SYMBOL_SLICE
+            else:
+                slice_type = ContextSliceType.FULL_FILE
+
+            if slice_type == ContextSliceType.SYMBOL_SLICE:
+                # Prefer matched function/class + nearby imports + +-30 lines
+                sliced_content, line_range = self._extract_symbol_slice(
+                    content=content,
+                    relevant_symbols=file_symbols,
+                    max_chars=effective_file_budget,
+                )
+                sf = SelectedFile(
+                    path=rel_path,
+                    content=sliced_content,
+                    language=node.language,
+                    relevance_reason=reasons_str,
+                    is_full_file=False,
+                    line_range=line_range,
+                    char_count=len(sliced_content),
+                    slice_type=ContextSliceType.SYMBOL_SLICE,
+                )
+                selected_files.append(sf)
+                current_source_chars += len(sliced_content)
+            elif orig_len <= effective_file_budget:
                 # File fits completely
                 sf = SelectedFile(
                     path=rel_path,
@@ -89,6 +134,7 @@ class ContextBudgeter:
                     relevance_reason=reasons_str,
                     is_full_file=True,
                     char_count=orig_len,
+                    slice_type=slice_type,
                 )
                 selected_files.append(sf)
                 current_source_chars += orig_len
@@ -97,7 +143,7 @@ class ContextBudgeter:
                 truncated_content, line_range = self._truncate_content(
                     content=content,
                     max_chars=effective_file_budget,
-                    relevant_symbols=symbols_by_file.get(rel_path, []),
+                    relevant_symbols=file_symbols,
                 )
                 sf = SelectedFile(
                     path=rel_path,
@@ -107,6 +153,7 @@ class ContextBudgeter:
                     is_full_file=False,
                     line_range=line_range,
                     char_count=len(truncated_content),
+                    slice_type=ContextSliceType.SYMBOL_SLICE if file_symbols else ContextSliceType.FULL_FILE,
                 )
                 selected_files.append(sf)
                 current_source_chars += len(truncated_content)
@@ -161,12 +208,51 @@ class ContextBudgeter:
         code_context.to_prompt_context()
         return code_context
 
+    def _extract_symbol_slice(
+        self,
+        content: str,
+        relevant_symbols: List[SymbolReference],
+        max_chars: int,
+    ) -> Tuple[str, Tuple[int, int]]:
+        """Extract symbol definition +-30 lines along with package header/imports."""
+        lines = content.splitlines(keepends=True)
+        total_lines = len(lines)
+
+        # 1. Capture file header / imports (lines 1 to 25)
+        header_lines = []
+        for i, line in enumerate(lines[:25], 1):
+            if line.strip().startswith(("import ", "from ", "#", '"""', "'''")) or not line.strip():
+                header_lines.append(line)
+            else:
+                break
+        header_text = "".join(header_lines)
+
+        # 2. Window around primary target symbol (+-30 lines)
+        sym = relevant_symbols[0]
+        target_line = sym.line_number
+        start_line = max(1, target_line - 30)
+        end_line = min(total_lines, target_line + 30)
+
+        body_lines = lines[start_line - 1 : end_line]
+        body_text = "".join(body_lines)
+
+        slice_text = (
+            f"# [SYMBOL_SLICE: Header / Imports]\n{header_text}\n"
+            f"# [SYMBOL_SLICE: Lines {start_line} to {end_line} of {total_lines} around {sym.kind} {sym.name}]\n"
+            f"{body_text}\n"
+            f"# [SYMBOL_SLICE: {total_lines - end_line} trailing lines omitted]"
+        )
+        if len(slice_text) > max_chars:
+            slice_text = slice_text[:max_chars - 50] + "\n# [TRUNCATED]"
+
+        return slice_text, (start_line, end_line)
+
     def _truncate_content(
         self,
         content: str,
         max_chars: int,
         relevant_symbols: List[SymbolReference],
-    ) -> tuple[str, Optional[tuple[int, int]]]:
+    ) -> Tuple[str, Optional[Tuple[int, int]]]:
         """Truncate content to respect budget while preserving symbol context when possible."""
         lines = content.splitlines(keepends=True)
         total_lines = len(lines)
@@ -174,7 +260,6 @@ class ContextBudgeter:
         # If a relevant symbol is known, try to center around it
         if relevant_symbols:
             target_line = relevant_symbols[0].line_number
-            # Take window around target line
             start_idx = max(0, target_line - 30)
             end_idx = min(total_lines, target_line + 70)
 

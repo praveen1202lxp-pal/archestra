@@ -332,7 +332,10 @@ class AntigravityCLIProvider(AgentProvider):
         ]
         if context:
             if hasattr(context, "to_prompt_context"):
-                sections.append(context.to_prompt_context())
+                try:
+                    sections.append(context.to_prompt_context(include_task_requirements=False))
+                except TypeError:
+                    sections.append(context.to_prompt_context())
             else:
                 sections.append(str(context))
 

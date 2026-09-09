@@ -245,16 +245,12 @@ def cmd_run(args) -> int:
             and (review is not None and review.status == ReviewStatus.APPROVED)
             and bool(diff)
         )
-
         if eligible:
-            if getattr(args, "yes", False):
-                choice = "y"
-            elif getattr(args, "no_promote", False):
+            if getattr(args, "no_promote", False):
                 choice = "n"
             else:
                 try:
-                    target_b = getattr(session, "base_branch", "master") or "master"
-                    prompt_msg = f"{BOLD}Apply and merge verified changes into branch '{target_b}'? [y/N]: {RESET}"
+                    prompt_msg = f"{BOLD}Apply verified changes? [y/N]: {RESET}"
                     choice = input(prompt_msg).strip().lower()
                 except (KeyboardInterrupt, EOFError):
                     choice = "n"
@@ -341,7 +337,6 @@ def main():
     # Run
     p_run = subparsers.add_parser("run", parents=[common_parser], help="Run a single task through Fusion Agent")
     p_run.add_argument("task", help="The programming task or question")
-    p_run.add_argument("-y", "--yes", action="store_true", help="Automatically accept promotion if verification and review pass")
     p_run.add_argument("--no-promote", action="store_true", help="Do not promote changes to base branch")
 
     # Interactive

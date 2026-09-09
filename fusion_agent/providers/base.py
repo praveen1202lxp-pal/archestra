@@ -26,12 +26,12 @@ class ContextSnapshot:
     code_context: Optional[Any] = None
     metrics: Dict[str, int] = field(default_factory=dict)
 
-    def to_prompt_context(self) -> str:
+    def to_prompt_context(self, include_task_requirements: bool = True) -> str:
         """Render context snapshot into a structured, bounded markdown prompt block."""
         sections = []
         if self.permanent_context.strip():
             sections.append(f"### PROJECT OVERVIEW & ARCHITECTURE\n{self.permanent_context.strip()}")
-        if self.current_context.strip():
+        if include_task_requirements and self.current_context.strip():
             sections.append(f"### CURRENT TASK & RELEVANT STATE\n{self.current_context.strip()}")
         if self.recent_context.strip():
             sections.append(f"### RECENT FINDINGS & DECISIONS\n{self.recent_context.strip()}")
@@ -39,7 +39,10 @@ class ContextSnapshot:
             sections.append(f"### PEER AGENT INPUT\n{self.peer_context.strip()}")
         if self.code_context is not None:
             if hasattr(self.code_context, "to_prompt_context"):
-                sections.append(self.code_context.to_prompt_context())
+                try:
+                    sections.append(self.code_context.to_prompt_context(include_task_requirements=include_task_requirements))
+                except TypeError:
+                    sections.append(self.code_context.to_prompt_context())
             else:
                 sections.append(str(self.code_context))
 

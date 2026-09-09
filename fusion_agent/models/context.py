@@ -1,7 +1,15 @@
 """Normalized CodeContext and context-budgeting data structures for Milestone 7."""
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+
+class ContextSliceType(str, Enum):
+    """Classification of context depth for a selected file."""
+    FULL_FILE = "FULL_FILE"
+    SYMBOL_SLICE = "SYMBOL_SLICE"
+    CONVENTION_SLICE = "CONVENTION_SLICE"
 
 
 @dataclass
@@ -14,6 +22,7 @@ class SelectedFile:
     is_full_file: bool = True
     line_range: Optional[Tuple[int, int]] = None
     char_count: int = 0
+    slice_type: ContextSliceType = ContextSliceType.FULL_FILE
 
     def __post_init__(self):
         if not self.char_count and self.content:
@@ -42,10 +51,11 @@ class ContextExpansionRequest:
 @dataclass
 class OmissionManifest:
     """Explicit record of files, symbols, or sections truncated or omitted to satisfy context budgets."""
-    omitted_files: List[Dict[str, str]] = field(default_factory=list)  # [{"path": ..., "reason": ...}]
+    omitted_files: List[Dict[str, Any]] = field(default_factory=list)  # [{"path": ..., "reason": ..., "high_priority": bool}]
     truncated_files: List[Dict[str, Any]] = field(default_factory=list)  # [{"path": ..., "original_chars": ..., "included_chars": ..., "reason": ...}]
     omitted_test_output_chars: int = 0
     omitted_peer_feedback_chars: int = 0
+    omitted_low_confidence_count: int = 0
 
     @property
     def has_omissions(self) -> bool:
@@ -54,6 +64,7 @@ class OmissionManifest:
             or self.truncated_files
             or self.omitted_test_output_chars > 0
             or self.omitted_peer_feedback_chars > 0
+            or self.omitted_low_confidence_count > 0
         )
 
 
@@ -82,22 +93,22 @@ class CodeContext:
     omissions: OmissionManifest = field(default_factory=OmissionManifest)
     metrics: Dict[str, Any] = field(default_factory=dict)
 
-    def to_prompt_context(self) -> str:
+    def to_prompt_context(self, include_task_requirements: bool = True) -> str:
         """Render CodeContext into a structured, bounded Markdown prompt block."""
         sections = []
 
-        # 1. Task Requirements
-        if self.task_requirements.strip():
+        # 1. Task Requirements (omitted if provider prompt already embeds task requirements to prevent duplication)
+        if include_task_requirements and self.task_requirements.strip():
             sections.append(f"### TASK REQUIREMENTS\n{self.task_requirements.strip()}")
 
         # 2. Selected Relevant Files
         if self.selected_files:
             file_blocks = []
             for sf in self.selected_files:
-                header = f"File: {sf.path}"
+                header = f"File: {sf.path} [{sf.slice_type.value}]"
                 if sf.line_range:
                     header += f" (Lines {sf.line_range[0]}-{sf.line_range[1]})"
-                if not sf.is_full_file:
+                if not sf.is_full_file and sf.slice_type == ContextSliceType.FULL_FILE:
                     header += " [Excerpt / Truncated]"
                 header += f" — Relevance: {sf.relevance_reason}"
 
@@ -136,11 +147,18 @@ class CodeContext:
         if self.peer_feedback and self.peer_feedback.strip():
             sections.append(f"### PEER REVIEW FEEDBACK\n{self.peer_feedback.strip()}")
 
-        # 8. Explicit Omission & Truncation Manifest (Zero Silent Truncation)
+        # 8. Compact Explicit Omission & Truncation Manifest (Zero Silent Truncation)
         if self.omissions.has_omissions:
             omission_lines = []
+            # Individually list high-priority items (explicit target, exact symbol match, security rejection)
             for om in self.omissions.omitted_files:
-                omission_lines.append(f"- Omitted file `{om.get('path')}`: {om.get('reason')}")
+                if om.get("high_priority") or om.get("is_explicit"):
+                    omission_lines.append(f"- Omitted target file `{om.get('path')}`: {om.get('reason')}")
+            # Compactly summarize low-confidence candidates to avoid prompt bloat
+            if self.omissions.omitted_low_confidence_count > 0:
+                omission_lines.append(
+                    f"- Omitted {self.omissions.omitted_low_confidence_count} lower-confidence repository candidates because they exceeded relevance/context thresholds."
+                )
             for tr in self.omissions.truncated_files:
                 omission_lines.append(
                     f"- Truncated file `{tr.get('path')}`: included {tr.get('included_chars')} of {tr.get('original_chars')} chars ({tr.get('reason')})"
@@ -149,15 +167,17 @@ class CodeContext:
                 omission_lines.append(f"- Truncated test output by {self.omissions.omitted_test_output_chars} characters to fit test output budget.")
             if self.omissions.omitted_peer_feedback_chars > 0:
                 omission_lines.append(f"- Truncated peer feedback by {self.omissions.omitted_peer_feedback_chars} characters to fit feedback budget.")
-            sections.append("### CONTEXT OMISSIONS & BOUNDS\n" + "\n".join(omission_lines))
+            if omission_lines:
+                sections.append("### CONTEXT OMISSIONS & BOUNDS\n" + "\n".join(omission_lines))
 
         rendered = "\n\n".join(sections)
+        total_omitted = len(self.omissions.omitted_files) + self.omissions.omitted_low_confidence_count
         self.metrics = {
             "fusion_context_chars": len(rendered),
             "fusion_context_tokens": max(1, len(rendered) // 4),
             "selected_files_count": len(self.selected_files),
             "relevant_symbols_count": len(self.relevant_symbols),
-            "omitted_files_count": len(self.omissions.omitted_files),
+            "omitted_files_count": total_omitted,
             "truncated_files_count": len(self.omissions.truncated_files),
         }
         return rendered

@@ -171,17 +171,17 @@ class FusionOrchestrator:
         emit("status", {"message": f"Constructed bounded CodeContext ({len(selected_names)} files: {', '.join(selected_names) if selected_names else 'None'}, ~{ctx_tokens} tokens)."})
 
         emit("status", {"message": f"{impl.name} is formulating structured code modifications..."})
+        task_text = task.description if task.description == task.title or task.description.startswith(task.title) else f"{task.title}\n{task.description}"
         patch_prompt = (
-            f"Task: {task.title}\n{task.description}\n\n"
+            f"Task: {task_text.strip()}\n\n"
             "RESPONSE CONTRACT:\n"
-            "You are an expert autonomous software engineer. Formulate the exact file additions and modifications.\n"
-            "For each file to be created or modified, format strictly as:\n\n"
+            "Format file additions and modifications strictly as:\n"
             "### File: relative/path/to/file.ext\n"
             "```language\n"
             "full file content here\n"
-            "```\n\n"
-            "Provide complete, valid, syntactically correct code. Do not use placeholder comments.\n"
-            "If the supplied context is strictly insufficient to complete the task safely, respond with:\n"
+            "```\n"
+            "Provide complete, valid code without placeholder comments.\n"
+            "If context is strictly insufficient, respond:\n"
             "CONTEXT_INSUFFICIENT\n- need_file: path/to/file.ext (reason: why needed)"
         )
         t_start = time.perf_counter()
@@ -346,28 +346,26 @@ class FusionOrchestrator:
             emit("status", {"message": f"Peer review requested revision. {impl.name} is attempting targeted repair (Round {repair_rounds}/{budget.max_repair_rounds})..."})
 
             repair_prompt = (
-                f"Task: {task.title}\n{task.description}\n\n"
-                f"The previous implementation requires revision based on peer review and verification.\n\n"
+                f"Task: {task_text.strip()}\n\n"
+                f"Revision required based on peer review and verification:\n\n"
                 f"### PEER REVIEW CRITIQUE (Round {repair_rounds}):\n"
                 f"{bounded_critique}\n\n"
                 f"### VERIFICATION SUITE STATUS:\n"
-                f"Passed: {verif_result.passed}\n"
-                f"Command: {verif_result.command}\n"
+                f"Passed: {verif_result.passed} | Command: {verif_result.command}\n"
             )
             if verif_result.stderr:
-                repair_prompt += f"Stderr:\n{verif_result.stderr[:1000]}\n"
+                repair_prompt += f"Stderr:\n{verif_result.stderr[:800]}\n"
             if verif_result.stdout:
-                repair_prompt += f"Stdout:\n{verif_result.stdout[:1000]}\n"
+                repair_prompt += f"Stdout:\n{verif_result.stdout[:800]}\n"
             repair_prompt += (
                 f"\n### CURRENT UNIFIED DIFF:\n"
                 f"{diff if diff else 'None'}\n\n"
                 "RESPONSE CONTRACT:\n"
-                "Address all reviewer critiques and test failures. Provide the complete updated files formatted strictly as:\n\n"
+                "Address all critiques. Format updated files strictly as:\n"
                 "### File: relative/path/to/file.ext\n"
                 "```language\n"
                 "full updated file content\n"
-                "```\n\n"
-                "Provide complete, valid, syntactically correct code."
+                "```"
             )
 
             # Targeted repair context: extract post-patch file overrides from worktree
