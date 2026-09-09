@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fusion-agent"
+version = "0.1.0"
+description = "Provider-agnostic multi-model coding agent orchestrator"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Fusion Agent Contributors" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+fusion = "fusion_agent.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fusion_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
