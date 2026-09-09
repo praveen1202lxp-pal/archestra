@@ -10,6 +10,8 @@ from fusion_agent.core.deliberation import DeliberationEngine
 from fusion_agent.core.router import RoutingDecision, TaskRouter
 from fusion_agent.memory.database import Database
 from fusion_agent.memory.project_state import ProjectStateManager
+from fusion_agent.memory.provider_stats import ProviderStatsTracker
+from fusion_agent.models.context import CodeContext, ContextBudgetConfig, ContextExpansionRequest
 from fusion_agent.models.deliberation import (
     DeliberationResult,
     Proposal,
@@ -19,7 +21,12 @@ from fusion_agent.models.deliberation import (
 from fusion_agent.models.strategy import StrategyType
 from fusion_agent.models.task import Task, TaskStatus
 from fusion_agent.providers.base import AgentProvider
+from fusion_agent.providers.normalizer import StructuredOutputNormalizer
 from fusion_agent.providers.registry import ProviderRegistry
+from fusion_agent.repository.budgeter import ContextBudgeter
+from fusion_agent.repository.ignore import SecretFilter
+from fusion_agent.repository.indexer import RepositoryIndexer
+from fusion_agent.repository.selector import RankedCandidate, RelevantFileSelector
 from fusion_agent.workspace.broker import ExecutionBroker
 from fusion_agent.workspace.editor import WorkspaceEditor
 from fusion_agent.workspace.session import DirtyWorkingTreeError, WorkspaceSession, WorkspaceState
@@ -128,10 +135,40 @@ class FusionOrchestrator:
         proposals: List[Proposal] = []
         reviews: List[ReviewResult] = []
 
-        # 2. Structured patch formulation from implementer (Initial Implementation)
+        # 2. Structured patch formulation from implementer (Initial Implementation with Bounded CodeContext)
         can_call, call_reason = budget.can_call_provider()
         if not can_call:
             raise RuntimeError(f"Budget ceiling reached before implementation: {call_reason}")
+
+        # Deterministic repository indexing and relevant-file selection
+        emit("status", {"message": "Indexing repository and selecting relevant files deterministically..."})
+        indexer = RepositoryIndexer()
+        repo_index = indexer.index_project(repo_path)
+        selector = RelevantFileSelector(repo_index)
+        ranked_candidates, symbol_refs = selector.select_relevant_files(f"{task.title}\n{task.description}")
+
+        budget_cfg = ContextBudgetConfig(
+            max_files=getattr(self.config.deliberation, "context_max_files", 5),
+            max_chars_per_file=getattr(self.config.deliberation, "context_max_chars_per_file", 8000),
+            total_source_chars=getattr(self.config.deliberation, "context_total_source_chars", 24000),
+            max_test_output_chars=getattr(self.config.deliberation, "context_max_test_output_chars", 2000),
+            max_peer_feedback_chars=getattr(self.config.deliberation, "context_max_peer_feedback_chars", 2000),
+            max_architecture_chars=getattr(self.config.deliberation, "context_max_architecture_chars", 1000),
+            require_minimal_workspace=getattr(self.config.deliberation, "context_require_minimal_workspace", False),
+        )
+        budgeter = ContextBudgeter(budget_cfg)
+        arch_summary = context.permanent_context if (context and hasattr(context, "permanent_context")) else ""
+        code_context = budgeter.build_code_context(
+            task_requirements=f"{task.title}\n{task.description}",
+            ranked_candidates=ranked_candidates,
+            symbol_refs=symbol_refs,
+            index=repo_index,
+            architecture_decisions=arch_summary,
+        )
+
+        selected_names = [sf.path for sf in code_context.selected_files]
+        ctx_tokens = code_context.metrics.get("fusion_context_tokens", 0)
+        emit("status", {"message": f"Constructed bounded CodeContext ({len(selected_names)} files: {', '.join(selected_names) if selected_names else 'None'}, ~{ctx_tokens} tokens)."})
 
         emit("status", {"message": f"{impl.name} is formulating structured code modifications..."})
         patch_prompt = (
@@ -143,16 +180,51 @@ class FusionOrchestrator:
             "```language\n"
             "full file content here\n"
             "```\n\n"
-            "Provide complete, valid, syntactically correct code. Do not use placeholder comments."
+            "Provide complete, valid, syntactically correct code. Do not use placeholder comments.\n"
+            "If the supplied context is strictly insufficient to complete the task safely, respond with:\n"
+            "CONTEXT_INSUFFICIENT\n- need_file: path/to/file.ext (reason: why needed)"
         )
         t_start = time.perf_counter()
-        prop_resp = impl.invoke(patch_prompt, context=context)
+        prop_resp = impl.invoke(patch_prompt, context=code_context)
         t_prop = (time.perf_counter() - t_start) * 1000.0
+
+        # Check for Context Expansion Request
+        max_expansions = getattr(self.config.deliberation, "max_context_expansion_rounds", 1)
+        max_exp_files = getattr(self.config.deliberation, "max_expansion_files", 2)
+        expansion_req = StructuredOutputNormalizer.parse_context_expansion_request(prop_resp.content)
+        if expansion_req and max_expansions > 0 and budget.can_call_provider()[0]:
+            emit("status", {"message": f"{impl.name} requested context expansion: {expansion_req.requested_files or expansion_req.requested_symbols}. Validating..."})
+            added_candidates = []
+            for req_f in expansion_req.requested_files[:max_exp_files]:
+                norm_f = req_f.replace("\\", "/").strip("./")
+                is_secret, _ = SecretFilter.is_secret_or_sensitive(norm_f)
+                if not is_secret and norm_f in repo_index.file_tree:
+                    added_candidates.append(RankedCandidate(rel_path=norm_f, score=999.0, reasons=[f"Model requested expansion: {expansion_req.reason}"]))
+
+            if added_candidates:
+                expanded_candidates = added_candidates + [c for c in ranked_candidates if c.rel_path not in {a.rel_path for a in added_candidates}]
+                code_context = budgeter.build_code_context(
+                    task_requirements=f"{task.title}\n{task.description}",
+                    ranked_candidates=expanded_candidates,
+                    symbol_refs=symbol_refs,
+                    index=repo_index,
+                    architecture_decisions=arch_summary,
+                )
+                emit("status", {"message": f"Retrying {impl.name} with expanded context ({len(code_context.selected_files)} files)..."})
+                t_start = time.perf_counter()
+                prop_resp = impl.invoke(patch_prompt, context=code_context)
+                t_prop = (time.perf_counter() - t_start) * 1000.0
+
         budget.record_call(
             provider_name=impl.name,
             duration_ms=prop_resp.duration_ms or t_prop,
             input_tokens=prop_resp.input_tokens,
             output_tokens=prop_resp.output_tokens,
+            fusion_context_tokens=prop_resp.fusion_context_tokens or ctx_tokens,
+            reasoning_tokens=prop_resp.reasoning_tokens,
+            visible_output_tokens=prop_resp.visible_output_tokens,
+            cached_tokens=prop_resp.cached_tokens,
+            raw_usage=prop_resp.metadata.get("usage"),
             stage="Initial Implementation",
         )
 
@@ -221,6 +293,11 @@ class FusionOrchestrator:
                 duration_ms=review_resp.duration_ms or t_rev,
                 input_tokens=review_resp.input_tokens,
                 output_tokens=review_resp.output_tokens,
+                fusion_context_tokens=review_resp.fusion_context_tokens or (len(rev_content) // 4),
+                reasoning_tokens=review_resp.reasoning_tokens,
+                visible_output_tokens=review_resp.visible_output_tokens,
+                cached_tokens=review_resp.cached_tokens,
+                raw_usage=review_resp.metadata.get("usage"),
                 stage="Review Round 1",
             )
 
@@ -293,15 +370,54 @@ class FusionOrchestrator:
                 "Provide complete, valid, syntactically correct code."
             )
 
+            # Targeted repair context: extract post-patch file overrides from worktree
+            worktree_overrides: Dict[str, str] = {}
+            for mf in modified_files:
+                mf_path = session.worktree_path / mf
+                if mf_path.is_file():
+                    try:
+                        worktree_overrides[mf] = mf_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+
+            repair_candidates = [
+                RankedCandidate(rel_path=mf, score=100.0, reasons=["Modified file in worktree under targeted repair"])
+                for mf in modified_files
+                if (session.worktree_path / mf).is_file()
+            ]
+
+            test_fail_output = ""
+            if verif_result.stderr:
+                test_fail_output += f"Stderr:\n{verif_result.stderr}\n"
+            if verif_result.stdout:
+                test_fail_output += f"Stdout:\n{verif_result.stdout}\n"
+
+            repair_code_context = budgeter.build_code_context(
+                task_requirements=f"{task.title}\n{task.description}",
+                ranked_candidates=repair_candidates,
+                symbol_refs=[s for s in symbol_refs if s.file_path in modified_files],
+                index=repo_index,
+                architecture_decisions="",  # Token containment: omit broad architecture during repair
+                test_failures=test_fail_output if not verif_result.passed else None,
+                current_diff=diff,
+                peer_feedback=bounded_critique,
+                worktree_file_overrides=worktree_overrides,
+            )
+            repair_ctx_tokens = repair_code_context.metrics.get("fusion_context_tokens", 0)
+
             t_start = time.perf_counter()
-            # Token containment: Pass context=None on repair rounds to avoid duplicating static architecture snapshot
-            repair_resp = impl.invoke(repair_prompt, context=None)
+            repair_resp = impl.invoke(repair_prompt, context=repair_code_context)
             t_repair = (time.perf_counter() - t_start) * 1000.0
             budget.record_call(
                 provider_name=impl.name,
                 duration_ms=repair_resp.duration_ms or t_repair,
                 input_tokens=repair_resp.input_tokens,
                 output_tokens=repair_resp.output_tokens,
+                fusion_context_tokens=repair_resp.fusion_context_tokens or repair_ctx_tokens,
+                reasoning_tokens=repair_resp.reasoning_tokens,
+                visible_output_tokens=repair_resp.visible_output_tokens,
+                cached_tokens=repair_resp.cached_tokens,
+                raw_usage=repair_resp.metadata.get("usage"),
                 stage=f"Repair Round {repair_rounds}",
             )
 
@@ -366,6 +482,11 @@ class FusionOrchestrator:
                     duration_ms=review_resp.duration_ms or t_rev,
                     input_tokens=review_resp.input_tokens,
                     output_tokens=review_resp.output_tokens,
+                    fusion_context_tokens=review_resp.fusion_context_tokens or (len(rev_content) // 4),
+                    reasoning_tokens=review_resp.reasoning_tokens,
+                    visible_output_tokens=review_resp.visible_output_tokens,
+                    cached_tokens=review_resp.cached_tokens,
+                    raw_usage=review_resp.metadata.get("usage"),
                     stage=f"Review Round {review_round_num}",
                 )
 
@@ -440,10 +561,13 @@ class FusionOrchestrator:
 
         # 1. Deterministic Task Routing
         emit("status", {"message": "Analyzing task complexity and routing..."})
+        stats_tracker = ProviderStatsTracker(self.db)
+        provider_stats = stats_tracker.get_all_provider_stats(list(self.providers.keys()))
         routing = self.router.route(
             task_prompt=user_prompt,
             available_providers=self.providers,
             optimization_mode=self.config.optimization_mode,
+            provider_stats=provider_stats,
         )
         emit("routing_decision", {
             "strategy": routing.strategy.value,

@@ -9,6 +9,14 @@ from fusion_agent.models.deliberation import (
     ReviewStatus,
     DeliberationResult,
 )
+from fusion_agent.models.context import (
+    CodeContext,
+    ContextBudgetConfig,
+    ContextExpansionRequest,
+    OmissionManifest,
+    SelectedFile,
+    SymbolReference,
+)
 
 __all__ = [
     "Task",
@@ -21,4 +29,10 @@ __all__ = [
     "ReviewResult",
     "ReviewStatus",
     "DeliberationResult",
+    "CodeContext",
+    "ContextBudgetConfig",
+    "ContextExpansionRequest",
+    "OmissionManifest",
+    "SelectedFile",
+    "SymbolReference",
 ]

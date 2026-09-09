@@ -46,6 +46,11 @@ class WorkspaceSession:
         self.state: WorkspaceState = WorkspaceState.INITIALIZING
         self.created_at: str = datetime.now(timezone.utc).isoformat()
 
+    @property
+    def worktree_path(self) -> Path:
+        """Alias for worktree_dir."""
+        return self.worktree_dir
+
     def _run_git(self, args: list, cwd: Optional[Path] = None, check: bool = True) -> str:
         """Run a git command in the repository or worktree."""
         cmd = ["git"] + args

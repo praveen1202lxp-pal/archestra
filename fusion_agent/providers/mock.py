@@ -71,7 +71,8 @@ class MockProvider(AgentProvider):
     def invoke(
         self,
         prompt: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> AgentResponse:
         start_time = time.perf_counter()
@@ -86,17 +87,26 @@ class MockProvider(AgentProvider):
         )
         
         duration_ms = (time.perf_counter() - start_time) * 1000.0
+        ctx_tokens = 0
+        if context:
+            if hasattr(context, "to_prompt_context"):
+                ctx_tokens = len(context.to_prompt_context().split())
+            else:
+                ctx_tokens = len(str(context).split())
+
         response = AgentResponse(
             content=content,
-            input_tokens=len(prompt.split()) + (len(context.to_prompt_context().split()) if context else 0),
+            input_tokens=len(prompt.split()) + ctx_tokens,
             output_tokens=len(content.split()),
             duration_ms=duration_ms,
-            metadata={"mock_name": self.name},
+            metadata={"mock_name": self.name, "cwd": cwd},
+            fusion_context_tokens=ctx_tokens,
         )
         self.invocations.append({
             "prompt": prompt,
             "context": context,
             "response": response,
+            "cwd": cwd,
             "kwargs": kwargs,
         })
         return response
@@ -105,7 +115,8 @@ class MockProvider(AgentProvider):
         self,
         content: str,
         criteria: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> ReviewResponse:
         start_time = time.perf_counter()
@@ -126,6 +137,7 @@ class MockProvider(AgentProvider):
             "content": content,
             "criteria": criteria,
             "context": context,
+            "cwd": cwd,
             "response": response,
         })
         return response

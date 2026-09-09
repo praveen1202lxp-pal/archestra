@@ -23,6 +23,7 @@ class ContextSnapshot:
     current_context: str = ""
     recent_context: str = ""
     peer_context: str = ""
+    code_context: Optional[Any] = None
     metrics: Dict[str, int] = field(default_factory=dict)
 
     def to_prompt_context(self) -> str:
@@ -36,6 +37,11 @@ class ContextSnapshot:
             sections.append(f"### RECENT FINDINGS & DECISIONS\n{self.recent_context.strip()}")
         if self.peer_context.strip():
             sections.append(f"### PEER AGENT INPUT\n{self.peer_context.strip()}")
+        if self.code_context is not None:
+            if hasattr(self.code_context, "to_prompt_context"):
+                sections.append(self.code_context.to_prompt_context())
+            else:
+                sections.append(str(self.code_context))
 
         total_text = "\n\n".join(sections)
         self.metrics = {
@@ -58,6 +64,10 @@ class AgentResponse:
     duration_ms: float = 0.0
     raw: Optional[Any] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    reasoning_tokens: Optional[int] = None
+    visible_output_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
+    fusion_context_tokens: Optional[int] = None
 
 
 @dataclass
@@ -69,6 +79,11 @@ class ReviewResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     duration_ms: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    reasoning_tokens: Optional[int] = None
+    visible_output_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
+    fusion_context_tokens: Optional[int] = None
 
 
 @dataclass
@@ -103,8 +118,14 @@ class AgentProvider(ABC):
         pass
 
     @abstractmethod
-    def invoke(self, prompt: str, context: Optional[ContextSnapshot] = None, **kwargs) -> AgentResponse:
-        """Invoke the provider with a prompt and context snapshot."""
+    def invoke(
+        self,
+        prompt: str,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
+        **kwargs
+    ) -> AgentResponse:
+        """Invoke the provider with a prompt and context snapshot or CodeContext."""
         pass
 
     @abstractmethod
@@ -112,7 +133,8 @@ class AgentProvider(ABC):
         self,
         content: str,
         criteria: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> ReviewResponse:
         """Ask the provider to review a proposal, code diff, or plan."""

@@ -110,3 +110,20 @@ class ProviderStatsTracker:
             average_output_tokens=avg_out_tokens,
             failure_rate=round(failure_rate, 3),
         )
+
+    def get_all_provider_stats(
+        self,
+        provider_names: Optional[List[str]] = None,
+        window: int = 20,
+    ) -> Dict[str, ProviderHistoricalStats]:
+        """Compute rolling stats for multiple providers, or all providers found in database."""
+        conn = self.db.connect()
+        if not provider_names:
+            cursor = conn.execute(
+                "SELECT DISTINCT provider_name FROM agent_runs UNION SELECT DISTINCT reviewer_provider FROM reviews"
+            )
+            names = [row[0] for row in cursor.fetchall() if row[0]]
+        else:
+            names = provider_names
+
+        return {name: self.get_provider_stats(name, window=window) for name in names}

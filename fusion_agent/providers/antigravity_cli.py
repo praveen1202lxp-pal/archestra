@@ -322,15 +322,19 @@ class AntigravityCLIProvider(AgentProvider):
     def invoke(
         self,
         prompt: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> AgentResponse:
-        """Invoke Antigravity CLI with context snapshot and structured formatting."""
+        """Invoke Antigravity CLI with context snapshot and structured formatting within confined sandbox."""
         sections = [
             "You are participating as an AI software engineering provider inside Fusion Agent.",
         ]
         if context:
-            sections.append(context.to_prompt_context())
+            if hasattr(context, "to_prompt_context"):
+                sections.append(context.to_prompt_context())
+            else:
+                sections.append(str(context))
 
         sections.append(f"### TASK\n{prompt}")
         if "RESPONSE CONTRACT" not in prompt and "### File:" not in prompt:
@@ -340,18 +344,39 @@ class AntigravityCLIProvider(AgentProvider):
             )
 
         final_prompt = "\n\n".join(sections)
-        exec_result = self._execute_cli(final_prompt)
+        if cwd is not None:
+            exec_result = self._execute_cli(final_prompt, cwd=cwd)
+        else:
+            with tempfile.TemporaryDirectory() as empty_dir:
+                exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
+
         structured = self._normalize_output(exec_result)
         formatted_content = structured.to_formatted_text()
 
-        # Token metrics: only record actual tokens if the CLI exposes reliable usage
+        # Token metrics from native usage
         input_tokens = None
         output_tokens = None
+        cached_tokens = None
+        reasoning_tokens = None
+        visible_output_tokens = None
+
         if exec_result.usage and isinstance(exec_result.usage, dict):
             if "input_tokens" in exec_result.usage:
                 input_tokens = int(exec_result.usage["input_tokens"])
+            if "cache_read_tokens" in exec_result.usage:
+                cached_tokens = int(exec_result.usage["cache_read_tokens"])
             if "output_tokens" in exec_result.usage:
                 output_tokens = int(exec_result.usage["output_tokens"])
+            if "thinking_tokens" in exec_result.usage:
+                reasoning_tokens = int(exec_result.usage["thinking_tokens"])
+            if output_tokens is not None and reasoning_tokens is not None:
+                visible_output_tokens = max(0, output_tokens - reasoning_tokens)
+
+        fusion_ctx_tokens = None
+        if context and hasattr(context, "metrics"):
+            fusion_ctx_tokens = context.metrics.get("fusion_context_tokens") or context.metrics.get("estimated_tokens")
+        if fusion_ctx_tokens is None:
+            fusion_ctx_tokens = max(1, len(final_prompt) // 4)
 
         metadata: Dict[str, Any] = {
             "provider": "antigravity_cli",
@@ -368,28 +393,36 @@ class AntigravityCLIProvider(AgentProvider):
 
         return AgentResponse(
             content=formatted_content,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=input_tokens or 0,
+            output_tokens=output_tokens or 0,
             duration_ms=exec_result.duration_seconds * 1000.0,
             raw=exec_result.stdout,
             metadata=metadata,
+            reasoning_tokens=reasoning_tokens,
+            visible_output_tokens=visible_output_tokens,
+            cached_tokens=cached_tokens,
+            fusion_context_tokens=fusion_ctx_tokens,
         )
 
     def review(
         self,
         content: str,
         criteria: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> ReviewResponse:
-        """Execute review via Antigravity CLI."""
+        """Execute review via Antigravity CLI within confined sandbox."""
         sections = [
             "You are acting as an expert code and architecture reviewer inside Fusion Agent.",
             f"### CRITERIA\n{criteria}",
             f"### CONTENT UNDER REVIEW\n{content}",
         ]
         if context:
-            sections.append(context.to_prompt_context())
+            if hasattr(context, "to_prompt_context"):
+                sections.append(context.to_prompt_context())
+            else:
+                sections.append(str(context))
 
         sections.append(
             "Evaluate this content rigorously. Begin your review with one of:\n"
@@ -398,25 +431,48 @@ class AntigravityCLIProvider(AgentProvider):
         )
 
         final_prompt = "\n\n".join(sections)
-        with tempfile.TemporaryDirectory() as empty_dir:
-            exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
-        review_text = exec_result.response_text if exec_result.response_text else exec_result.stdout
+        if cwd is not None:
+            exec_result = self._execute_cli(final_prompt, cwd=cwd)
+        else:
+            with tempfile.TemporaryDirectory() as empty_dir:
+                exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
 
+        review_text = exec_result.response_text if exec_result.response_text else exec_result.stdout
         status = StructuredOutputNormalizer.parse_review_status(review_text)
 
         input_tokens = None
         output_tokens = None
+        cached_tokens = None
+        reasoning_tokens = None
+        visible_output_tokens = None
+
         if exec_result.usage and isinstance(exec_result.usage, dict):
             if "input_tokens" in exec_result.usage:
                 input_tokens = int(exec_result.usage["input_tokens"])
+            if "cache_read_tokens" in exec_result.usage:
+                cached_tokens = int(exec_result.usage["cache_read_tokens"])
             if "output_tokens" in exec_result.usage:
                 output_tokens = int(exec_result.usage["output_tokens"])
+            if "thinking_tokens" in exec_result.usage:
+                reasoning_tokens = int(exec_result.usage["thinking_tokens"])
+            if output_tokens is not None and reasoning_tokens is not None:
+                visible_output_tokens = max(0, output_tokens - reasoning_tokens)
+
+        fusion_ctx_tokens = None
+        if context and hasattr(context, "metrics"):
+            fusion_ctx_tokens = context.metrics.get("fusion_context_tokens") or context.metrics.get("estimated_tokens")
+        if fusion_ctx_tokens is None:
+            fusion_ctx_tokens = max(1, len(final_prompt) // 4)
 
         return ReviewResponse(
             status=status,
             comments=review_text,
             suggested_fixes=[],
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=input_tokens or 0,
+            output_tokens=output_tokens or 0,
             duration_ms=exec_result.duration_seconds * 1000.0,
+            reasoning_tokens=reasoning_tokens,
+            visible_output_tokens=visible_output_tokens,
+            cached_tokens=cached_tokens,
+            fusion_context_tokens=fusion_ctx_tokens,
         )

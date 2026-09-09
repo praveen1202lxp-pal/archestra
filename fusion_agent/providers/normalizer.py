@@ -205,3 +205,63 @@ class StructuredOutputNormalizer:
             return ReviewStatus.REJECTED
 
         return ReviewStatus.APPROVED
+
+    @classmethod
+    def parse_context_expansion_request(cls, text: str) -> Optional[Any]:
+        """Parse structured CONTEXT_INSUFFICIENT signal from model response."""
+        from fusion_agent.models.context import ContextExpansionRequest
+
+        if not text:
+            return None
+
+        # 1. Check for JSON block
+        match_json = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match_json:
+            try:
+                data = json.loads(match_json.group(1))
+                if isinstance(data, dict):
+                    status = str(data.get("status", "")).upper()
+                    if "CONTEXT_INSUFFICIENT" in status:
+                        req_files = data.get("requested_files", [])
+                        if isinstance(req_files, str):
+                            req_files = [req_files]
+                        req_syms = data.get("requested_symbols", [])
+                        if isinstance(req_syms, str):
+                            req_syms = [req_syms]
+                        return ContextExpansionRequest(
+                            requested_files=req_files,
+                            requested_symbols=req_syms,
+                            reason=data.get("reason", "Model requested additional context"),
+                        )
+            except Exception:
+                pass
+
+        # 2. Check for text signal: CONTEXT_INSUFFICIENT or [CONTEXT_INSUFFICIENT]
+        if "CONTEXT_INSUFFICIENT" in text.upper():
+            req_files = []
+            req_syms = []
+            reasons = []
+
+            # Parse lines like: - requested_file: path
+            # or: NEED_FILE: path (reason: ...)
+            for line in text.splitlines():
+                file_match = re.search(r"(?:requested_file|need_file|file)\s*[:=]\s*[`'\"]?([\w\-./\\]+\.[a-zA-Z0-9]+)[`'\"]?", line, re.IGNORECASE)
+                if file_match:
+                    req_files.append(file_match.group(1).replace("\\", "/"))
+                reason_match = re.search(r"reason\s*[:=]\s*(.+)", line, re.IGNORECASE)
+                if reason_match:
+                    r_clean = reason_match.group(1).rstrip(")]}").strip().strip("'\"")
+                    if r_clean:
+                        reasons.append(r_clean)
+                sym_match = re.search(r"(?:requested_symbol|symbol)\s*[:=]\s*[`'\"]?([\w.]+)[`'\"]?", line, re.IGNORECASE)
+                if sym_match:
+                    req_syms.append(sym_match.group(1))
+
+            combined_reason = "; ".join(reasons) if reasons else "Model flagged context insufficient"
+            return ContextExpansionRequest(
+                requested_files=req_files,
+                requested_symbols=req_syms,
+                reason=combined_reason,
+            )
+
+        return None

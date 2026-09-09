@@ -206,7 +206,7 @@ class GeminiCLIProvider(AgentProvider):
             preferred_task_types=["BUG_INVESTIGATION", "ARCHITECTURE_DESIGN", "CODE_MODIFICATION"],
         )
 
-    def _execute_cli(self, prompt: str) -> str:
+    def _execute_cli(self, prompt: str, cwd: Optional[str] = None) -> str:
         """Execute the Gemini CLI subprocess safely in headless mode with timeout and error handling."""
         exe = self._resolve_executable()
         if not exe:
@@ -236,6 +236,7 @@ class GeminiCLIProvider(AgentProvider):
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(
@@ -274,10 +275,12 @@ class GeminiCLIProvider(AgentProvider):
     def invoke(
         self,
         prompt: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> AgentResponse:
-        """Invoke Gemini CLI with structured context and instructions."""
+        """Invoke Gemini CLI with structured context and instructions within confined sandbox."""
+        import tempfile
         start_time = time.perf_counter()
 
         # Build comprehensive structured prompt
@@ -288,7 +291,10 @@ class GeminiCLIProvider(AgentProvider):
         )
 
         if context:
-            full_prompt_sections.append(context.to_prompt_context())
+            if hasattr(context, "to_prompt_context"):
+                full_prompt_sections.append(context.to_prompt_context())
+            else:
+                full_prompt_sections.append(str(context))
 
         full_prompt_sections.append(f"### USER TASK\n{prompt}")
 
@@ -304,7 +310,12 @@ class GeminiCLIProvider(AgentProvider):
 
         final_prompt = "\n\n".join(full_prompt_sections)
 
-        raw_output = self._execute_cli(final_prompt)
+        if cwd is not None:
+            raw_output = self._execute_cli(final_prompt, cwd=cwd)
+        else:
+            with tempfile.TemporaryDirectory() as empty_dir:
+                raw_output = self._execute_cli(final_prompt, cwd=empty_dir)
+
         structured = self._parse_structured_output(raw_output)
         formatted_content = structured.to_formatted_text()
 
@@ -321,16 +332,19 @@ class GeminiCLIProvider(AgentProvider):
                 "executable": self.executable_path,
                 "confidence": structured.confidence,
             },
+            fusion_context_tokens=max(1, len(final_prompt) // 4),
         )
 
     def review(
         self,
         content: str,
         criteria: str,
-        context: Optional[ContextSnapshot] = None,
+        context: Optional[Any] = None,
+        cwd: Optional[str] = None,
         **kwargs
     ) -> ReviewResponse:
-        """Ask Gemini CLI to perform a code/architecture review."""
+        """Ask Gemini CLI to perform a code/architecture review within confined sandbox."""
+        import tempfile
         start_time = time.perf_counter()
 
         review_prompt_sections = [
@@ -339,7 +353,10 @@ class GeminiCLIProvider(AgentProvider):
             f"### CONTENT UNDER REVIEW\n{content}",
         ]
         if context:
-            review_prompt_sections.append(context.to_prompt_context())
+            if hasattr(context, "to_prompt_context"):
+                review_prompt_sections.append(context.to_prompt_context())
+            else:
+                review_prompt_sections.append(str(context))
 
         review_prompt_sections.append(
             "Evaluate this content rigorously. Start your review with one of:\n"
@@ -350,7 +367,11 @@ class GeminiCLIProvider(AgentProvider):
         )
 
         final_prompt = "\n\n".join(review_prompt_sections)
-        raw_output = self._execute_cli(final_prompt)
+        if cwd is not None:
+            raw_output = self._execute_cli(final_prompt, cwd=cwd)
+        else:
+            with tempfile.TemporaryDirectory() as empty_dir:
+                raw_output = self._execute_cli(final_prompt, cwd=empty_dir)
 
         # Parse review status
         status = StructuredOutputNormalizer.parse_review_status(raw_output)
@@ -364,4 +385,5 @@ class GeminiCLIProvider(AgentProvider):
             input_tokens=len(final_prompt.split()),
             output_tokens=len(raw_output.split()),
             duration_ms=duration_ms,
+            fusion_context_tokens=max(1, len(final_prompt) // 4),
         )

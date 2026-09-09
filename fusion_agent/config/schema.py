@@ -43,6 +43,15 @@ class DeliberationConfig:
     max_task_duration_seconds: float = 300.0        # End-to-end task duration ceiling
     max_premium_provider_calls: int = 4             # Ceiling on calls to paid/premium providers
     skip_peer_review_for_low_risk: bool = True      # Skip second-model review if review risk is LOW
+    context_max_files: int = 5                      # Maximum candidate files included in CodeContext
+    context_max_chars_per_file: int = 8000          # Max chars per file before truncation
+    context_total_source_chars: int = 24000         # Total source code char budget across all files
+    context_max_test_output_chars: int = 2000       # Max chars allocated to test failure/stderr output
+    context_max_peer_feedback_chars: int = 2000     # Max chars allocated to peer critique in repair
+    context_max_architecture_chars: int = 1000      # Max chars for architectural decisions
+    context_require_minimal_workspace: bool = False # Mode B toggle: construct minimal read-only workspace on disk
+    max_context_expansion_rounds: int = 1          # Max bounded retrieval expansions if context is insufficient
+    max_expansion_files: int = 2                    # Max additional files retrieved per expansion round
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

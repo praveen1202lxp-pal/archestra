@@ -164,6 +164,7 @@ class TaskRouter:
         role: str,
         optimization_mode: OptimizationMode,
         task_type: Optional[TaskType] = None,
+        stats: Optional[Any] = None,
     ) -> float:
         """Calculate explainable score for a provider filling a specific role."""
         caps = provider.get_capabilities()
@@ -181,10 +182,16 @@ class TaskRouter:
 
             if optimization_mode == OptimizationMode.FASTEST:
                 latency = getattr(caps, "typical_latency_ms", 30000.0)
+                if stats and hasattr(stats, "average_duration_ms") and stats.average_duration_ms > 0:
+                    latency = stats.average_duration_ms
                 score += max(0.0, 1.0 - (latency / 60000.0)) * 0.30
 
-            if optimization_mode == OptimizationMode.LOWEST_COST and caps.cost_tier == CostTier.PAID_API:
-                score -= 0.50
+            if optimization_mode == OptimizationMode.LOWEST_COST:
+                if caps.cost_tier == CostTier.PAID_API:
+                    score -= 0.50
+                if stats and hasattr(stats, "average_input_tokens") and stats.average_input_tokens:
+                    # Token efficiency bonus/penalty based on historical input usage
+                    score += max(0.0, 1.0 - (stats.average_input_tokens / 50000.0)) * 0.15
 
         elif role == "reviewer":
             # Review strength (45%), reasoning strength (35%), task preference (20%)
@@ -193,6 +200,9 @@ class TaskRouter:
             score += review_score * 0.45
             score += reasoning_score * 0.35
             score += (1.0 if "CODE_REVIEW" in caps.preferred_task_types else 0.7) * 0.20
+
+            if stats and hasattr(stats, "review_usefulness_rate"):
+                score += (stats.review_usefulness_rate - 0.5) * 0.20
 
         else:  # "lead" / "proposer"
             # Reasoning strength (50%), task preference match (30%), general reasoning (20%)
@@ -209,6 +219,7 @@ class TaskRouter:
         task_prompt: str,
         available_providers: Dict[str, AgentProvider],
         optimization_mode: OptimizationMode = OptimizationMode.BALANCED,
+        provider_stats: Optional[Dict[str, Any]] = None,
     ) -> RoutingDecision:
         """Deterministically determine collaboration strategy and dynamic provider roles."""
         assessment = self.assess_task(task_prompt)
@@ -234,10 +245,13 @@ class TaskRouter:
         reviewer_scores: Dict[str, float] = {}
         lead_scores: Dict[str, float] = {}
 
+        p_stats = provider_stats or {}
+
         for p_name, p_inst in eligible_providers.items():
-            imp_s = self._score_provider_for_role(p_name, p_inst, "implementer", optimization_mode, task_type=task_type)
-            rev_s = self._score_provider_for_role(p_name, p_inst, "reviewer", optimization_mode, task_type=task_type)
-            lead_s = self._score_provider_for_role(p_name, p_inst, "lead", optimization_mode, task_type=task_type)
+            st = p_stats.get(p_name)
+            imp_s = self._score_provider_for_role(p_name, p_inst, "implementer", optimization_mode, task_type=task_type, stats=st)
+            rev_s = self._score_provider_for_role(p_name, p_inst, "reviewer", optimization_mode, task_type=task_type, stats=st)
+            lead_s = self._score_provider_for_role(p_name, p_inst, "lead", optimization_mode, task_type=task_type, stats=st)
 
             implementer_scores[p_name] = imp_s
             reviewer_scores[p_name] = rev_s
