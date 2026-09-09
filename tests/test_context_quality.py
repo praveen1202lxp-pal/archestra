@@ -23,9 +23,9 @@ def test_benchmark_prompt_zero_state_context(tmp_path):
     indexer = RepositoryIndexer()
     index = indexer.index_project(".")
 
-    # Ensure target files are absent
-    assert "fusion_agent/utils/math_utils.py" not in index.file_tree
-    assert "tests/test_math_utils.py" not in index.file_tree
+    # Simulate target files being absent from index (e.g. at the start of a new-file task)
+    index.file_tree.pop("fusion_agent/utils/math_utils.py", None)
+    index.file_tree.pop("tests/test_math_utils.py", None)
 
     benchmark_prompt = (
         "Implement a robust clamp function in fusion_agent/utils/math_utils.py that clamps a number x "
