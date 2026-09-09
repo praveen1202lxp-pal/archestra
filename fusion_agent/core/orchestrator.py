@@ -186,7 +186,11 @@ class FusionOrchestrator:
             t_start = time.perf_counter()
             review_resp = secondary_agent.review(
                 content=rev_content,
-                criteria="Evaluate git diff and test results for correctness, security, syntax, edge cases, and regressions.",
+                criteria=(
+                    "Evaluate git diff and test results thoroughly for correctness, security, syntax, edge cases, and regressions. "
+                    "If any edge cases, missing validations, or unhandled exceptions are found, return [NEEDS_REVISION] with specific critique. "
+                    "If the patch is clean, fully verified, and handles all edge cases, return [APPROVED]."
+                ),
                 context=context,
             )
             t_rev = (time.perf_counter() - t_start) * 1000.0
@@ -308,7 +312,11 @@ class FusionOrchestrator:
                 t_start = time.perf_counter()
                 review_resp = secondary_agent.review(
                     content=rev_content,
-                    criteria="Evaluate git diff and test results for correctness, security, syntax, edge cases, and regressions.",
+                    criteria=(
+                        "Evaluate git diff and test results thoroughly for correctness, security, syntax, edge cases, and regressions. "
+                        "If the repairs successfully resolved the previous critiques, return [APPROVED]. "
+                        "If critical issues remain, return [NEEDS_REVISION]."
+                    ),
                     context=context,
                 )
                 t_rev = (time.perf_counter() - t_start) * 1000.0
