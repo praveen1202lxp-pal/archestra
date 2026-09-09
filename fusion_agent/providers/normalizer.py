@@ -177,11 +177,31 @@ class StructuredOutputNormalizer:
     @classmethod
     def parse_review_status(cls, text: str) -> ReviewStatus:
         """Determine ReviewStatus from review comments."""
-        upper = text.upper()
-        if "REJECT" in upper:
-            return ReviewStatus.REJECTED
-        if any(w in upper for w in ("NEEDS_REVISION", "REVISION", "FIX", "CRITIQUE")):
-            return ReviewStatus.NEEDS_REVISION
-        if "APPROV" in upper:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        first_line = lines[0].upper() if lines else text.upper()
+
+        # 1. Exact tags on the first line take precedence
+        if "[APPROVED]" in first_line or first_line.startswith("APPROVED"):
             return ReviewStatus.APPROVED
+        if "[NEEDS_REVISION]" in first_line or "NEEDS_REVISION" in first_line:
+            return ReviewStatus.NEEDS_REVISION
+        if "[REJECTED]" in first_line or first_line.startswith("REJECTED"):
+            return ReviewStatus.REJECTED
+
+        # 2. Exact bracketed tags anywhere in text
+        if "[APPROVED]" in text.upper():
+            return ReviewStatus.APPROVED
+        if "[NEEDS_REVISION]" in text.upper():
+            return ReviewStatus.NEEDS_REVISION
+        if "[REJECTED]" in text.upper():
+            return ReviewStatus.REJECTED
+
+        # 3. Fallback to keywords on first line
+        if "APPROV" in first_line:
+            return ReviewStatus.APPROVED
+        if any(w in first_line for w in ("REVISION", "FIX", "CRITIQUE")):
+            return ReviewStatus.NEEDS_REVISION
+        if "REJECT" in first_line:
+            return ReviewStatus.REJECTED
+
         return ReviewStatus.APPROVED
