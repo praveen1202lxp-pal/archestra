@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -201,7 +202,7 @@ class AntigravityCLIProvider(AgentProvider):
             preferred_task_types=["ARCHITECTURE_DESIGN", "CODE_REVIEW", "BUG_INVESTIGATION"],
         )
 
-    def _execute_cli(self, prompt: str) -> CLIExecutionResult:
+    def _execute_cli(self, prompt: str, cwd: Optional[str] = None) -> CLIExecutionResult:
         """Execute Antigravity CLI in headless mode with JSON output preference."""
         exe = self._resolve_executable()
         if not exe:
@@ -237,6 +238,7 @@ class AntigravityCLIProvider(AgentProvider):
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(
@@ -385,7 +387,8 @@ class AntigravityCLIProvider(AgentProvider):
         )
 
         final_prompt = "\n\n".join(sections)
-        exec_result = self._execute_cli(final_prompt)
+        with tempfile.TemporaryDirectory() as empty_dir:
+            exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
         review_text = exec_result.response_text if exec_result.response_text else exec_result.stdout
 
         status = StructuredOutputNormalizer.parse_review_status(review_text)

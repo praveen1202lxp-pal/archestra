@@ -1,5 +1,6 @@
 """Unit tests for CodexCLIProvider adapter."""
 
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -273,11 +274,32 @@ def test_codex_cli_review():
     mock_proc.stderr = ""
 
     with patch("shutil.which", return_value="C:\\fake\\codex.exe"), \
-         patch("subprocess.run", return_value=mock_proc):
+         patch("subprocess.run", return_value=mock_proc) as mock_run:
         provider = CodexCLIProvider(name="test_codex")
         review = provider.review("sample proposal", criteria="check correctness")
         assert review.status == ReviewStatus.APPROVED
         assert "APPROVED" in review.comments
+        # Verify review executed with an isolated working directory
+        assert mock_run.call_args.kwargs.get("cwd") is not None
+
+
+def test_codex_cli_review_sandboxed_cwd():
+    """Verify review executes in an ephemeral directory, not repository cwd."""
+    jsonl_output = '{"type":"item.completed","item":{"type":"agent_message","text":"[NEEDS_REVISION] Missing null check"}}'
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stdout = jsonl_output
+    mock_proc.stderr = ""
+
+    with patch("shutil.which", return_value="C:\\fake\\codex.exe"), \
+         patch("subprocess.run", return_value=mock_proc) as mock_run:
+        provider = CodexCLIProvider(name="test_codex")
+        review = provider.review("diff content", criteria="review diff")
+        assert review.status == ReviewStatus.NEEDS_REVISION
+        passed_cwd = mock_run.call_args.kwargs.get("cwd")
+        assert passed_cwd is not None
+        assert os.path.isabs(passed_cwd)
+
 
 
 def test_codex_cli_registry_registration():

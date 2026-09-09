@@ -210,6 +210,19 @@ def cmd_run(args) -> int:
             print(f"Peer Review:  {r_color}[{review.status.value}]{RESET} by {review.reviewer_agent}")
             print(f"{BOLD}Comments:{RESET}\n{review.comments}")
 
+        if hasattr(result.deliberation, "reviews") and len(result.deliberation.reviews) > 1:
+            print(f"\n{BOLD}Review History ({len(result.deliberation.reviews)} rounds):{RESET}")
+            for i, r in enumerate(result.deliberation.reviews, 1):
+                rc = GREEN if r.status == ReviewStatus.APPROVED else RED
+                print(f"  Round {i}: {rc}[{r.status.value}]{RESET} by {r.reviewer_agent}")
+
+        if hasattr(result.deliberation, "stage_metrics") and result.deliberation.stage_metrics:
+            print(f"\n{BOLD}Per-Provider Stages:{RESET}")
+            for sm in result.deliberation.stage_metrics:
+                s_in = f"{sm['input_tokens']:,}" if sm.get('input_tokens') is not None else "unavailable"
+                s_out = f"{sm['output_tokens']:,}" if sm.get('output_tokens') is not None else "unavailable"
+                print(f"  - {BOLD}{sm['stage']}{RESET} ({sm['provider']}): {sm['duration_ms']:.1f} ms | in: {s_in}, out: {s_out}")
+
         if diff:
             print(f"\n{BOLD}{YELLOW}--- GENERATED UNIFIED DIFF ---{RESET}")
             print(diff)

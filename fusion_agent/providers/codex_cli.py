@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,7 +211,7 @@ class CodexCLIProvider(AgentProvider):
             preferred_task_types=["ARCHITECTURE_DESIGN", "CODE_REVIEW", "BUG_INVESTIGATION"],
         )
 
-    def _execute_cli(self, prompt: str) -> CodexExecutionResult:
+    def _execute_cli(self, prompt: str, cwd: Optional[str] = None) -> CodexExecutionResult:
         """Execute Codex CLI in non-interactive headless mode."""
         exe = self._resolve_executable()
         if not exe:
@@ -257,6 +258,7 @@ class CodexCLIProvider(AgentProvider):
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(
@@ -393,7 +395,8 @@ class CodexCLIProvider(AgentProvider):
         )
 
         final_prompt = "\n\n".join(sections)
-        exec_result = self._execute_cli(final_prompt)
+        with tempfile.TemporaryDirectory() as empty_dir:
+            exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
         review_text = exec_result.response_text
 
         status = StructuredOutputNormalizer.parse_review_status(review_text)

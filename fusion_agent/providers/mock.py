@@ -46,6 +46,7 @@ class MockProvider(AgentProvider):
         self.invocations: List[Dict[str, Any]] = []
         self.reviews: List[Dict[str, Any]] = []
         self.response_generator: Optional[Callable[[str, Optional[ContextSnapshot]], str]] = None
+        self.review_generator: Optional[Callable[[str, str, Optional[ContextSnapshot]], ReviewResponse]] = None
 
     def initialize(self) -> bool:
         self._is_initialized = True
@@ -109,15 +110,18 @@ class MockProvider(AgentProvider):
     ) -> ReviewResponse:
         start_time = time.perf_counter()
         duration_ms = (time.perf_counter() - start_time) * 1000.0
-        
-        response = ReviewResponse(
-            status=self.default_review_status,
-            comments=f"[{self.name} Review] {self.default_review_comments}",
-            suggested_fixes=[],
-            input_tokens=len(content.split()) + len(criteria.split()),
-            output_tokens=len(self.default_review_comments.split()),
-            duration_ms=duration_ms,
-        )
+
+        if self.review_generator:
+            response = self.review_generator(content, criteria, context)
+        else:
+            response = ReviewResponse(
+                status=self.default_review_status,
+                comments=f"[{self.name} Review] {self.default_review_comments}",
+                suggested_fixes=[],
+                input_tokens=len(content.split()) + len(criteria.split()),
+                output_tokens=len(self.default_review_comments.split()),
+                duration_ms=duration_ms,
+            )
         self.reviews.append({
             "content": content,
             "criteria": criteria,

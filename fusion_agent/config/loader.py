@@ -72,8 +72,11 @@ class ConfigLoader:
         delib_raw = expanded_data.get("deliberation", {})
         deliberation = DeliberationConfig(
             max_rounds=delib_raw.get("max_rounds", 3),
-            max_model_calls=delib_raw.get("max_model_calls", 8),
-            timeout_seconds=delib_raw.get("timeout_seconds", 60.0),
+            max_repair_rounds=delib_raw.get("max_repair_rounds", 2),
+            max_provider_calls=delib_raw.get("max_provider_calls", delib_raw.get("max_model_calls", 8)),
+            max_model_calls=delib_raw.get("max_model_calls", delib_raw.get("max_provider_calls", 8)),
+            max_feedback_chars=delib_raw.get("max_feedback_chars", 2000),
+            timeout_seconds=delib_raw.get("timeout_seconds", 120.0),
             auto_synthesize=delib_raw.get("auto_synthesize", True),
         )
 

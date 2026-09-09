@@ -30,10 +30,13 @@ class AgentConfig:
 
 @dataclass
 class DeliberationConfig:
-    """Limits and guardrails for multi-agent deliberation."""
+    """Limits and guardrails for multi-agent deliberation and review repair loops."""
     max_rounds: int = 3
-    max_model_calls: int = 8
-    timeout_seconds: float = 60.0
+    max_repair_rounds: int = 2          # Maximum iterations of patch-review-repair
+    max_provider_calls: int = 8         # Hard ceiling on total provider calls per task
+    max_model_calls: int = 8            # Backward compatibility alias
+    max_feedback_chars: int = 2000      # Bounds reviewer feedback passed into repair prompt
+    timeout_seconds: float = 120.0      # Per-stage timeout ceiling
     auto_synthesize: bool = True
 
     def to_dict(self) -> Dict[str, Any]:

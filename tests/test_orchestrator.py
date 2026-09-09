@@ -193,3 +193,235 @@ def test_orchestrator_autonomous_edit_dirty_tree_refusal(tmp_path):
 
     db.close()
 
+
+def test_orchestrator_repair_loop_success(tmp_path):
+    """Verify that a rejected patch is repaired within the same session and approved."""
+    from unittest.mock import patch
+    from fusion_agent.models.deliberation import ReviewStatus
+    from fusion_agent.providers.base import ReviewResponse
+    from fusion_agent.workspace.verifier import VerificationResult
+
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="RepairSuccessTest")
+    config.project_root = str(tmp_path)
+    config.deliberation.max_repair_rounds = 2
+
+    def coder_response(prompt, context=None):
+        if "PEER REVIEW CRITIQUE" in prompt:
+            return "### File: src/math.py\n```python\ndef divide(a, b):\n    if b == 0:\n        raise ZeroDivisionError('cannot divide by zero')\n    return a / b\n```"
+        return "### File: src/math.py\n```python\ndef divide(a, b):\n    return a / b\n```"
+
+    review_count = 0
+    def reviewer_review(content, criteria, context=None):
+        nonlocal review_count
+        review_count += 1
+        if review_count == 1:
+            return ReviewResponse(
+                status=ReviewStatus.NEEDS_REVISION,
+                comments="[NEEDS_REVISION] Missing zero division error handling.",
+                suggested_fixes=["Add check for b == 0"],
+                input_tokens=100,
+                output_tokens=20,
+            )
+        return ReviewResponse(
+            status=ReviewStatus.APPROVED,
+            comments="[APPROVED] Zero division check added properly.",
+            suggested_fixes=[],
+            input_tokens=120,
+            output_tokens=15,
+        )
+
+    agent_1 = MockProvider(name="coder")
+    agent_1.response_generator = coder_response
+
+    agent_2 = MockProvider(name="reviewer")
+    agent_2.review_generator = reviewer_review
+
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    mock_verif = VerificationResult(
+        passed=True,
+        exit_code=0,
+        stdout="tests passed",
+        stderr="",
+        duration_seconds=0.1,
+        command="pytest",
+    )
+
+    with patch("fusion_agent.workspace.session.WorkspaceSession.prepare"), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.run_tests", return_value=mock_verif), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.get_diff", return_value="diff --git a/src/math.py b/src/math.py"):
+
+        result = orchestrator.run_task("Implement divide function in Python")
+
+        assert result.task.status == TaskStatus.COMPLETED
+        assert result.review_result.status == ReviewStatus.APPROVED
+        assert len(result.deliberation.reviews) == 2
+        assert len(result.deliberation.proposals) == 2
+        assert result.deliberation.rounds_executed == 2
+
+        # Check stage metrics
+        stages = [sm["stage"] for sm in result.deliberation.stage_metrics]
+        assert "Initial Implementation" in stages
+        assert "Review Round 1" in stages
+        assert "Repair Round 1" in stages
+        assert "Review Round 2" in stages
+
+        # Check database records
+        conn = db.connect()
+        runs = conn.execute("SELECT * FROM agent_runs WHERE task_id = ?;", (result.task.id,)).fetchall()
+        assert len(runs) >= 4
+
+    db.close()
+
+
+def test_orchestrator_repair_loop_exceeds_max_rounds(tmp_path):
+    """Verify that loop terminates at max_repair_rounds if revisions are continuously rejected."""
+    from unittest.mock import patch
+    from fusion_agent.models.deliberation import ReviewStatus
+    from fusion_agent.workspace.verifier import VerificationResult
+
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="RepairExceedTest")
+    config.project_root = str(tmp_path)
+    config.deliberation.max_repair_rounds = 2
+
+    agent_1 = MockProvider(name="coder", default_response="### File: src/math.py\n```python\nx = 1\n```")
+    agent_2 = MockProvider(
+        name="reviewer",
+        default_review_status=ReviewStatus.NEEDS_REVISION,
+        default_review_comments="[NEEDS_REVISION] Code is still insufficient.",
+    )
+
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    mock_verif = VerificationResult(
+        passed=True,
+        exit_code=0,
+        stdout="passed",
+        stderr="",
+        duration_seconds=0.1,
+        command="pytest",
+    )
+
+    with patch("fusion_agent.workspace.session.WorkspaceSession.prepare"), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.run_tests", return_value=mock_verif), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.get_diff", return_value="diff"):
+
+        result = orchestrator.run_task("Write Python code for feature")
+
+        # Stopped after 2 repair rounds (1 initial review + 2 repair reviews = 3 reviews total)
+        assert result.review_result.status == ReviewStatus.NEEDS_REVISION
+        assert len(result.deliberation.reviews) == 3
+        assert len(result.deliberation.proposals) == 3
+        assert "Repair rounds executed: 2" in result.final_answer
+
+    db.close()
+
+
+def test_orchestrator_repair_loop_bounded_feedback(tmp_path):
+    """Verify that reviewer feedback passed into the repair prompt is truncated to max_feedback_chars."""
+    from unittest.mock import patch
+    from fusion_agent.models.deliberation import ReviewStatus
+    from fusion_agent.workspace.verifier import VerificationResult
+
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="BoundFeedbackTest")
+    config.project_root = str(tmp_path)
+    config.deliberation.max_repair_rounds = 1
+    config.deliberation.max_feedback_chars = 50
+
+    long_critique = "A" * 500
+    agent_1 = MockProvider(name="coder", default_response="### File: src/math.py\n```python\nx = 1\n```")
+    agent_2 = MockProvider(
+        name="reviewer",
+        default_review_status=ReviewStatus.NEEDS_REVISION,
+        default_review_comments=long_critique,
+    )
+
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    mock_verif = VerificationResult(
+        passed=True,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.1,
+        command="pytest",
+    )
+
+    with patch("fusion_agent.workspace.session.WorkspaceSession.prepare"), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.run_tests", return_value=mock_verif), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.get_diff", return_value="diff"):
+
+        result = orchestrator.run_task("Implement bounded feedback test in Python")
+
+        assert len(agent_1.invocations) == 2
+        repair_prompt = agent_1.invocations[1]["prompt"]
+        assert "PEER REVIEW CRITIQUE" in repair_prompt
+        assert "A" * 30 in repair_prompt
+        assert "A" * 50 not in repair_prompt
+
+    db.close()
+
+
+def test_orchestrator_repair_loop_call_limit(tmp_path):
+    """Verify that repair loop respects max_provider_calls hard ceiling."""
+    from unittest.mock import patch
+    from fusion_agent.models.deliberation import ReviewStatus
+    from fusion_agent.workspace.verifier import VerificationResult
+
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="CallLimitTest")
+    config.project_root = str(tmp_path)
+    config.deliberation.max_repair_rounds = 5
+    config.deliberation.max_provider_calls = 2
+
+    agent_1 = MockProvider(name="coder", default_response="### File: src/math.py\n```python\nx = 1\n```")
+    agent_2 = MockProvider(
+        name="reviewer",
+        default_review_status=ReviewStatus.NEEDS_REVISION,
+        default_review_comments="[NEEDS_REVISION] Needs fix",
+    )
+
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    mock_verif = VerificationResult(
+        passed=True,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.1,
+        command="pytest",
+    )
+
+    with patch("fusion_agent.workspace.session.WorkspaceSession.prepare"), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.run_tests", return_value=mock_verif), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.get_diff", return_value="diff"):
+
+        result = orchestrator.run_task("Implement feature for call limits in Python")
+
+        assert len(agent_1.invocations) == 1
+        assert len(agent_2.reviews) == 1
+        assert len(result.deliberation.reviews) == 1
+        assert "Repair rounds executed: 0" in result.final_answer
+
+    db.close()
+
+
