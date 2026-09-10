@@ -11,12 +11,20 @@ from fusion_agent.core.router import RoutingDecision, TaskRouter
 from fusion_agent.memory.database import Database
 from fusion_agent.memory.project_state import ProjectStateManager
 from fusion_agent.memory.provider_stats import ProviderStatsTracker
+from fusion_agent.core.planner import PlanEngine, PlanValidationError
 from fusion_agent.models.context import CodeContext, ContextBudgetConfig, ContextExpansionRequest
 from fusion_agent.models.deliberation import (
     DeliberationResult,
     Proposal,
     ReviewResult,
     ReviewStatus,
+)
+from fusion_agent.models.plan import (
+    Checkpoint,
+    ExecutionPlan,
+    PlanStep,
+    StepResult,
+    StepStatus,
 )
 from fusion_agent.models.strategy import StrategyType
 from fusion_agent.models.task import Task, TaskStatus
@@ -28,7 +36,13 @@ from fusion_agent.repository.ignore import SecretFilter
 from fusion_agent.repository.indexer import RepositoryIndexer
 from fusion_agent.repository.selector import RankedCandidate, RelevantFileSelector
 from fusion_agent.workspace.broker import ExecutionBroker
+from fusion_agent.workspace.checkpoint import (
+    CheckpointManager,
+    CheckpointRollbackError,
+    UnexpectedFilesError,
+)
 from fusion_agent.workspace.editor import WorkspaceEditor
+
 from fusion_agent.workspace.session import DirtyWorkingTreeError, WorkspaceSession, WorkspaceState
 from fusion_agent.workspace.verifier import VerificationResult, WorkspaceVerifier
 
@@ -544,7 +558,510 @@ class FusionOrchestrator:
 
         return deliberation, session, verif_result, diff, review_result
 
+    def _run_checkpointed_plan(
+        self,
+        task: Task,
+        primary_agent: Optional[AgentProvider] = None,
+        secondary_agent: Optional[AgentProvider] = None,
+        context: Optional[Any] = None,
+        emit: Optional[Callable] = None,
+        lead: Optional[AgentProvider] = None,
+        implementer: Optional[AgentProvider] = None,
+        reviewer: Optional[AgentProvider] = None,
+        budget: Optional[TaskBudgetController] = None,
+    ) -> Tuple[DeliberationResult, WorkspaceSession, VerificationResult, str, Optional[ReviewResult]]:
+        """Execute multi-step checkpointed execution plan inside an isolated worktree."""
+        planner_agent = lead or primary_agent
+        if not planner_agent:
+            raise ValueError("A planning provider must be specified for checkpointed planning.")
+        impl_agent = implementer or primary_agent
+        if not impl_agent:
+            raise ValueError("An implementer provider must be specified for checkpointed planning.")
+        rev_agent = reviewer if reviewer is not None else secondary_agent
+
+        if emit is None:
+            emit = lambda event, data: None
+        if budget is None:
+            budget = TaskBudgetController(self.config.deliberation)
+
+        repo_path = Path(self.config.project_root).resolve()
+        session = WorkspaceSession(task_id=task.id, repo_root=repo_path)
+
+        # 1. Pre-flight check & worktree allocation
+        emit("status", {"message": "Pre-flight check: verifying repository working tree is clean..."})
+        session.prepare()
+        emit("status", {"message": f"Allocated isolated worktree on task branch '{session.task_branch}' (base: {session.base_branch})."})
+
+        broker = ExecutionBroker(session)
+        verifier = WorkspaceVerifier()
+        checkpoint_mgr = CheckpointManager()
+
+        max_steps = getattr(self.config.deliberation, "max_plan_steps", 5)
+        max_amendments = getattr(self.config.deliberation, "max_plan_amendments", 1)
+        plan_engine = PlanEngine(max_steps=max_steps, max_amendments=max_amendments)
+
+        # 2. Build high-level planning context
+        indexer = RepositoryIndexer()
+        repo_index = indexer.index_project(session.worktree_path)
+        selector = RelevantFileSelector(repo_index)
+        ranked_candidates, symbol_refs = selector.select_relevant_files(f"{task.title}\n{task.description}")
+
+        budget_cfg = ContextBudgetConfig(
+            max_files=getattr(self.config.deliberation, "context_max_files", 5),
+            max_chars_per_file=getattr(self.config.deliberation, "context_max_chars_per_file", 8000),
+            total_source_chars=getattr(self.config.deliberation, "context_total_source_chars", 24000),
+            max_test_output_chars=getattr(self.config.deliberation, "context_max_test_output_chars", 2000),
+            max_peer_feedback_chars=getattr(self.config.deliberation, "context_max_peer_feedback_chars", 2000),
+            max_architecture_chars=getattr(self.config.deliberation, "context_max_architecture_chars", 1000),
+            require_minimal_workspace=getattr(self.config.deliberation, "context_require_minimal_workspace", False),
+        )
+        budgeter = ContextBudgeter(budget_cfg)
+        arch_summary = context.permanent_context if (context and hasattr(context, "permanent_context")) else ""
+        plan_code_context = budgeter.build_code_context(
+            task_requirements=f"{task.title}\n{task.description}",
+            ranked_candidates=ranked_candidates,
+            symbol_refs=symbol_refs,
+            index=repo_index,
+            architecture_decisions=arch_summary,
+        )
+
+        # 3. Plan Generation (Fail Closed on Error)
+        try:
+            plan = plan_engine.generate_plan(
+                task=task,
+                context=plan_code_context,
+                planner=planner_agent,
+                reviewer=rev_agent,
+                budget=budget,
+                emit=emit,
+            )
+        except Exception as exc:
+            # FAIL CLOSED: Never silently degrade to one-shot execution!
+            session.teardown(delete_branch=True)
+            raise RuntimeError(f"Multi-step planning failed: {exc}")
+
+        self.state_manager.create_plan(plan)
+        emit("status", {"message": f"Execution plan established: '{plan.title}' ({len(plan.steps)} steps)."})
+
+        # 4. Step Execution Loop
+        last_verified_sha = session.base_commit
+        stage_metrics: List[Dict[str, Any]] = []
+        proposals: List[Proposal] = []
+        reviews: List[ReviewResult] = []
+        completed_steps_info: List[str] = []
+        all_modified_files: List[str] = []
+        last_verif_result: Optional[VerificationResult] = None
+        max_feedback_chars = getattr(self.config.deliberation, "max_feedback_chars", 2000)
+
+        for step_idx, step in enumerate(plan.steps):
+            # Check DAG dependencies
+            if not plan.is_step_runnable(step):
+                step.status = StepStatus.SKIPPED
+                self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.SKIPPED)
+                emit("status", {"message": f"Step {step.id} skipped due to incomplete dependencies."})
+                continue
+
+            # Forward-looking budget reservation check
+            remaining_count = len(plan.steps) - step_idx
+            can_start, b_reason = budget.can_start_step(
+                remaining_steps_count=remaining_count,
+                requires_final_review=bool(rev_agent),
+            )
+            if not can_start:
+                emit("status", {"message": f"Budget ceiling reached ({b_reason}); halting remaining steps."})
+                step.status = StepStatus.SKIPPED
+                self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.SKIPPED)
+                break
+
+            step.status = StepStatus.IN_PROGRESS
+            self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.IN_PROGRESS)
+            emit("status", {"message": f"--- Step {step_idx+1}/{len(plan.steps)} ({step.id}): {step.objective} ---"})
+
+            # Post-edit CodeContext built from current worktree
+            step_index = indexer.index_project(session.worktree_path)
+            step_selector = RelevantFileSelector(step_index)
+            step_candidates, step_sym_refs = step_selector.select_relevant_files(
+                f"{step.objective}\n{' '.join(step.expected_files)}\n{' '.join(step.expected_symbols)}"
+            )
+
+            # Prioritize expected files explicitly mentioned in the step
+            for exp_f in step.expected_files:
+                norm_exp = exp_f.replace("\\", "/").strip("./")
+                if norm_exp in step_index.file_tree and not any(c.rel_path == norm_exp for c in step_candidates):
+                    step_candidates.insert(
+                        0,
+                        RankedCandidate(
+                            rel_path=norm_exp,
+                            score=100.0,
+                            reasons=["Explicitly expected file for current plan step"],
+                        ),
+                    )
+
+            prior_summary = "\n".join(completed_steps_info) if completed_steps_info else "Initial step."
+            if len(prior_summary) > 1000:
+                prior_summary = prior_summary[:1000] + "..."
+
+            step_code_context = budgeter.build_code_context(
+                task_requirements=f"Step Objective: {step.objective}\nRationale: {step.rationale}",
+                ranked_candidates=step_candidates,
+                symbol_refs=step_sym_refs,
+                index=step_index,
+                architecture_decisions=prior_summary,
+            )
+
+            step_prompt = (
+                f"Active Step: {step.id} - {step.objective}\n"
+                f"Rationale: {step.rationale}\n"
+                f"Overall Task: {task.title}\n\n"
+                "RESPONSE CONTRACT:\n"
+                "Format file additions and modifications strictly as:\n"
+                "### File: relative/path/to/file.ext\n"
+                "```language\n"
+                "full file content here\n"
+                "```\n"
+                "Provide complete, valid code without placeholder comments."
+            )
+
+            t_start = time.perf_counter()
+            step_resp = impl_agent.invoke(step_prompt, context=step_code_context)
+            t_dur = (time.perf_counter() - t_start) * 1000.0
+            budget.record_call(
+                provider_name=impl_agent.name,
+                duration_ms=step_resp.duration_ms or t_dur,
+                input_tokens=step_resp.input_tokens,
+                output_tokens=step_resp.output_tokens,
+                fusion_context_tokens=step_resp.fusion_context_tokens,
+                reasoning_tokens=step_resp.reasoning_tokens,
+                visible_output_tokens=step_resp.visible_output_tokens,
+                cached_tokens=step_resp.cached_tokens,
+                raw_usage=step_resp.metadata.get("usage"),
+                stage=f"Step {step.id} Implementation",
+            )
+            proposals.append(
+                Proposal(
+                    agent_name=impl_agent.name,
+                    summary=f"Implementation for {step.id}",
+                    content=step_resp.content,
+                    duration_ms=step_resp.duration_ms or t_dur,
+                    input_tokens=step_resp.input_tokens,
+                    output_tokens=step_resp.output_tokens,
+                )
+            )
+            stage_metrics.append({
+                "stage": f"Step {step.id} Implementation",
+                "provider": impl_agent.name,
+                "role": "implementer",
+                "duration_ms": step_resp.duration_ms or t_dur,
+                "input_tokens": step_resp.input_tokens,
+                "output_tokens": step_resp.output_tokens,
+            })
+
+            # Apply edits strictly via ExecutionBroker
+            step_modified_files = WorkspaceEditor.apply_edits(step_resp.content, broker)
+            for mf in step_modified_files:
+                if mf not in all_modified_files:
+                    all_modified_files.append(mf)
+
+            # Step Verification with Sanitized Expectations as Data
+            test_cmd = self.config.verification_command
+            if step.verification_expectations:
+                val_ok, val_err = plan_engine.validate_verification_expectation(
+                    step.verification_expectations,
+                    worktree_path=session.worktree_path,
+                )
+                if not val_ok:
+                    emit("status", {"message": f"Security Notice: Rejected unsafe verification expectation: {val_err}"})
+                    step_verif = VerificationResult(
+                        passed=False,
+                        exit_code=-1,
+                        stdout="",
+                        stderr=f"Security Policy: Rejected verification expectation: {val_err}",
+                        duration_seconds=0.0,
+                        command="",
+                    )
+                else:
+                    trusted_runner = verifier.detect_trusted_test_command(session.repo_root)
+                    if trusted_runner:
+                        test_cmd = f"{trusted_runner} {step.verification_expectations.strip()}"
+                    else:
+                        test_cmd = self.config.verification_command
+                    step_verif = verifier.run_tests(session, test_command=test_cmd, broker=broker)
+            else:
+                step_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+
+            last_verif_result = step_verif
+
+            # Bounded Step Repair Loop
+            step_repair_rounds = 0
+            while not step_verif.passed and budget.can_attempt_repair(step_repair_rounds)[0]:
+                can_call, call_reason = budget.can_call_provider()
+                if not can_call:
+                    emit("status", {"message": f"Budget ceiling reached ({call_reason}); halting step repair."})
+                    break
+
+                step_repair_rounds += 1
+                budget.record_repair_round()
+                emit("status", {"message": f"{step.id} tests failed. {impl_agent.name} is attempting targeted repair (Round {step_repair_rounds})..."})
+
+                repair_prompt = (
+                    f"Plan Step: {step.id} - {step.objective}\n\n"
+                    f"Verification failed with command: {step_verif.command}\n"
+                )
+                if step_verif.stderr:
+                    repair_prompt += f"Stderr:\n{step_verif.stderr[:800]}\n"
+                if step_verif.stdout:
+                    repair_prompt += f"Stdout:\n{step_verif.stdout[:800]}\n"
+                repair_prompt += (
+                    "\nRESPONSE CONTRACT:\n"
+                    "Format updated files strictly as:\n"
+                    "### File: relative/path/to/file.ext\n"
+                    "```language\nfull updated file content\n```"
+                )
+
+                t_start = time.perf_counter()
+                rep_resp = impl_agent.invoke(repair_prompt, context=step_code_context)
+                t_dur = (time.perf_counter() - t_start) * 1000.0
+                budget.record_call(
+                    provider_name=impl_agent.name,
+                    duration_ms=rep_resp.duration_ms or t_dur,
+                    input_tokens=rep_resp.input_tokens,
+                    output_tokens=rep_resp.output_tokens,
+                    fusion_context_tokens=rep_resp.fusion_context_tokens,
+                    stage=f"Step {step.id} Repair Round {step_repair_rounds}",
+                )
+                repaired = WorkspaceEditor.apply_edits(rep_resp.content, broker)
+                for rf in repaired:
+                    if rf not in step_modified_files:
+                        step_modified_files.append(rf)
+                    if rf not in all_modified_files:
+                        all_modified_files.append(rf)
+
+                step_verif = verifier.run_tests(session, test_command=test_cmd, broker=broker)
+                last_verif_result = step_verif
+
+            # Handle Step Outcome
+            if step_verif.passed:
+                try:
+                    checkpoint = checkpoint_mgr.create_checkpoint(
+                        session=session,
+                        plan_id=plan.plan_id,
+                        step_id=step.id,
+                        objective_summary=step.objective,
+                        approved_files=step_modified_files,
+                        verification_passed=True,
+                        provider_name=impl_agent.name,
+                        token_metrics={
+                            "input_tokens": step_resp.input_tokens,
+                            "output_tokens": step_resp.output_tokens,
+                        },
+                        base_commit_sha=last_verified_sha,
+                    )
+                    last_verified_sha = checkpoint.commit_sha
+                    self.state_manager.record_checkpoint(checkpoint)
+                    emit("status", {"message": f"Step {step.id} verified and checkpointed ({checkpoint.commit_sha[:8]})."})
+                except UnexpectedFilesError as u_exc:
+                    emit("status", {"message": f"Step {step.id} checkpoint failed: {u_exc}"})
+                    step_verif = VerificationResult(
+                        passed=False,
+                        exit_code=-1,
+                        stdout="",
+                        stderr=str(u_exc),
+                        duration_seconds=0.0,
+                        command="",
+                    )
+
+            if step_verif.passed:
+                res = StepResult(
+                    step_id=step.id,
+                    status=StepStatus.COMPLETED,
+                    files_modified=step_modified_files,
+                    checkpoint_sha=last_verified_sha,
+                    verification_passed=True,
+                    provider=impl_agent.name,
+                    repair_rounds=step_repair_rounds,
+                )
+                step.status = StepStatus.COMPLETED
+                step.result = res
+                self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.COMPLETED, result=res)
+                completed_steps_info.append(f"{step.id} ({step.objective}): {', '.join(step_modified_files)}")
+            else:
+                # STEP FAILED: Execute exact rollback and halt dependent steps
+                res = StepResult(
+                    step_id=step.id,
+                    status=StepStatus.FAILED,
+                    files_modified=step_modified_files,
+                    checkpoint_sha=last_verified_sha,
+                    verification_passed=False,
+                    verification_output=step_verif.stderr or step_verif.stdout,
+                    provider=impl_agent.name,
+                    repair_rounds=step_repair_rounds,
+                )
+                step.status = StepStatus.FAILED
+                step.result = res
+                self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.FAILED, result=res)
+                emit("status", {"message": f"Step {step.id} failed after repairs. Performing exact rollback to {last_verified_sha[:8]}..."})
+
+                checkpoint_mgr.rollback_to_checkpoint(
+                    session=session,
+                    checkpoint_sha=last_verified_sha,
+                    created_files=step_modified_files,
+                )
+
+                # Skip all remaining dependent steps
+                for remaining_step in plan.steps[step_idx + 1 :]:
+                    remaining_step.status = StepStatus.SKIPPED
+                    self.state_manager.update_step_status(plan.plan_id, remaining_step.id, StepStatus.SKIPPED)
+
+                emit("status", {"message": f"Halted plan execution after failure in {step.id}."})
+                break
+
+        # 5. Full Repository Verification
+        has_failed_steps = any(s.status == StepStatus.FAILED for s in plan.steps)
+        any_completed = any(s.status == StepStatus.COMPLETED for s in plan.steps)
+
+        if any_completed and not has_failed_steps:
+            emit("status", {"message": "All plan steps completed. Executing full repository verification suite..."})
+            final_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+        else:
+            final_verif = last_verif_result or VerificationResult(
+                passed=False,
+                exit_code=-1,
+                stdout="",
+                stderr="One or more plan steps failed or were not completed.",
+                duration_seconds=0.0,
+                command="",
+            )
+
+        # 6. Extract Unified Diff against original base commit
+        diff = verifier.get_diff(session)
+
+        # 7. Final Peer Review & Bounded Final Repair
+        review_result = None
+        if rev_agent and final_verif.passed and budget.can_call_provider()[0]:
+            emit("status", {"message": f"{rev_agent.name} is conducting final peer review on consolidated plan diff..."})
+            plan_summary_text = "\n".join([
+                f"- {s.id} ({s.status.value}): {s.objective}" for s in plan.steps
+            ])
+            rev_content = (
+                f"### EXECUTION PLAN SUMMARY\n{plan_summary_text}\n\n"
+                f"### CONSOLIDATED UNIFIED DIFF\n{diff if diff else 'No modifications detected.'}\n\n"
+                f"### FINAL VERIFICATION RESULT\n"
+                f"Status: {'PASSED' if final_verif.passed else 'FAILED'}\n"
+                f"Exit Code: {final_verif.exit_code}\n"
+            )
+            t_start = time.perf_counter()
+            review_resp = rev_agent.review(
+                content=rev_content,
+                criteria=(
+                    "Evaluate complete unified diff across all plan steps for correctness, security, syntax, and regressions. "
+                    "If the plan implementation is sound and handles all edge cases, return [APPROVED]. "
+                    "If issues remain, return [NEEDS_REVISION] with specific critique."
+                ),
+                context=context,
+            )
+            t_rev = (time.perf_counter() - t_start) * 1000.0
+            budget.record_call(
+                provider_name=rev_agent.name,
+                duration_ms=review_resp.duration_ms or t_rev,
+                input_tokens=review_resp.input_tokens,
+                output_tokens=review_resp.output_tokens,
+                fusion_context_tokens=review_resp.fusion_context_tokens or (len(rev_content) // 4),
+                stage="Final Plan Peer Review",
+            )
+            review_result = ReviewResult(
+                reviewer_agent=rev_agent.name,
+                subject_agent=impl_agent.name,
+                status=review_resp.status,
+                comments=review_resp.comments,
+                suggested_fixes=review_resp.suggested_fixes,
+                duration_ms=review_resp.duration_ms or t_rev,
+                input_tokens=review_resp.input_tokens,
+                output_tokens=review_resp.output_tokens,
+            )
+            reviews.append(review_result)
+
+            # Bounded Final Repair Cycle if reviewer requested revision
+            if review_result.status == ReviewStatus.NEEDS_REVISION and budget.can_attempt_repair(0)[0]:
+                emit("status", {"message": f"Final review requested revision. {impl_agent.name} is attempting final consolidated repair..."})
+                bounded_critique = review_result.comments[:max_feedback_chars]
+                final_repair_prompt = (
+                    f"Task: {task.title}\n\n"
+                    f"Final peer review critique:\n{bounded_critique}\n\n"
+                    f"### CURRENT UNIFIED DIFF:\n{diff}\n\n"
+                    "RESPONSE CONTRACT:\n"
+                    "Address all critiques. Format updated files strictly as:\n"
+                    "### File: relative/path/to/file.ext\n```language\nfull file content\n```"
+                )
+                t_start = time.perf_counter()
+                rep_resp = impl_agent.invoke(final_repair_prompt, context=plan_code_context)
+                t_dur = (time.perf_counter() - t_start) * 1000.0
+                budget.record_call(
+                    provider_name=impl_agent.name,
+                    duration_ms=rep_resp.duration_ms or t_dur,
+                    input_tokens=rep_resp.input_tokens,
+                    output_tokens=rep_resp.output_tokens,
+                    stage="Final Consolidated Repair",
+                )
+                WorkspaceEditor.apply_edits(rep_resp.content, broker)
+                final_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+                diff = verifier.get_diff(session)
+
+                if budget.can_call_provider()[0]:
+                    emit("status", {"message": f"{rev_agent.name} is re-evaluating updated diff..."})
+                    rev_content_2 = f"### UNIFIED DIFF (After Final Repair)\n{diff}\n\n### VERIFICATION\nPassed: {final_verif.passed}\n"
+                    t_start2 = time.perf_counter()
+                    review_resp_2 = rev_agent.review(
+                        content=rev_content_2,
+                        criteria="Re-evaluate updated unified diff after repair for correctness and resolution of previous critique.",
+                        context=context,
+                    )
+                    t_rev2 = (time.perf_counter() - t_start2) * 1000.0
+                    budget.record_call(
+                        provider_name=rev_agent.name,
+                        duration_ms=review_resp_2.duration_ms or t_rev2,
+                        input_tokens=review_resp_2.input_tokens,
+                        output_tokens=review_resp_2.output_tokens,
+                        stage="Final Plan Peer Re-Review",
+                    )
+                    review_result = ReviewResult(
+                        reviewer_agent=rev_agent.name,
+                        subject_agent=impl_agent.name,
+                        status=review_resp_2.status,
+                        comments=review_resp_2.comments,
+                    )
+                    reviews.append(review_result)
+
+        plan_summary_msg = (
+            f"Checkpointed execution plan completed in isolated worktree ({session.task_branch}).\n"
+            f"Plan: '{plan.title}'\n"
+            f"Steps completed: {len([s for s in plan.steps if s.status == StepStatus.COMPLETED])}/{len(plan.steps)}\n"
+            f"Files modified: {', '.join(all_modified_files) if all_modified_files else 'None'}\n"
+            f"Automated verification: {'PASSED' if final_verif.passed else 'FAILED'}\n"
+            f"Final peer review: {review_result.status.value if review_result else 'SKIPPED'}"
+        )
+
+        has_any_tok = any(sm.get("input_tokens") is not None for sm in stage_metrics)
+        tot_in = sum(sm["input_tokens"] for sm in stage_metrics if sm.get("input_tokens") is not None) if has_any_tok else None
+        tot_out = sum(sm["output_tokens"] for sm in stage_metrics if sm.get("output_tokens") is not None) if has_any_tok else None
+        tot_duration = sum(sm["duration_ms"] for sm in stage_metrics)
+
+        deliberation = DeliberationResult(
+            strategy_used=StrategyType.CHECKPOINTED_PLAN.value,
+            synthesized_output=plan_summary_msg,
+            proposals=proposals,
+            reviews=reviews,
+            participating_providers=[planner_agent.name, impl_agent.name] + ([rev_agent.name] if rev_agent else []),
+            rounds_executed=len([s for s in plan.steps if s.status == StepStatus.COMPLETED]),
+            total_input_tokens=tot_in,
+            total_output_tokens=tot_out,
+            duration_ms=tot_duration,
+            stage_metrics=stage_metrics,
+        )
+
+        return deliberation, session, final_verif, diff, review_result
+
     def run_task(
+
         self,
         user_prompt: str,
         on_status: Optional[Callable] = None,
@@ -566,6 +1083,7 @@ class FusionOrchestrator:
             available_providers=self.providers,
             optimization_mode=self.config.optimization_mode,
             provider_stats=provider_stats,
+            allow_multi_step_planning=getattr(self.config.deliberation, "allow_multi_step_planning", True),
         )
         emit("routing_decision", {
             "strategy": routing.strategy.value,
@@ -636,13 +1154,62 @@ class FusionOrchestrator:
                     final_answer=err_msg,
                 )
 
-        # 5. Execute Multi-Agent Deliberation or Autonomous Edit
+        # 5. Execute Multi-Agent Deliberation, Autonomous Edit, or Checkpointed Plan
         workspace_session = None
         verification_result = None
         diff = None
         review_result = None
 
-        if active_strategy == StrategyType.AUTONOMOUS_EDIT:
+        if active_strategy == StrategyType.CHECKPOINTED_PLAN:
+            emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
+            try:
+                deliberation, workspace_session, verification_result, diff, review_result = (
+                    self._run_checkpointed_plan(
+                        task=task,
+                        lead=lead_agent,
+                        implementer=implementer_agent,
+                        reviewer=reviewer_agent,
+                        context=context,
+                        emit=emit,
+                        budget=budget,
+                    )
+                )
+            except DirtyWorkingTreeError as exc:
+                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                task.status = TaskStatus.FAILED
+                err_msg = str(exc)
+                emit("status", {"message": f"Refusal: {err_msg}"})
+                return OrchestratorResult(
+                    task=task,
+                    routing=routing,
+                    deliberation=DeliberationResult(
+                        strategy_used="FAILED",
+                        synthesized_output=err_msg,
+                        participating_providers=[primary_agent.name],
+                    ),
+                    final_answer=err_msg,
+                )
+            except Exception as exc:
+                try:
+                    WorkspaceSession(task_id=task.id, repo_root=Path(self.config.project_root).resolve()).teardown(delete_branch=True)
+                except Exception:
+                    pass
+                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                task.status = TaskStatus.FAILED
+                err_msg = f"Checkpointed plan execution failed: {exc}"
+                emit("status", {"message": f"Error: {err_msg}"})
+                return OrchestratorResult(
+                    task=task,
+                    routing=routing,
+                    deliberation=DeliberationResult(
+                        strategy_used="FAILED",
+                        synthesized_output=err_msg,
+                        participating_providers=[primary_agent.name],
+                    ),
+                    final_answer=err_msg,
+                )
+        elif active_strategy == StrategyType.AUTONOMOUS_EDIT:
+
             emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
             try:
                 deliberation, workspace_session, verification_result, diff, review_result = (

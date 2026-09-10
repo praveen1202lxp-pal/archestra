@@ -20,8 +20,11 @@ def test_promotion_clean_merge(tmp_path):
     mock_repo_status = MagicMock(returncode=0, stdout="", stderr="")                  # main repo is clean
     mock_add = MagicMock(returncode=0, stdout="", stderr="")
     mock_wt_status = MagicMock(returncode=0, stdout="M src/file.py\n", stderr="")
-    mock_commit = MagicMock(returncode=0, stdout="[fusion/task-prom1 abc] commit\n", stderr="")
-    mock_merge = MagicMock(returncode=0, stdout="Fast-forward\n", stderr="")
+    mock_commit_wt = MagicMock(returncode=0, stdout="[fusion/task-prom1 abc] commit\n", stderr="")
+    mock_diff = MagicMock(returncode=0, stdout="diff --git a/src/file.py\n", stderr="")
+    mock_checkout = MagicMock(returncode=0, stdout="Switched to branch 'master'\n", stderr="")
+    mock_merge_squash = MagicMock(returncode=0, stdout="Squash commit -- not committing\n", stderr="")
+    mock_commit_target = MagicMock(returncode=0, stdout="[master 456] feat: implement\n", stderr="")
     mock_rev_prom = MagicMock(returncode=0, stdout="merged_hash_456\n", stderr="")
 
     with patch.object(engine, "_run_git") as mock_git, \
@@ -32,8 +35,11 @@ def test_promotion_clean_merge(tmp_path):
             mock_repo_status,
             mock_add,
             mock_wt_status,
-            mock_commit,
-            mock_merge,
+            mock_commit_wt,
+            mock_diff,
+            mock_checkout,
+            mock_merge_squash,
+            mock_commit_target,
             mock_rev_prom,
         ]
 
@@ -102,8 +108,11 @@ def test_promotion_conflict_fails_safely(tmp_path):
     mock_repo_status = MagicMock(returncode=0, stdout="", stderr="")
     mock_add = MagicMock(returncode=0, stdout="", stderr="")
     mock_wt_status = MagicMock(returncode=0, stdout="M src/file.py\n", stderr="")
-    mock_commit = MagicMock(returncode=0, stdout="[fusion/task-prom2 abc] commit\n", stderr="")
+    mock_commit_wt = MagicMock(returncode=0, stdout="[fusion/task-prom2 abc] commit\n", stderr="")
+    mock_diff = MagicMock(returncode=0, stdout="diff --git a/src/file.py\n", stderr="")
+    mock_checkout = MagicMock(returncode=0, stdout="Switched to branch 'master'\n", stderr="")
     mock_merge = MagicMock(returncode=1, stdout="", stderr="CONFLICT: merge conflict in src/file.py")
+    mock_abort = MagicMock(returncode=0, stdout="", stderr="")
 
     with patch.object(engine, "_run_git") as mock_git:
         mock_git.side_effect = [
@@ -112,8 +121,11 @@ def test_promotion_conflict_fails_safely(tmp_path):
             mock_repo_status,
             mock_add,
             mock_wt_status,
-            mock_commit,
+            mock_commit_wt,
+            mock_diff,
+            mock_checkout,
             mock_merge,
+            mock_abort,
         ]
 
         result = engine.promote(session)

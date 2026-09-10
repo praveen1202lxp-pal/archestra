@@ -52,6 +52,10 @@ class DeliberationConfig:
     context_require_minimal_workspace: bool = False # Mode B toggle: construct minimal read-only workspace on disk
     max_context_expansion_rounds: int = 1          # Max bounded retrieval expansions if context is insufficient
     max_expansion_files: int = 2                    # Max additional files retrieved per expansion round
+    max_plan_steps: int = 5                         # Maximum steps in an execution plan
+    max_plan_amendments: int = 1                    # Maximum dynamic plan amendments permitted
+    allow_multi_step_planning: bool = True          # Enable multi-step planning for complex tasks
+    plan_critique_required_for_high_risk: bool = True # Critique plan if review risk is HIGH or CRITICAL
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

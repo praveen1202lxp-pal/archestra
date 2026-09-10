@@ -79,6 +79,22 @@ class TaskBudgetController:
             return False, f"Maximum repair rounds ({self.max_repair_rounds}) reached."
         return self.can_call_provider()
 
+    def can_start_step(
+        self,
+        remaining_steps_count: int,
+        requires_final_review: bool = True,
+    ) -> Tuple[bool, Optional[str]]:
+        """Check whether sufficient budget remains to complete this step and reserve pipeline completion."""
+        min_required_calls = 1 + (1 if requires_final_review else 0)
+        if self.calls_made + min_required_calls > self.max_provider_calls:
+            return (
+                False,
+                f"Insufficient provider calls remaining ({self.max_provider_calls - self.calls_made} left; "
+                f"need at least {min_required_calls} to execute step and reserve final peer review)."
+            )
+        return self.can_call_provider()
+
+
     def record_call(
         self,
         provider_name: str,

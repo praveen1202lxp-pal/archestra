@@ -35,4 +35,17 @@ __all__ = [
     "OmissionManifest",
     "SelectedFile",
     "SymbolReference",
+    "StepStatus",
+    "PlanStep",
+    "StepResult",
+    "ExecutionPlan",
+    "Checkpoint",
 ]
+
+from fusion_agent.models.plan import (
+    StepStatus,
+    PlanStep,
+    StepResult,
+    ExecutionPlan,
+    Checkpoint,
+)

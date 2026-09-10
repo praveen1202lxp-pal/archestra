@@ -54,6 +54,10 @@ class TaskRouter:
     MULTI_FILE_PATTERNS = [
         r"\b(across\s+files|multiple\s+files|repository|repo-wide|modules?|packages?|directories|subsystems?)\b",
     ]
+    MULTI_COMPONENT_PATTERNS = [
+        r"\b(schema\s+and\s+(\w+\s+)?(cli|query|service|command)|cli\s+command\s+and|service\s+and\s+cli|multi-step|database\s+and\s+cli|pipeline\s+and\s+tests?)\b",
+        r"\b(and\s+expose\s+a\s+cli|and\s+add\s+a\s+cli|and\s+create\s+a\s+cli|and\s+.*?\btests?)\b",
+    ]
 
     def assess_task(self, title_or_prompt: str) -> TaskAssessment:
         """Perform deterministic V1 TaskAssessment on task prompt."""
@@ -66,16 +70,17 @@ class TaskRouter:
         security = any(re.search(p, text) for p in self.SECURITY_PATTERNS)
         simple = any(re.search(p, text) for p in self.SIMPLE_PATTERNS)
         multi_file = any(re.search(p, text) for p in self.MULTI_FILE_PATTERNS)
+        multi_component = any(re.search(p, text) for p in self.MULTI_COMPONENT_PATTERNS)
 
         # 1. Determine TaskType
         if debugging:
             task_type = TaskType.BUG_INVESTIGATION
-        elif arch:
-            task_type = TaskType.ARCHITECTURE_DESIGN
-        elif refactor and not code:
-            task_type = TaskType.CRITICAL_REFACTOR
         elif code:
             task_type = TaskType.CODE_MODIFICATION
+        elif arch:
+            task_type = TaskType.ARCHITECTURE_DESIGN
+        elif refactor:
+            task_type = TaskType.CRITICAL_REFACTOR
         elif simple:
             task_type = TaskType.SIMPLE_QUERY
         else:
@@ -84,7 +89,7 @@ class TaskRouter:
         # 2. Determine Complexity
         if security or (debugging and arch):
             complexity = Complexity.CRITICAL
-        elif debugging or arch:
+        elif debugging or arch or multi_component:
             complexity = Complexity.HIGH
         elif code or refactor:
             complexity = Complexity.MEDIUM
@@ -94,7 +99,7 @@ class TaskRouter:
             complexity = Complexity.MEDIUM
 
         # 3. Determine Estimated Scope
-        if multi_file:
+        if multi_file or multi_component:
             scope = ScopeEstimate.MULTI_FILE
         elif task_type in (TaskType.CODE_MODIFICATION, TaskType.CRITICAL_REFACTOR):
             scope = ScopeEstimate.SINGLE_FILE
@@ -102,6 +107,7 @@ class TaskRouter:
             scope = ScopeEstimate.REPO_WIDE
         else:
             scope = ScopeEstimate.SINGLE_FILE
+
 
         # 4. Determine Review Risk
         if security:
@@ -220,11 +226,13 @@ class TaskRouter:
         available_providers: Dict[str, AgentProvider],
         optimization_mode: OptimizationMode = OptimizationMode.BALANCED,
         provider_stats: Optional[Dict[str, Any]] = None,
+        allow_multi_step_planning: bool = True,
     ) -> RoutingDecision:
         """Deterministically determine collaboration strategy and dynamic provider roles."""
         assessment = self.assess_task(task_prompt)
         task_type = assessment.task_type
         complexity = assessment.complexity
+
 
         # 1. Filter providers by constraints
         eligible_providers = dict(available_providers)
@@ -297,7 +305,18 @@ class TaskRouter:
             )
 
         # 3. Base strategy selection by task type, complexity, and assessment
-        if task_type == TaskType.SIMPLE_QUERY or complexity == Complexity.LOW:
+        if (
+            allow_multi_step_planning
+            and assessment.implementation_required
+            and (
+                assessment.estimated_scope in (ScopeEstimate.MULTI_FILE, ScopeEstimate.REPO_WIDE)
+                or (assessment.complexity in (Complexity.HIGH, Complexity.CRITICAL) and assessment.expected_files_count >= 2)
+            )
+        ):
+            base_strategy = StrategyType.CHECKPOINTED_PLAN
+            rationale = "Multi-component task requires checkpointed multi-step execution in an isolated workspace."
+
+        elif task_type == TaskType.SIMPLE_QUERY or complexity == Complexity.LOW:
             base_strategy = StrategyType.DIRECT
             rationale = "Simple task with low complexity; single agent execution is optimal."
 
@@ -322,6 +341,9 @@ class TaskRouter:
             if base_strategy in (StrategyType.PROPOSE_CRITIQUE_REFINE, StrategyType.INDEPENDENT_INVESTIGATION):
                 base_strategy = StrategyType.EXECUTE_AND_REVIEW
                 rationale += " (Adjusted to EXECUTE_AND_REVIEW for FASTEST mode)"
+            elif base_strategy == StrategyType.CHECKPOINTED_PLAN:
+                base_strategy = StrategyType.AUTONOMOUS_EDIT
+                rationale += " (Adjusted to AUTONOMOUS_EDIT for FASTEST mode)"
             elif base_strategy in (StrategyType.EXECUTE_AND_REVIEW, StrategyType.AUTONOMOUS_EDIT):
                 base_strategy = StrategyType.DIRECT
                 rationale += " (Adjusted to DIRECT for FASTEST mode)"
@@ -347,7 +369,15 @@ class TaskRouter:
             reviewer = None
         else:
             # Multi-provider role assignment
-            if base_strategy == StrategyType.AUTONOMOUS_EDIT:
+            if base_strategy == StrategyType.CHECKPOINTED_PLAN:
+                lead = ranked_leads[0]
+                impl_candidates = [p for p in ranked_implementers if p != lead]
+                implementer = impl_candidates[0] if impl_candidates else ranked_implementers[0]
+                peer_candidates = [p for p in ranked_reviewers if p != implementer and p != lead]
+                if not peer_candidates:
+                    peer_candidates = [p for p in ranked_reviewers if p != implementer]
+                reviewer = peer_candidates[0] if (peer_candidates and assessment.second_model_benefit) else None
+            elif base_strategy == StrategyType.AUTONOMOUS_EDIT:
                 implementer = ranked_implementers[0]
                 peer_candidates = [p for p in ranked_reviewers if p != implementer]
                 reviewer = peer_candidates[0] if (peer_candidates and assessment.second_model_benefit) else None
@@ -358,12 +388,13 @@ class TaskRouter:
                 reviewer = peer_candidates[0] if peer_candidates else None
                 implementer = ranked_implementers[0]
 
-        primary = implementer if base_strategy == StrategyType.AUTONOMOUS_EDIT else lead
+        primary = lead if base_strategy == StrategyType.CHECKPOINTED_PLAN else (implementer if base_strategy == StrategyType.AUTONOMOUS_EDIT else lead)
         secondary = reviewer
 
         # If strategy was autonomous edit and single provider or FASTEST mode turned off reviewer
-        if base_strategy == StrategyType.AUTONOMOUS_EDIT and secondary is None and len(provider_names) > 1 and not assessment.second_model_benefit:
+        if base_strategy in (StrategyType.AUTONOMOUS_EDIT, StrategyType.CHECKPOINTED_PLAN) and secondary is None and len(provider_names) > 1 and not assessment.second_model_benefit:
             rationale += " Single-agent autonomous edit selected because second-model benefit is LOW."
+
 
         role_assignments = {
             "lead": lead,

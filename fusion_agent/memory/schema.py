@@ -1,6 +1,6 @@
 """SQLite database schema definitions for Fusion Agent shared memory."""
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -77,9 +77,67 @@ CREATE TABLE IF NOT EXISTS reviews (
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT,
+    status TEXT NOT NULL,
+    max_steps INTEGER DEFAULT 5,
+    amendments_count INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_steps (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    step_index INTEGER NOT NULL,
+    objective TEXT NOT NULL,
+    rationale TEXT,
+    expected_files TEXT,
+    expected_symbols TEXT,
+    dependencies TEXT,
+    verification_expectations TEXT,
+    risk_level TEXT NOT NULL,
+    estimated_complexity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provider_name TEXT,
+    repair_rounds INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY(plan_id) REFERENCES plans(id)
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    base_commit_sha TEXT NOT NULL,
+    files_changed TEXT,
+    diff_summary TEXT,
+    verification_passed INTEGER DEFAULT 0,
+    provider_name TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    fusion_context_tokens INTEGER DEFAULT 0,
+    duration_ms REAL DEFAULT 0.0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(plan_id) REFERENCES plans(id),
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_task ON agent_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id);
+CREATE INDEX IF NOT EXISTS idx_plans_task ON plans(task_id);
+CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON plan_steps(plan_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_plan ON checkpoints(plan_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id);
 """
+

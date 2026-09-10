@@ -78,30 +78,35 @@ class PromotionEngine:
                 ),
             )
 
-        # 4. Stage and commit all modifications in worktree
+        # 4. Stage and commit any remaining modifications in worktree
         self._run_git(["add", "-A"], cwd=worktree_path)
         status_res = self._run_git(["status", "--porcelain"], cwd=worktree_path)
-        if not status_res.stdout.strip():
+        if status_res.stdout.strip():
+            msg = commit_message or f"feat(fusion): implement autonomous task {session.task_id}"
+            commit_res = self._run_git(["commit", "-m", msg], cwd=worktree_path)
+            if commit_res.returncode != 0:
+                return PromotionResult(
+                    success=False,
+                    target_branch=target_branch,
+                    message=f"Failed to commit changes in worktree: {commit_res.stderr.strip()}",
+                )
+
+        # 5. Check if task branch actually differs from base commit
+        diff_against_base = self._run_git(["diff", session.base_commit, session.task_branch], cwd=repo_path)
+        if not diff_against_base.stdout.strip():
             session.state = WorkspaceState.PROMOTED
             session.teardown(delete_branch=True)
             return PromotionResult(
                 success=True,
                 target_branch=target_branch,
-                message="No modifications detected in worktree; session cleanly closed.",
+                message="No modifications detected between task branch and target branch; session cleanly closed.",
             )
 
-        msg = commit_message or f"feat(fusion): implement autonomous task {session.task_id}"
-        commit_res = self._run_git(["commit", "-m", msg], cwd=worktree_path)
-        if commit_res.returncode != 0:
-            return PromotionResult(
-                success=False,
-                target_branch=target_branch,
-                message=f"Failed to commit changes in worktree: {commit_res.stderr.strip()}",
-            )
-
-        # 5. Merge task branch into main repository target branch
-        merge_res = self._run_git(["merge", session.task_branch], cwd=repo_path)
+        # 6. Squash merge task branch into main repository target branch
+        self._run_git(["checkout", target_branch], cwd=repo_path)
+        merge_res = self._run_git(["merge", "--squash", session.task_branch], cwd=repo_path)
         if merge_res.returncode != 0:
+            self._run_git(["merge", "--abort"], cwd=repo_path)
             return PromotionResult(
                 success=False,
                 target_branch=target_branch,
@@ -111,9 +116,18 @@ class PromotionEngine:
                 ),
             )
 
+        msg = commit_message or f"feat(fusion): implement autonomous task {session.task_id}"
+        commit_res = self._run_git(["commit", "-m", msg], cwd=repo_path)
+        if commit_res.returncode != 0:
+            return PromotionResult(
+                success=False,
+                target_branch=target_branch,
+                message=f"Failed to commit squashed changes in target branch '{target_branch}': {commit_res.stderr.strip()}",
+            )
+
         promoted_commit = self._run_git(["rev-parse", "HEAD"], cwd=repo_path).stdout.strip()
 
-        # 6. Clean teardown
+        # 7. Clean teardown
         session.state = WorkspaceState.PROMOTED
         session.teardown(delete_branch=True)
 
@@ -123,6 +137,7 @@ class PromotionEngine:
             target_branch=target_branch,
             message=f"Successfully promoted changes into {target_branch} (commit {promoted_commit[:8]}).",
         )
+
 
     def discard(self, session: WorkspaceSession) -> None:
         """Discard an unverified or rejected session with zero leftover residue."""

@@ -1,6 +1,7 @@
 """Workspace and isolation subsystem for safe autonomous repository editing."""
 
 from fusion_agent.workspace.broker import ExecutionBroker
+from fusion_agent.workspace.checkpoint import CheckpointManager
 from fusion_agent.workspace.editor import WorkspaceEditor
 from fusion_agent.workspace.promotion import PromotionEngine, PromotionResult
 from fusion_agent.workspace.session import DirtyWorkingTreeError, WorkspaceSession, WorkspaceState
@@ -16,4 +17,6 @@ __all__ = [
     "VerificationResult",
     "PromotionEngine",
     "PromotionResult",
+    "CheckpointManager",
 ]
+
