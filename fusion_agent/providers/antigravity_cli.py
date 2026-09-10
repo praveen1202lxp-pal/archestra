@@ -353,8 +353,13 @@ class AntigravityCLIProvider(AgentProvider):
             with tempfile.TemporaryDirectory() as empty_dir:
                 exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
 
-        structured = self._normalize_output(exec_result)
-        formatted_content = structured.to_formatted_text()
+        structured = None
+        raw_text = exec_result.response_text or exec_result.stdout
+        if "RESPONSE CONTRACT" in prompt or "### File:" in raw_text or '"steps":' in raw_text:
+            formatted_content = raw_text
+        else:
+            structured = self._normalize_output(exec_result)
+            formatted_content = structured.to_formatted_text()
 
         # Token metrics from native usage
         input_tokens = None
@@ -384,7 +389,7 @@ class AntigravityCLIProvider(AgentProvider):
         metadata: Dict[str, Any] = {
             "provider": "antigravity_cli",
             "executable": self.executable_path,
-            "confidence": structured.confidence,
+            "confidence": structured.confidence if structured else 1.0,
         }
         if exec_result.conversation_id:
             metadata["conversation_id"] = exec_result.conversation_id
