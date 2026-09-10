@@ -316,7 +316,7 @@ class GeminiCLIProvider(AgentProvider):
         if cwd is not None:
             raw_output = self._execute_cli(final_prompt, cwd=cwd)
         else:
-            with tempfile.TemporaryDirectory() as empty_dir:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as empty_dir:
                 raw_output = self._execute_cli(final_prompt, cwd=empty_dir)
 
         structured = self._parse_structured_output(raw_output)
@@ -373,7 +373,7 @@ class GeminiCLIProvider(AgentProvider):
         if cwd is not None:
             raw_output = self._execute_cli(final_prompt, cwd=cwd)
         else:
-            with tempfile.TemporaryDirectory() as empty_dir:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as empty_dir:
                 raw_output = self._execute_cli(final_prompt, cwd=empty_dir)
 
         # Parse review status

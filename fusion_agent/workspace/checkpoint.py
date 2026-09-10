@@ -55,8 +55,8 @@ class CheckpointManager:
         """Stage only approved task paths, commit with command-local identity, and record state."""
         worktree = session.worktree_path
 
-        # 1. Inspect git status before staging
-        status_raw = self._run_git(["status", "--porcelain"], cwd=worktree)
+        # 1. Inspect git status before staging (use --untracked-files=all so individual files are listed)
+        status_raw = self._run_git(["status", "--porcelain", "--untracked-files=all"], cwd=worktree)
         changed_paths: Set[str] = set()
         for line in status_raw.splitlines():
             line = line.strip()
@@ -71,7 +71,10 @@ class CheckpointManager:
         # 2. Validate against approved paths if provided
         if approved_files is not None:
             norm_approved = {f.replace("\\", "/").strip("./") for f in approved_files}
-            unexpected = [p for p in changed_paths if p not in norm_approved]
+            unexpected = [
+                p for p in changed_paths
+                if p not in norm_approved and not any(a == p or a.startswith(p if p.endswith("/") else p + "/") for a in norm_approved)
+            ]
             if unexpected:
                 raise UnexpectedFilesError(
                     f"Checkpoint rejected for {step_id}: unexpected files were created or modified "

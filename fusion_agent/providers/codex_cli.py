@@ -358,7 +358,7 @@ class CodexCLIProvider(AgentProvider):
         if cwd is not None:
             exec_result = self._execute_cli(final_prompt, cwd=cwd)
         else:
-            with tempfile.TemporaryDirectory() as empty_dir:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as empty_dir:
                 exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
 
         structured = None
@@ -451,7 +451,7 @@ class CodexCLIProvider(AgentProvider):
         if cwd is not None:
             exec_result = self._execute_cli(final_prompt, cwd=cwd)
         else:
-            with tempfile.TemporaryDirectory() as empty_dir:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as empty_dir:
                 exec_result = self._execute_cli(final_prompt, cwd=empty_dir)
 
         review_text = exec_result.response_text
