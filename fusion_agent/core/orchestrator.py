@@ -776,10 +776,10 @@ class FusionOrchestrator:
                         syntax_passed = True
                         syntax_err = ""
                         for pf in py_files:
-                            comp_res = broker.run_command(f"python -m py_compile {pf}", cwd=session.worktree_path)
-                            if comp_res.returncode != 0:
+                            retcode, out, err = broker.run_command(f"python -m py_compile {pf}")
+                            if retcode != 0:
                                 syntax_passed = False
-                                syntax_err = comp_res.stderr or comp_res.stdout
+                                syntax_err = err or out
                                 break
                         step_verif = VerificationResult(
                             passed=syntax_passed,
@@ -822,10 +822,10 @@ class FusionOrchestrator:
                     syntax_passed = True
                     syntax_err = ""
                     for pf in py_files:
-                        comp_res = broker.run_command(f"python -m py_compile {pf}", cwd=session.worktree_path)
-                        if comp_res.returncode != 0:
+                        retcode, out, err = broker.run_command(f"python -m py_compile {pf}")
+                        if retcode != 0:
                             syntax_passed = False
-                            syntax_err = comp_res.stderr or comp_res.stdout
+                            syntax_err = err or out
                             break
                     step_verif = VerificationResult(
                         passed=syntax_passed,
