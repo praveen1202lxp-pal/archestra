@@ -45,15 +45,25 @@ class CheckpointManager:
         session: WorkspaceSession,
         plan_id: str,
         step_id: str,
-        objective_summary: str,
+        objective_summary: Any = "",
         approved_files: Optional[List[str]] = None,
         verification_passed: bool = True,
         provider_name: str = "",
         token_metrics: Optional[Dict[str, Any]] = None,
         base_commit_sha: Optional[str] = None,
+        verification_id: Optional[str] = None,
+        state_manager: Optional[Any] = None,
+        expected_files: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> Checkpoint:
-        """Stage only approved task paths, commit with command-local identity, and record state."""
+        """Stage only approved task paths, record write-ahead intent, commit with trailers, and record state."""
         worktree = session.worktree_path
+
+        if approved_files is None and expected_files is not None:
+            approved_files = expected_files
+        if approved_files is None and isinstance(objective_summary, (list, tuple)):
+            approved_files = list(objective_summary)
+            objective_summary = f"Implement {step_id}"
 
         # 1. Inspect git status before staging (use --untracked-files=all so individual files are listed)
         status_raw = self._run_git(["status", "--porcelain", "--untracked-files=all"], cwd=worktree)
@@ -62,7 +72,6 @@ class CheckpointManager:
             line = line.strip()
             if not line:
                 continue
-            # Format: XY <file> or XY <orig> -> <file>
             parts = line[2:].strip().split(" -> ")
             rel_file = parts[-1].strip().replace("\\", "/")
             if not rel_file.startswith(".fusion") and "/.fusion/" not in rel_file:
@@ -89,28 +98,59 @@ class CheckpointManager:
         # 4. Check status of staged files
         diff_summary = ""
         files_changed: List[str] = []
+        checkpoint_id = str(uuid.uuid4())[:8]
+        expected_parent_sha = self._run_git(["rev-parse", "HEAD"], cwd=worktree)
 
-        if paths_to_stage:
-            commit_msg = f"checkpoint({step_id}): {objective_summary.strip()}"
-            # Command-local Git identity: does NOT modify global or local repo config
-            self._run_git([
-                "-c", "user.name=Fusion Engine",
-                "-c", "user.email=fusion@local",
-                "commit", "-m", commit_msg
-            ], cwd=worktree)
+        # Write-ahead checkpoint transaction intent in PREPARING status
+        if state_manager and hasattr(state_manager, "record_checkpoint_transaction_intent"):
+            state_manager.record_checkpoint_transaction_intent(
+                checkpoint_id=checkpoint_id,
+                task_id=session.task_id,
+                plan_id=plan_id,
+                step_id=step_id,
+                expected_parent_sha=expected_parent_sha,
+                verification_id=verification_id or "verified",
+                approved_paths=list(paths_to_stage),
+                verified=verification_passed,
+            )
 
-            commit_sha = self._run_git(["rev-parse", "HEAD"], cwd=worktree)
-            files_raw = self._run_git(["diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha], cwd=worktree)
-            files_changed = [f.strip() for f in files_raw.splitlines() if f.strip()]
-            diff_summary = self._run_git(["diff", "HEAD~1", "HEAD", "--stat"], cwd=worktree)
-        else:
-            commit_sha = self._run_git(["rev-parse", "HEAD"], cwd=worktree)
-            diff_summary = "No file changes in this step."
+        try:
+            if paths_to_stage:
+                summary_text = " ".join(objective_summary) if isinstance(objective_summary, (list, tuple)) else str(objective_summary or "")
+                commit_msg = (
+                    f"checkpoint({step_id}): {summary_text.strip()}\n\n"
+                    f"Fusion-Task-ID: {session.task_id}\n"
+                    f"Fusion-Plan-ID: {plan_id}\n"
+                    f"Fusion-Step-ID: {step_id}\n"
+                    f"Fusion-Checkpoint-ID: {checkpoint_id}\n"
+                )
+                self._run_git([
+                    "-c", "user.name=Fusion Engine",
+                    "-c", "user.email=fusion@local",
+                    "commit", "-m", commit_msg
+                ], cwd=worktree)
+
+                commit_sha = self._run_git(["rev-parse", "HEAD"], cwd=worktree)
+                files_raw = self._run_git(["diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha], cwd=worktree)
+                files_changed = [f.strip() for f in files_raw.splitlines() if f.strip()]
+                diff_summary = self._run_git(["diff", "HEAD~1", "HEAD", "--stat"], cwd=worktree)
+            else:
+                commit_sha = self._run_git(["rev-parse", "HEAD"], cwd=worktree)
+                diff_summary = "No file changes in this step."
+
+            # Mark checkpoint transaction COMPLETED
+            if state_manager and hasattr(state_manager, "complete_checkpoint_transaction"):
+                state_manager.complete_checkpoint_transaction(checkpoint_id)
+
+        except Exception as exc:
+            if state_manager and hasattr(state_manager, "fail_checkpoint_transaction"):
+                state_manager.fail_checkpoint_transaction(checkpoint_id)
+            raise exc
 
         base_sha = base_commit_sha or session.base_commit or commit_sha
 
         checkpoint = Checkpoint(
-            checkpoint_id=str(uuid.uuid4())[:8],
+            checkpoint_id=checkpoint_id,
             plan_id=plan_id,
             task_id=session.task_id,
             step_id=step_id,
@@ -125,31 +165,53 @@ class CheckpointManager:
         )
         return checkpoint
 
+    @classmethod
+    def get_commit_trailers(cls, commit_sha: str, cwd: Path) -> Dict[str, str]:
+        """Extract Fusion metadata trailers from a Git commit."""
+        raw_msg = cls._run_git(["log", "-1", "--format=%B", commit_sha], cwd=cwd, check=False)
+        trailers: Dict[str, str] = {}
+        for line in raw_msg.splitlines():
+            line = line.strip()
+            if line.startswith("Fusion-") and ":" in line:
+                k, v = line.split(":", 1)
+                trailers[k.strip()] = v.strip()
+        return trailers
+
     def rollback_to_checkpoint(
         self,
         session: WorkspaceSession,
         checkpoint_sha: str,
         created_files: Optional[List[str]] = None,
     ) -> None:
-        """Restore the isolated worktree strictly to checkpoint_sha, removing untracked task files."""
+        """Restore the isolated worktree strictly to checkpoint_sha using selective rollback."""
         worktree = session.worktree_path
 
-        # 1. Reset tracked files
+        # 1. Reset tracked files to the verified checkpoint commit
         self._run_git(["reset", "--hard", checkpoint_sha], cwd=worktree)
 
         # 2. Specifically remove known task-created files if still present
         if created_files:
             for rel_f in created_files:
                 target_file = (worktree / rel_f).resolve()
-                # Security constraint: only delete if inside the worktree
                 if str(target_file).startswith(str(worktree)) and target_file.is_file():
                     try:
                         target_file.unlink()
                     except Exception:
                         pass
 
-        # 3. Clean any remaining untracked files strictly inside worktree
-        self._run_git(["clean", "-fd"], cwd=worktree)
+        # 3. Selectively remove unverified/untracked task files inside worktree
+        status_raw = self._run_git(["status", "--porcelain", "--untracked-files=all"], cwd=worktree)
+        for line in status_raw.splitlines():
+            line = line.strip()
+            if line.startswith("??"):
+                rel_path = line[2:].strip().replace("\\", "/")
+                if not rel_path.startswith(".fusion") and "/.fusion/" not in rel_path:
+                    target_file = (worktree / rel_path).resolve()
+                    if str(target_file).startswith(str(worktree)) and target_file.is_file():
+                        try:
+                            target_file.unlink()
+                        except Exception:
+                            pass
 
         # 4. Verify post-rollback state
         status = self._run_git(["status", "--porcelain"], cwd=worktree)
@@ -159,7 +221,7 @@ class CheckpointManager:
         ]
         if dirty_lines:
             raise CheckpointRollbackError(
-                f"Worktree rollback to {checkpoint_sha[:8]} failed to restore clean state.\n"
+                f"Worktree selective rollback to {checkpoint_sha[:8]} failed to restore clean state.\n"
                 f"Remaining status:\n{chr(10).join(dirty_lines)}"
             )
 

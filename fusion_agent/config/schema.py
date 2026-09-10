@@ -56,6 +56,12 @@ class DeliberationConfig:
     max_plan_amendments: int = 1                    # Maximum dynamic plan amendments permitted
     allow_multi_step_planning: bool = True          # Enable multi-step planning for complex tasks
     plan_critique_required_for_high_risk: bool = True # Critique plan if review risk is HIGH or CRITICAL
+    max_mcp_calls_per_task: int = 10                # Hard ceiling on total MCP calls per task
+    max_mcp_calls_per_stage: int = 3                # Limit on MCP tool calls per provider stage
+    max_tool_turns_per_stage: int = 2               # Maximum tool turns per provider stage
+    max_mcp_duration_seconds: float = 60.0          # Cumulative timeout ceiling for MCP calls
+    max_mcp_result_tokens: int = 8000               # Total tokens budget for MCP responses
+    mcp_max_result_chars_per_call: int = 8000       # Max chars per tool result before truncation
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -72,6 +78,7 @@ class FusionConfig:
     deliberation: DeliberationConfig = field(default_factory=DeliberationConfig)
     verification_command: Optional[str] = None
     log_level: str = "INFO"
+    mcp_servers: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

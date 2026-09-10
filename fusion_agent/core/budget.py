@@ -40,10 +40,19 @@ class TaskBudgetController:
         self.max_output_tokens = config.max_total_output_tokens
         self.max_premium_calls = config.max_premium_provider_calls
 
+        self.max_mcp_calls = getattr(config, "max_mcp_calls_per_task", 10)
+        self.max_mcp_calls_per_stage = getattr(config, "max_mcp_calls_per_stage", 3)
+        self.max_mcp_duration_seconds = getattr(config, "max_mcp_duration_seconds", 60.0)
+        self.max_mcp_result_tokens = getattr(config, "max_mcp_result_tokens", 8000)
+
         self.start_time = time.perf_counter()
+        self.previously_consumed_active_seconds: float = 0.0
         self.calls_made: int = 0
         self.premium_calls_made: int = 0
         self.repair_rounds_used: int = 0
+        self.mcp_calls_made: int = 0
+        self.cumulative_mcp_duration_ms: float = 0.0
+        self.cumulative_mcp_result_tokens: int = 0
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.total_fusion_context_tokens: int = 0
@@ -56,8 +65,119 @@ class TaskBudgetController:
 
     @property
     def elapsed_seconds(self) -> float:
-        """Return elapsed duration since budget controller initialization."""
-        return time.perf_counter() - self.start_time
+        """Return cumulative active duration since start including prior sessions."""
+        return self.previously_consumed_active_seconds + (time.perf_counter() - self.start_time)
+
+    @property
+    def repair_rounds_attempted(self) -> int:
+        """Alias for repair_rounds_used."""
+        return self.repair_rounds_used
+
+    @classmethod
+    def restore_from_history(
+        cls,
+        first: Any,
+        second: Any,
+        third: Any = None,
+    ) -> "TaskBudgetController":
+        """Reconstruct budget controller state from SQLite records after an interruption.
+        Supports both (task_id, state_manager, config) and (config, task_id, state_manager).
+        """
+        if isinstance(first, DeliberationConfig):
+            config = first
+            task_id = str(second)
+            state_manager = third
+        elif isinstance(third, DeliberationConfig):
+            task_id = str(first)
+            state_manager = second
+            config = third
+        elif third is None:
+            task_id = str(first)
+            state_manager = second
+            config = DeliberationConfig()
+        else:
+            task_id = str(first)
+            state_manager = second
+            config = third
+
+        controller = cls(config)
+        conn = state_manager.db.connect()
+        rows = conn.execute(
+            "SELECT * FROM agent_runs WHERE task_id = ? ORDER BY timestamp ASC;",
+            (task_id,),
+        ).fetchall()
+
+        calls_made = 0
+        repair_rounds_used = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_reasoning_tokens = 0
+        total_cached_tokens = 0
+        total_visible_output_tokens = 0
+        total_fusion_context_tokens = 0
+        total_provider_managed_overhead = 0
+        has_measured = False
+        cumulative_duration_sec = 0.0
+
+        for r in rows:
+            calls_made += 1
+            stage = r["stage"] or ""
+            if "repair" in stage.lower():
+                repair_rounds_used += 1
+
+            dur_ms = r["duration_ms"] or 0.0
+            cumulative_duration_sec += (dur_ms / 1000.0)
+
+            inp = r["input_tokens"]
+            outp = r["output_tokens"]
+            f_tokens = r["fusion_context_tokens"]
+            reas = r["reasoning_tokens"]
+            cac = r["cached_tokens"]
+            vis = r["visible_output_tokens"]
+
+            if inp is not None:
+                total_input_tokens += inp
+                has_measured = True
+                if f_tokens is not None:
+                    overhead = max(0, inp - f_tokens)
+                    total_provider_managed_overhead += overhead
+            if outp is not None:
+                total_output_tokens += outp
+                has_measured = True
+            if f_tokens is not None:
+                total_fusion_context_tokens += f_tokens
+            if reas is not None:
+                total_reasoning_tokens += reas
+            if cac is not None:
+                total_cached_tokens += cac
+            if vis is not None:
+                total_visible_output_tokens += vis
+
+        controller.calls_made = calls_made
+        controller.repair_rounds_used = repair_rounds_used
+        controller.total_input_tokens = total_input_tokens
+        controller.total_output_tokens = total_output_tokens
+        controller.total_reasoning_tokens = total_reasoning_tokens
+        controller.total_cached_tokens = total_cached_tokens
+        controller.total_visible_output_tokens = total_visible_output_tokens
+        controller.total_fusion_context_tokens = total_fusion_context_tokens
+        controller.total_provider_managed_overhead = total_provider_managed_overhead
+        controller.has_measured_tokens = has_measured
+        controller.previously_consumed_active_seconds = cumulative_duration_sec
+
+        try:
+            mcp_rows = conn.execute(
+                "SELECT * FROM mcp_tool_invocations WHERE task_id = ? AND status NOT IN ('DENIED', 'DECLINED');",
+                (task_id,),
+            ).fetchall()
+            for mr in mcp_rows:
+                controller.mcp_calls_made += 1
+                controller.cumulative_mcp_duration_ms += (mr["duration_ms"] or 0.0)
+                controller.cumulative_mcp_result_tokens += (mr["result_tokens"] or 0)
+        except Exception:
+            pass
+
+        return controller
 
     def can_call_provider(self, is_premium: bool = False) -> Tuple[bool, Optional[str]]:
         """Check whether budget allows invoking a provider."""
@@ -73,9 +193,28 @@ class TaskBudgetController:
             return False, f"Output token budget ({self.max_output_tokens}) exhausted."
         return True, None
 
-    def can_attempt_repair(self, current_repair_count: int) -> Tuple[bool, Optional[str]]:
+    def can_call_mcp_tool(self, stage_calls_made: int = 0) -> Tuple[bool, Optional[str]]:
+        """Check whether task budget allows invoking an MCP tool."""
+        if self.mcp_calls_made >= self.max_mcp_calls:
+            return False, f"Maximum MCP calls per task ({self.max_mcp_calls}) reached."
+        if stage_calls_made >= self.max_mcp_calls_per_stage:
+            return False, f"Maximum MCP calls per provider stage ({self.max_mcp_calls_per_stage}) reached."
+        if (self.cumulative_mcp_duration_ms / 1000.0) >= self.max_mcp_duration_seconds:
+            return False, f"Maximum cumulative MCP duration ({self.max_mcp_duration_seconds:.1f}s) exceeded."
+        if self.cumulative_mcp_result_tokens >= self.max_mcp_result_tokens:
+            return False, f"MCP result token budget ({self.max_mcp_result_tokens}) exhausted."
+        return True, None
+
+    def record_mcp_call(self, duration_ms: float, result_tokens: int) -> None:
+        """Record consumption of an MCP tool invocation."""
+        self.mcp_calls_made += 1
+        self.cumulative_mcp_duration_ms += duration_ms
+        self.cumulative_mcp_result_tokens += result_tokens
+
+    def can_attempt_repair(self, current_repair_count: Optional[int] = None) -> Tuple[bool, Optional[str]]:
         """Check whether another repair round is permitted within budget."""
-        if current_repair_count >= self.max_repair_rounds:
+        count = self.repair_rounds_used if current_repair_count is None else current_repair_count
+        if count >= self.max_repair_rounds:
             return False, f"Maximum repair rounds ({self.max_repair_rounds}) reached."
         return self.can_call_provider()
 

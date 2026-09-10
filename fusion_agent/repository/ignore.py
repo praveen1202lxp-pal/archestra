@@ -119,6 +119,21 @@ class SecretFilter:
 
     is_binary_file = is_binary
 
+    SECRET_VALUE_PATTERNS = [
+        re.compile(r"(?i)(bearer\s+)[a-zA-Z0-9_\-\.]{16,}"),
+        re.compile(r"(?i)(api[_-]?key|secret|token|password|auth|credential)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-\.]{12,}['\"]?"),
+    ]
+
+    @classmethod
+    def filter_text(cls, text: str) -> str:
+        """Mask potential credential and secret values from logs, prompts, and audit records."""
+        if not text:
+            return text
+        filtered = text
+        for pat in cls.SECRET_VALUE_PATTERNS:
+            filtered = pat.sub(r"\1: [REDACTED_SECRET]", filtered)
+        return filtered
+
 
 class IgnoreManager:
     """Aggregates built-in ignore rules, .gitignore, and .fusionignore."""

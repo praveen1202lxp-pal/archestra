@@ -1,21 +1,28 @@
 """Persistent project state manager and context snapshot generator."""
 
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fusion_agent.memory.database import Database
 from fusion_agent.models.assessment import ReviewRisk
 from fusion_agent.models.deliberation import ReviewStatus
 from fusion_agent.models.plan import (
     Checkpoint,
+    CheckpointTransaction,
+    CheckpointTransactionStatus,
     ExecutionPlan,
     PlanStep,
+    PlanStatus,
+    PromotionTransaction,
+    PromotionTransactionStatus,
     StepResult,
     StepStatus,
+    VerificationType,
 )
-from fusion_agent.models.task import Complexity, Task, TaskStatus, TaskType
+from fusion_agent.models.task import Complexity, PromotionDisposition, Task, TaskStatus, TaskType
 from fusion_agent.providers.base import ContextSnapshot
 
 
@@ -145,8 +152,15 @@ class ProjectStateManager:
         selected_strategy: Optional[str] = None,
         verification_passed: Optional[bool] = None,
         repair_rounds: Optional[int] = None,
+        interruption_reason: Optional[str] = None,
+        interrupted_at: Optional[str] = None,
+        recovery_attempts: Optional[int] = None,
+        resumed_at: Optional[str] = None,
+        execution_config_snapshot: Optional[str] = None,
+        repo_fingerprint: Optional[str] = None,
+        base_commit: Optional[str] = None,
     ) -> None:
-        """Update task status and optional completion timestamp and metrics."""
+        """Update task status and optional completion timestamp, metrics, and recovery attributes."""
         conn = self.db.connect()
         now = datetime.now(timezone.utc).isoformat()
         completed_at = now if status in (TaskStatus.COMPLETED, TaskStatus.FAILED) else None
@@ -163,6 +177,27 @@ class ProjectStateManager:
         if repair_rounds is not None:
             updates.append("repair_rounds = ?")
             params.append(repair_rounds)
+        if interruption_reason is not None:
+            updates.append("interruption_reason = ?")
+            params.append(interruption_reason)
+        if interrupted_at is not None:
+            updates.append("interrupted_at = ?")
+            params.append(interrupted_at)
+        if recovery_attempts is not None:
+            updates.append("recovery_attempts = ?")
+            params.append(recovery_attempts)
+        if resumed_at is not None:
+            updates.append("resumed_at = ?")
+            params.append(resumed_at)
+        if execution_config_snapshot is not None:
+            updates.append("execution_config_snapshot = ?")
+            params.append(execution_config_snapshot)
+        if repo_fingerprint is not None:
+            updates.append("repo_fingerprint = ?")
+            params.append(repo_fingerprint)
+        if base_commit is not None:
+            updates.append("base_commit = ?")
+            params.append(base_commit)
             
         params.append(task_id)
         sql = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?;"
@@ -175,6 +210,7 @@ class ProjectStateManager:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
         if not row:
             return None
+        row_keys = row.keys()
         return Task(
             id=row["id"],
             project_id=row["project_id"],
@@ -184,9 +220,85 @@ class ProjectStateManager:
             complexity=Complexity(row["complexity"]),
             status=TaskStatus(row["status"]),
             selected_strategy=row["selected_strategy"],
+            verification_passed=bool(row["verification_passed"]) if "verification_passed" in row_keys else False,
+            repair_rounds=row["repair_rounds"] if "repair_rounds" in row_keys else 0,
+            promotion_disposition=PromotionDisposition(row["promotion_disposition"]) if ("promotion_disposition" in row_keys and row["promotion_disposition"]) else PromotionDisposition.NOT_OFFERED,
+            active_stage=row["active_stage"] if "active_stage" in row_keys else None,
+            last_checkpoint_sha=row["last_checkpoint_sha"] if "last_checkpoint_sha" in row_keys else None,
+            interruption_reason=row["interruption_reason"] if "interruption_reason" in row_keys else None,
+            interrupted_at=row["interrupted_at"] if "interrupted_at" in row_keys else None,
+            recovery_attempts=row["recovery_attempts"] if "recovery_attempts" in row_keys else 0,
+            resumed_at=row["resumed_at"] if "resumed_at" in row_keys else None,
+            execution_config_snapshot=row["execution_config_snapshot"] if "execution_config_snapshot" in row_keys else None,
+            repo_fingerprint=row["repo_fingerprint"] if "repo_fingerprint" in row_keys else None,
+            base_commit=row["base_commit"] if "base_commit" in row_keys else None,
             created_at=row["created_at"],
             completed_at=row["completed_at"],
         )
+
+    def update_task_promotion(self, task_id: str, disposition: Any) -> None:
+        """Update promotion disposition on a task."""
+        conn = self.db.connect()
+        val = disposition.value if isinstance(disposition, PromotionDisposition) else str(disposition)
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET promotion_disposition = ? WHERE id = ?;",
+                (val, task_id),
+            )
+
+    def update_task_stage(
+        self,
+        task_id: str,
+        stage: str,
+        last_checkpoint_sha: Optional[str] = None,
+    ) -> None:
+        """Update the currently active execution stage and latest checkpoint."""
+        conn = self.db.connect()
+        with conn:
+            if last_checkpoint_sha is not None:
+                conn.execute(
+                    "UPDATE tasks SET active_stage = ?, last_checkpoint_sha = ? WHERE id = ?;",
+                    (stage, last_checkpoint_sha, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET active_stage = ? WHERE id = ?;",
+                    (stage, task_id),
+                )
+
+    def update_task_recovery_fields(
+        self,
+        task_id: str,
+        repo_fingerprint: Optional[str] = None,
+        execution_config_snapshot: Optional[str] = None,
+        base_commit: Optional[str] = None,
+    ) -> None:
+        """Update repository fingerprint, execution config snapshot, and base commit for task recovery."""
+        conn = self.db.connect()
+        updates = []
+        params = []
+        if repo_fingerprint is not None:
+            updates.append("repo_fingerprint = ?")
+            params.append(repo_fingerprint)
+        if execution_config_snapshot is not None:
+            updates.append("execution_config_snapshot = ?")
+            params.append(execution_config_snapshot)
+        if base_commit is not None:
+            updates.append("base_commit = ?")
+            params.append(base_commit)
+        if not updates:
+            return
+        params.append(task_id)
+        with conn:
+            conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?;", params)
+
+    def get_recoverable_tasks(self) -> List[Dict[str, Any]]:
+        """Fetch tasks that are interrupted, running, or recoverable."""
+        conn = self.db.connect()
+        rows = conn.execute(
+            "SELECT id, title, status, last_checkpoint_sha, created_at FROM tasks WHERE status IN ('RUNNING', 'INTERRUPTED', 'RECOVERABLE', 'RESUMING') ORDER BY created_at DESC;"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_tasks(self, project_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """List recent tasks for project."""
@@ -233,6 +345,493 @@ class ProjectStateManager:
 
     # --- Agent Runs & Reviews ---
 
+    def record_provider_stage(
+        self,
+        task_id: str,
+        stage: str,
+        provider_name: str = "",
+        role: str = "",
+        response_content: str = "",
+        prompt_summary: str = "",
+        duration_ms: float = 0.0,
+        status: str = "SUCCESS",
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        round_number: int = 0,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        reasoning_tokens: Optional[int] = None,
+        cached_tokens: Optional[int] = None,
+        visible_output_tokens: Optional[int] = None,
+        raw_usage: Optional[Any] = None,
+        context: Optional[Any] = None,
+        fusion_context_chars: Optional[int] = None,
+        fusion_context_tokens: Optional[int] = None,
+        selected_file_count: Optional[int] = None,
+        selected_files: Optional[Union[List[str], str]] = None,
+        selected_symbols: Optional[Union[List[str], str]] = None,
+        context_expansion_round: int = 0,
+        response: Optional[Any] = None,
+        provider: Optional[str] = None,
+    ) -> str:
+        """Record an individual model invocation into SQLite as an authoritative execution ledger."""
+        conn = self.db.connect()
+        run_id = str(uuid.uuid4())[:8]
+        now = datetime.now(timezone.utc).isoformat()
+        provider_final = provider or provider_name
+
+        # If a response object (AgentResponse, ReviewResponse) is provided, extract values
+        if response is not None:
+            if not response_content:
+                response_content = getattr(response, "content", None) or getattr(response, "comments", "")
+            if not duration_ms and getattr(response, "duration_ms", 0.0):
+                duration_ms = response.duration_ms
+            # Native tokens
+            usage = response.metadata.get("usage") if hasattr(response, "metadata") and isinstance(response.metadata, dict) else None
+            if raw_usage is None and usage:
+                raw_usage = usage
+
+            # Input tokens
+            if input_tokens is None:
+                if usage and "input_tokens" in usage:
+                    input_tokens = int(usage["input_tokens"])
+                elif getattr(response, "input_tokens", None) not in (None, 0):
+                    input_tokens = response.input_tokens
+                elif usage is not None and "input_tokens" not in usage:
+                    input_tokens = None
+
+            # Output tokens
+            if output_tokens is None:
+                if usage and "output_tokens" in usage:
+                    output_tokens = int(usage["output_tokens"])
+                elif getattr(response, "output_tokens", None) not in (None, 0):
+                    output_tokens = response.output_tokens
+                elif usage is not None and "output_tokens" not in usage:
+                    output_tokens = None
+
+            # Reasoning, cached, visible tokens
+            if reasoning_tokens is None:
+                reasoning_tokens = getattr(response, "reasoning_tokens", None)
+            if cached_tokens is None:
+                cached_tokens = getattr(response, "cached_tokens", None)
+            if visible_output_tokens is None:
+                visible_output_tokens = getattr(response, "visible_output_tokens", None)
+
+        # Context telemetry extraction
+        if context is not None:
+            if hasattr(context, "metrics") and isinstance(context.metrics, dict):
+                cm = context.metrics
+                if fusion_context_chars is None:
+                    fusion_context_chars = cm.get("fusion_context_chars")
+                if fusion_context_tokens is None:
+                    fusion_context_tokens = cm.get("fusion_context_tokens")
+                if context_expansion_round == 0 and "context_expansion_round" in cm:
+                    context_expansion_round = cm.get("context_expansion_round", 0)
+
+            if hasattr(context, "selected_files"):
+                s_files = [getattr(s, "path", getattr(s, "rel_path", str(s))) for s in getattr(context, "selected_files", [])]
+                if selected_files is None:
+                    selected_files = s_files
+                if selected_file_count is None:
+                    selected_file_count = len(s_files)
+
+            if hasattr(context, "relevant_symbols") and selected_symbols is None:
+                syms = getattr(context, "relevant_symbols", [])
+                selected_symbols = [getattr(s, "name", str(s)) for s in syms]
+
+            if fusion_context_chars is None:
+                if hasattr(context, "to_prompt_context"):
+                    txt = context.to_prompt_context()
+                    fusion_context_chars = len(txt)
+                    fusion_context_tokens = max(1, len(txt) // 4)
+                elif isinstance(context, str):
+                    fusion_context_chars = len(context)
+                    fusion_context_tokens = max(1, len(context) // 4)
+
+        # Ensure elements in selected_files and selected_symbols are primitives
+        if isinstance(selected_files, list):
+            selected_files = [getattr(s, "path", getattr(s, "rel_path", str(s))) for s in selected_files]
+        if isinstance(selected_symbols, list):
+            selected_symbols = [getattr(s, "name", str(s)) for s in selected_symbols]
+
+        # Normalize serialized fields
+        raw_usage_str = json.dumps(raw_usage) if isinstance(raw_usage, (dict, list)) else (raw_usage if isinstance(raw_usage, str) else None)
+        sel_files_str = json.dumps(selected_files) if isinstance(selected_files, list) else (selected_files if isinstance(selected_files, str) else None)
+        sel_syms_str = json.dumps(selected_symbols) if isinstance(selected_symbols, list) else (selected_symbols if isinstance(selected_symbols, str) else None)
+
+        logical_invocation_id = f"{task_id}:{plan_id or 'none'}:{step_id or 'none'}:{stage}:{round_number}"
+
+        with conn:
+            task_row = conn.execute("SELECT 1 FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+            if not task_row:
+                conn.execute(
+                    "INSERT OR IGNORE INTO projects (id, name, root_path) VALUES (?, ?, ?);",
+                    ("default", "Default Project", "."),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tasks (
+                        id, project_id, title, description, status, task_type, complexity, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (task_id, "default", task_id, "", "IN_PROGRESS", "FEATURE", "COMPLEX", now),
+                )
+
+            # Unaccept prior attempts for the same logical stage/round
+            conn.execute(
+                "UPDATE agent_runs SET is_accepted = 0 WHERE logical_invocation_id = ?;",
+                (logical_invocation_id,),
+            )
+            att_row = conn.execute(
+                "SELECT MAX(attempt_number) FROM agent_runs WHERE logical_invocation_id = ?;",
+                (logical_invocation_id,),
+            ).fetchone()
+            attempt_number = (att_row[0] or 0) + 1 if att_row else 1
+
+            conn.execute(
+                """
+                INSERT INTO agent_runs (
+                    id, task_id, plan_id, step_id, stage, round_number, attempt_number,
+                    logical_invocation_id, is_accepted, provider_name, role, prompt_summary, response_content,
+                    input_tokens, output_tokens, duration_ms, status,
+                    reasoning_tokens, cached_tokens, visible_output_tokens, raw_usage,
+                    fusion_context_chars, fusion_context_tokens, selected_file_count,
+                    selected_files, selected_symbols, context_expansion_round, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    run_id,
+                    task_id,
+                    plan_id,
+                    step_id,
+                    stage,
+                    round_number,
+                    attempt_number,
+                    logical_invocation_id,
+                    provider_final,
+                    role,
+                    prompt_summary,
+                    response_content,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    status.upper() if isinstance(status, str) else "SUCCESS",
+                    reasoning_tokens,
+                    cached_tokens,
+                    visible_output_tokens,
+                    raw_usage_str,
+                    fusion_context_chars,
+                    fusion_context_tokens,
+                    selected_file_count or 0,
+                    sel_files_str,
+                    sel_syms_str,
+                    context_expansion_round,
+                    now,
+                ),
+            )
+        return run_id
+
+    def record_provider_stage_started(
+        self,
+        task_id: str,
+        stage: str,
+        provider_name: str = "",
+        role: str = "",
+        prompt_summary: str = "",
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        round_number: int = 0,
+        context: Optional[Any] = None,
+        fusion_context_chars: Optional[int] = None,
+        fusion_context_tokens: Optional[int] = None,
+        selected_file_count: Optional[int] = None,
+        selected_files: Optional[Union[List[str], str]] = None,
+        selected_symbols: Optional[Union[List[str], str]] = None,
+        context_expansion_round: int = 0,
+        provider: Optional[str] = None,
+        logical_invocation_id: Optional[str] = None,
+    ) -> Tuple[str, int]:
+        """Write-ahead persistence of a provider call record with STARTED status.
+
+        Returns (run_id, attempt_number).
+        """
+        conn = self.db.connect()
+        run_id = str(uuid.uuid4())[:8]
+        now = datetime.now(timezone.utc).isoformat()
+        provider_final = provider or provider_name
+        if not logical_invocation_id:
+            logical_invocation_id = f"{task_id}:{plan_id or 'none'}:{step_id or 'none'}:{stage}:{round_number}"
+
+        # Context telemetry extraction
+        if context is not None:
+            if hasattr(context, "metrics") and isinstance(context.metrics, dict):
+                cm = context.metrics
+                if fusion_context_chars is None:
+                    fusion_context_chars = cm.get("fusion_context_chars")
+                if fusion_context_tokens is None:
+                    fusion_context_tokens = cm.get("fusion_context_tokens")
+                if context_expansion_round == 0 and "context_expansion_round" in cm:
+                    context_expansion_round = cm.get("context_expansion_round", 0)
+
+            if hasattr(context, "selected_files"):
+                s_files = [getattr(s, "path", getattr(s, "rel_path", str(s))) for s in getattr(context, "selected_files", [])]
+                if selected_files is None:
+                    selected_files = s_files
+                if selected_file_count is None:
+                    selected_file_count = len(s_files)
+
+            if hasattr(context, "relevant_symbols") and selected_symbols is None:
+                syms = getattr(context, "relevant_symbols", [])
+                selected_symbols = [getattr(s, "name", str(s)) for s in syms]
+
+            if fusion_context_chars is None:
+                if hasattr(context, "to_prompt_context"):
+                    txt = context.to_prompt_context()
+                    fusion_context_chars = len(txt)
+                    fusion_context_tokens = max(1, len(txt) // 4)
+                elif isinstance(context, str):
+                    fusion_context_chars = len(context)
+                    fusion_context_tokens = max(1, len(context) // 4)
+
+        if isinstance(selected_files, list):
+            selected_files = [getattr(s, "path", getattr(s, "rel_path", str(s))) for s in selected_files]
+        if isinstance(selected_symbols, list):
+            selected_symbols = [getattr(s, "name", str(s)) for s in selected_symbols]
+
+        sel_files_str = json.dumps(selected_files) if isinstance(selected_files, list) else (selected_files if isinstance(selected_files, str) else None)
+        sel_syms_str = json.dumps(selected_symbols) if isinstance(selected_symbols, list) else (selected_symbols if isinstance(selected_symbols, str) else None)
+
+        with conn:
+            self._ensure_task_exists(conn, task_id)
+            att_row = conn.execute(
+                "SELECT MAX(attempt_number) FROM agent_runs WHERE logical_invocation_id = ?;",
+                (logical_invocation_id,),
+            ).fetchone()
+            attempt_number = (att_row[0] or 0) + 1 if att_row else 1
+
+            conn.execute(
+                """
+                INSERT INTO agent_runs (
+                    id, task_id, plan_id, step_id, stage, round_number, attempt_number,
+                    logical_invocation_id, is_accepted, provider_name, role, prompt_summary, response_content,
+                    input_tokens, output_tokens, duration_ms, status,
+                    fusion_context_chars, fusion_context_tokens, selected_file_count,
+                    selected_files, selected_symbols, context_expansion_round, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, '', NULL, NULL, 0.0, 'STARTED', ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    run_id,
+                    task_id,
+                    plan_id,
+                    step_id,
+                    stage,
+                    round_number,
+                    attempt_number,
+                    logical_invocation_id,
+                    provider_final,
+                    role,
+                    prompt_summary,
+                    fusion_context_chars,
+                    fusion_context_tokens,
+                    selected_file_count or 0,
+                    sel_files_str,
+                    sel_syms_str,
+                    context_expansion_round,
+                    now,
+                ),
+            )
+        return run_id, attempt_number
+
+    def complete_provider_stage(
+        self,
+        run_id: str,
+        response_content: str = "",
+        duration_ms: float = 0.0,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        reasoning_tokens: Optional[int] = None,
+        cached_tokens: Optional[int] = None,
+        visible_output_tokens: Optional[int] = None,
+        raw_usage: Optional[Any] = None,
+        response: Optional[Any] = None,
+        is_accepted: bool = True,
+        status: str = "SUCCESS",
+        context: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Mark a STARTED provider stage record as COMPLETED with normalized usage and content."""
+        if isinstance(run_id, tuple):
+            run_id = run_id[0]
+        conn = self.db.connect()
+        status_final = status.upper() if isinstance(status, str) else "SUCCESS"
+
+        if response is not None:
+            if not response_content:
+                response_content = getattr(response, "content", None) or getattr(response, "comments", "")
+            if not duration_ms and getattr(response, "duration_ms", 0.0):
+                duration_ms = response.duration_ms
+            usage = response.metadata.get("usage") if hasattr(response, "metadata") and isinstance(response.metadata, dict) else None
+            if raw_usage is None and usage:
+                raw_usage = usage
+            if input_tokens is None:
+                if usage and "input_tokens" in usage:
+                    input_tokens = int(usage["input_tokens"])
+                elif getattr(response, "input_tokens", None) not in (None, 0):
+                    input_tokens = response.input_tokens
+                elif usage is not None and "input_tokens" not in usage:
+                    input_tokens = None
+            if output_tokens is None:
+                if usage and "output_tokens" in usage:
+                    output_tokens = int(usage["output_tokens"])
+                elif getattr(response, "output_tokens", None) not in (None, 0):
+                    output_tokens = response.output_tokens
+                elif usage is not None and "output_tokens" not in usage:
+                    output_tokens = None
+            if reasoning_tokens is None:
+                reasoning_tokens = getattr(response, "reasoning_tokens", None)
+            if cached_tokens is None:
+                cached_tokens = getattr(response, "cached_tokens", None)
+            if visible_output_tokens is None:
+                visible_output_tokens = getattr(response, "visible_output_tokens", None)
+
+        raw_usage_str = json.dumps(raw_usage) if isinstance(raw_usage, (dict, list)) else (raw_usage if isinstance(raw_usage, str) else None)
+
+        fusion_context_chars = None
+        fusion_context_tokens = None
+        selected_file_count = None
+        sel_files_str = None
+        sel_syms_str = None
+        context_expansion_round = None
+
+        if context is not None:
+            if hasattr(context, "metrics") and isinstance(context.metrics, dict):
+                cm = context.metrics
+                fusion_context_chars = cm.get("fusion_context_chars")
+                fusion_context_tokens = cm.get("fusion_context_tokens")
+                if "context_expansion_round" in cm:
+                    context_expansion_round = cm.get("context_expansion_round", 0)
+
+            if hasattr(context, "selected_files"):
+                s_files = [getattr(s, "path", getattr(s, "rel_path", str(s))) for s in getattr(context, "selected_files", [])]
+                selected_file_count = len(s_files)
+                sel_files_str = json.dumps(s_files)
+
+            if hasattr(context, "relevant_symbols"):
+                syms = getattr(context, "relevant_symbols", [])
+                sel_syms_str = json.dumps([getattr(s, "name", str(s)) for s in syms])
+
+            if fusion_context_chars is None:
+                if hasattr(context, "to_prompt_context"):
+                    txt = context.to_prompt_context()
+                    fusion_context_chars = len(txt)
+                    fusion_context_tokens = max(1, len(txt) // 4)
+                elif isinstance(context, str):
+                    fusion_context_chars = len(context)
+                    fusion_context_tokens = max(1, len(context) // 4)
+
+        with conn:
+            if is_accepted:
+                curr = conn.execute("SELECT logical_invocation_id FROM agent_runs WHERE id = ?;", (run_id,)).fetchone()
+                if curr and curr["logical_invocation_id"]:
+                    conn.execute(
+                        "UPDATE agent_runs SET is_accepted = 0 WHERE logical_invocation_id = ? AND id != ?;",
+                        (curr["logical_invocation_id"], run_id),
+                    )
+
+            if context is not None:
+                conn.execute(
+                    """
+                    UPDATE agent_runs
+                    SET status = ?,
+                        response_content = ?,
+                        duration_ms = ?,
+                        input_tokens = ?,
+                        output_tokens = ?,
+                        reasoning_tokens = ?,
+                        cached_tokens = ?,
+                        visible_output_tokens = ?,
+                        raw_usage = ?,
+                        is_accepted = ?,
+                        fusion_context_chars = COALESCE(?, fusion_context_chars),
+                        fusion_context_tokens = COALESCE(?, fusion_context_tokens),
+                        selected_file_count = COALESCE(?, selected_file_count),
+                        selected_files = COALESCE(?, selected_files),
+                        selected_symbols = COALESCE(?, selected_symbols),
+                        context_expansion_round = COALESCE(?, context_expansion_round)
+                    WHERE id = ?;
+                    """,
+                    (
+                        status_final,
+                        response_content,
+                        duration_ms,
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        cached_tokens,
+                        visible_output_tokens,
+                        raw_usage_str,
+                        1 if is_accepted else 0,
+                        fusion_context_chars,
+                        fusion_context_tokens,
+                        selected_file_count,
+                        sel_files_str,
+                        sel_syms_str,
+                        context_expansion_round,
+                        run_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE agent_runs
+                    SET status = ?,
+                        response_content = ?,
+                        duration_ms = ?,
+                        input_tokens = ?,
+                        output_tokens = ?,
+                        reasoning_tokens = ?,
+                        cached_tokens = ?,
+                        visible_output_tokens = ?,
+                        raw_usage = ?,
+                        is_accepted = ?
+                    WHERE id = ?;
+                    """,
+                    (
+                        status_final,
+                        response_content,
+                        duration_ms,
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        cached_tokens,
+                        visible_output_tokens,
+                        raw_usage_str,
+                        1 if is_accepted else 0,
+                        run_id,
+                    ),
+                )
+
+    def fail_provider_stage(self, run_id: str, error_message: str, duration_ms: float = 0.0) -> None:
+        """Mark a STARTED provider stage record as FAILED."""
+        if isinstance(run_id, tuple):
+            run_id = run_id[0]
+        conn = self.db.connect()
+        with conn:
+            conn.execute(
+                "UPDATE agent_runs SET status = 'FAILED', response_content = ?, duration_ms = ?, is_accepted = 0 WHERE id = ?;",
+                (f"Error: {error_message}", duration_ms, run_id),
+            )
+
+    def reconcile_stale_provider_runs(self, task_id: str) -> int:
+        """Reconcile orphaned STARTED provider runs left behind by a crash to INTERRUPTED."""
+        conn = self.db.connect()
+        with conn:
+            cursor = conn.execute(
+                "UPDATE agent_runs SET status = 'INTERRUPTED', is_accepted = 0 WHERE task_id = ? AND status = 'STARTED';",
+                (task_id,),
+            )
+            return cursor.rowcount
+
     def record_agent_run(
         self,
         task_id: str,
@@ -240,38 +839,165 @@ class ProjectStateManager:
         role: str,
         response_content: str,
         prompt_summary: str = "",
-        input_tokens: int = 0,
-        output_tokens: int = 0,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
         duration_ms: float = 0.0,
         status: str = "SUCCESS",
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        round_number: int = 0,
+        **kwargs,
     ) -> str:
-        """Record an individual agent invocation."""
+        """Legacy compatibility wrapper around record_provider_stage."""
+        return self.record_provider_stage(
+            task_id=task_id,
+            stage=stage or "legacy_agent_run",
+            provider_name=provider_name,
+            role=role,
+            response_content=response_content,
+            prompt_summary=prompt_summary,
+            duration_ms=duration_ms,
+            status=status,
+            plan_id=plan_id,
+            step_id=step_id,
+            round_number=round_number,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            **kwargs,
+        )
+
+    def record_verification(
+        self,
+        task_id: str,
+        verification_type: Any,
+        command: str,
+        exit_code: int,
+        passed: bool,
+        duration_seconds: float = 0.0,
+        stdout: str = "",
+        stderr: str = "",
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+    ) -> str:
+        """Persist a normalized verification run into SQLite."""
         conn = self.db.connect()
-        run_id = str(uuid.uuid4())[:8]
+        verif_id = str(uuid.uuid4())[:8]
         now = datetime.now(timezone.utc).isoformat()
+        v_type = verification_type.value if isinstance(verification_type, VerificationType) else str(verification_type)
+
+        # Bounded summaries (max 2000 chars)
+        out_summary = stdout[:2000] if stdout else ""
+        err_summary = stderr[:2000] if stderr else ""
+
         with conn:
+            task_row = conn.execute("SELECT 1 FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+            if not task_row:
+                conn.execute(
+                    "INSERT OR IGNORE INTO projects (id, name, root_path) VALUES (?, ?, ?);",
+                    ("default", "Default Project", "."),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tasks (
+                        id, project_id, title, description, status, task_type, complexity, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (task_id, "default", task_id, "", "IN_PROGRESS", "FEATURE", "COMPLEX", now),
+                )
+
             conn.execute(
                 """
-                INSERT INTO agent_runs (
-                    id, task_id, provider_name, role, prompt_summary,
-                    response_content, input_tokens, output_tokens, duration_ms, status, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO verifications (
+                    id, task_id, plan_id, step_id, verification_type, command,
+                    exit_code, passed, duration_seconds, stdout_summary, stderr_summary, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
-                    run_id,
+                    verif_id,
                     task_id,
-                    provider_name,
-                    role,
-                    prompt_summary,
-                    response_content,
-                    input_tokens,
-                    output_tokens,
-                    duration_ms,
-                    status,
+                    plan_id,
+                    step_id,
+                    v_type,
+                    str(command),
+                    exit_code,
+                    1 if passed else 0,
+                    duration_seconds,
+                    out_summary,
+                    err_summary,
                     now,
                 ),
             )
-        return run_id
+        return verif_id
+
+    def get_verifications_for_task(self, task_id: str) -> List[Dict[str, Any]]:
+        """Retrieve all recorded verifications for a given task."""
+        conn = self.db.connect()
+        rows = conn.execute(
+            "SELECT * FROM verifications WHERE task_id = ? ORDER BY timestamp ASC;",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_task_lifecycle_summary(self, task_id: str) -> Dict[str, Any]:
+        """Reconstruct authoritative execution state for a task."""
+        conn = self.db.connect()
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+        if not task_row:
+            return {}
+        task_dict = dict(task_row)
+
+        plan_row = conn.execute("SELECT * FROM plans WHERE task_id = ? ORDER BY created_at DESC LIMIT 1;", (task_id,)).fetchone()
+        steps = []
+        if plan_row:
+            step_rows = conn.execute(
+                "SELECT * FROM plan_steps WHERE plan_id = ? ORDER BY step_index ASC;",
+                (plan_row["id"],),
+            ).fetchall()
+            steps = [dict(s) for s in step_rows]
+
+        checkpoints = conn.execute(
+            "SELECT * FROM checkpoints WHERE task_id = ? ORDER BY created_at ASC;",
+            (task_id,),
+        ).fetchall()
+
+        runs = conn.execute(
+            "SELECT * FROM agent_runs WHERE task_id = ? ORDER BY timestamp ASC;",
+            (task_id,),
+        ).fetchall()
+
+        verifications = conn.execute(
+            "SELECT * FROM verifications WHERE task_id = ? ORDER BY timestamp ASC;",
+            (task_id,),
+        ).fetchall()
+
+        reviews = conn.execute(
+            "SELECT * FROM reviews WHERE task_id = ? ORDER BY timestamp ASC;",
+            (task_id,),
+        ).fetchall()
+
+        last_checkpoint = dict(checkpoints[-1]) if checkpoints else None
+        last_run = dict(runs[-1]) if runs else None
+        last_review = dict(reviews[-1]) if reviews else None
+        last_final_verif = next((dict(v) for v in reversed(verifications) if v["verification_type"] == "FINAL"), None)
+
+        return {
+            "task_id": task_id,
+            "status": task_dict["status"],
+            "active_stage": task_dict.get("active_stage"),
+            "plan_status": plan_row["status"] if plan_row else None,
+            "finished_steps": [s["id"] for s in steps if s["status"] == "COMPLETED"],
+            "total_steps": len(steps),
+            "last_verified_checkpoint": last_checkpoint["commit_sha"] if last_checkpoint else task_dict.get("last_checkpoint_sha"),
+            "last_completed_provider_call": {
+                "stage": last_run.get("stage"),
+                "provider": last_run.get("provider_name"),
+                "status": last_run.get("status"),
+            } if last_run else None,
+            "full_verification_passed": bool(last_final_verif["passed"]) if last_final_verif else bool(task_dict.get("verification_passed")),
+            "peer_review_approved": (last_review.get("status") == "APPROVED") if last_review else False,
+            "promotion_disposition": task_dict.get("promotion_disposition", "NOT_OFFERED"),
+        }
 
     def record_review(
         self,
@@ -386,18 +1112,38 @@ class ProjectStateManager:
         """Persist a new ExecutionPlan and its steps into SQLite."""
         conn = self.db.connect()
         now = datetime.now(timezone.utc).isoformat()
+        p_status = plan.status.value if isinstance(plan.status, PlanStatus) else str(plan.status)
         with conn:
+            task_row = conn.execute("SELECT 1 FROM tasks WHERE id = ?;", (plan.task_id,)).fetchone()
+            if not task_row:
+                conn.execute(
+                    "INSERT OR IGNORE INTO projects (id, name, root_path) VALUES (?, ?, ?);",
+                    ("default", "Default Project", "."),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tasks (
+                        id, project_id, title, description, status, task_type, complexity, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (plan.task_id, "default", plan.task_id, "", "IN_PROGRESS", "FEATURE", "COMPLEX", now),
+                )
+
             conn.execute(
                 """
                 INSERT INTO plans (id, task_id, title, summary, status, max_steps, amendments_count, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status=excluded.status,
+                    summary=excluded.summary,
+                    updated_at=excluded.updated_at;
                 """,
                 (
                     plan.plan_id,
                     plan.task_id,
                     plan.title,
                     plan.summary,
-                    plan.status,
+                    p_status,
                     len(plan.steps),
                     plan.amendments_count,
                     plan.created_at or now,
@@ -412,7 +1158,12 @@ class ProjectStateManager:
                         dependencies, verification_expectations, risk_level, estimated_complexity,
                         status, provider_name, repair_rounds, created_at, completed_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(plan_id, id) DO UPDATE SET
+                        status=excluded.status,
+                        provider_name=excluded.provider_name,
+                        repair_rounds=excluded.repair_rounds,
+                        completed_at=excluded.completed_at;
                     """,
                     (
                         step.id,
@@ -478,6 +1229,12 @@ class ProjectStateManager:
             )
             steps.append(step)
 
+        raw_status = plan_row["status"]
+        try:
+            p_status = PlanStatus(raw_status)
+        except (ValueError, KeyError):
+            p_status = PlanStatus.PREPARED
+
         return ExecutionPlan(
             plan_id=plan_row["id"],
             task_id=plan_row["task_id"],
@@ -486,7 +1243,7 @@ class ProjectStateManager:
             steps=steps,
             current_step_index=0,
             amendments_count=plan_row["amendments_count"] or 0,
-            status=plan_row["status"],
+            status=p_status,
             created_at=plan_row["created_at"],
             updated_at=plan_row["updated_at"],
         )
@@ -502,20 +1259,21 @@ class ProjectStateManager:
             return None
         return self.get_plan(row["id"])
 
-    def update_plan_status(self, plan_id: str, status: str, amendments_count: Optional[int] = None) -> None:
+    def update_plan_status(self, plan_id: str, status: Union[str, PlanStatus], amendments_count: Optional[int] = None) -> None:
         """Update overall plan status and amendment count."""
         conn = self.db.connect()
         now = datetime.now(timezone.utc).isoformat()
+        status_val = status.value if isinstance(status, PlanStatus) else str(status)
         with conn:
             if amendments_count is not None:
                 conn.execute(
                     "UPDATE plans SET status = ?, amendments_count = ?, updated_at = ? WHERE id = ?;",
-                    (status, amendments_count, now, plan_id),
+                    (status_val, amendments_count, now, plan_id),
                 )
             else:
                 conn.execute(
                     "UPDATE plans SET status = ?, updated_at = ? WHERE id = ?;",
-                    (status, now, plan_id),
+                    (status_val, now, plan_id),
                 )
 
     def update_step_status(
@@ -540,6 +1298,16 @@ class ProjectStateManager:
                 """,
                 (status.value, prov, rep, completed_at, plan_id, step_id),
             )
+
+    def get_step(self, plan_id: str, step_id: str) -> Optional[PlanStep]:
+        """Fetch a single PlanStep by plan_id and step_id."""
+        plan = self.get_plan(plan_id)
+        if not plan:
+            return None
+        for s in plan.steps:
+            if s.id == step_id:
+                return s
+        return None
 
     def record_checkpoint(self, checkpoint: Checkpoint) -> str:
         """Persist a verified commit Checkpoint into SQLite."""
@@ -607,3 +1375,427 @@ class ProjectStateManager:
             )
         return checkpoints
 
+    def get_checkpoints_for_task(self, task_id: str) -> List[Dict[str, Any]]:
+        """Retrieve all checkpoints for a task ordered by creation time."""
+        conn = self.db.connect()
+        rows = conn.execute(
+            "SELECT * FROM checkpoints WHERE task_id = ? ORDER BY created_at ASC;",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_checkpoint(self, checkpoint: Checkpoint) -> str:
+        """Alias for record_checkpoint."""
+        return self.record_checkpoint(checkpoint)
+
+    def get_checkpoint(self, checkpoint_id: str) -> Optional[Checkpoint]:
+        """Fetch a checkpoint by its ID."""
+        conn = self.db.connect()
+        row = conn.execute("SELECT * FROM checkpoints WHERE id = ?;", (checkpoint_id,)).fetchone()
+        if not row:
+            return None
+        r = dict(row)
+        return Checkpoint(
+            checkpoint_id=r["id"],
+            plan_id=r["plan_id"],
+            task_id=r["task_id"],
+            step_id=r["step_id"],
+            commit_sha=r["commit_sha"],
+            base_commit_sha=r["base_commit_sha"],
+            files_changed=json.loads(r["files_changed"] or "[]"),
+            diff_summary=r["diff_summary"] or "",
+            verification_passed=bool(r["verification_passed"]),
+            provider_name=r["provider_name"] or "",
+            token_metrics={
+                "input_tokens": r["input_tokens"],
+                "output_tokens": r["output_tokens"],
+                "fusion_context_tokens": r["fusion_context_tokens"],
+                "duration_ms": r["duration_ms"],
+            },
+            created_at=r["created_at"],
+        )
+
+    # --- Write-Ahead Checkpoint Transactions ---
+
+    def record_checkpoint_transaction(self, txn: CheckpointTransaction) -> None:
+        """Persist a CheckpointTransaction object into SQLite."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO checkpoint_transactions (
+                    id, task_id, plan_id, step_id, expected_parent_sha,
+                    verification_id, verified, approved_paths, status, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    txn.id, txn.task_id, txn.plan_id, txn.step_id, txn.expected_parent_sha,
+                    txn.verification_id, 1 if txn.verified else 0,
+                    json.dumps(txn.approved_paths) if isinstance(txn.approved_paths, list) else txn.approved_paths,
+                    txn.status.value if hasattr(txn.status, "value") else str(txn.status),
+                    txn.created_at or now, txn.completed_at,
+                ),
+            )
+
+    def record_checkpoint_transaction_intent(
+        self,
+        checkpoint_id: str,
+        task_id: str,
+        plan_id: str,
+        step_id: str,
+        expected_parent_sha: str,
+        verification_id: str,
+        approved_paths: List[str],
+        verified: bool = True,
+    ) -> str:
+        """Write-ahead persistence of checkpoint creation intent before git commit."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO checkpoint_transactions (
+                    id, task_id, plan_id, step_id, expected_parent_sha,
+                    verification_id, verified, approved_paths, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARING', ?);
+                """,
+                (
+                    checkpoint_id, task_id, plan_id, step_id, expected_parent_sha,
+                    verification_id, 1 if verified else 0, json.dumps(approved_paths), now,
+                ),
+            )
+        return checkpoint_id
+
+    def complete_checkpoint_transaction(self, checkpoint_id: str) -> None:
+        """Mark a checkpoint transaction COMPLETED after git commit succeeds."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                "UPDATE checkpoint_transactions SET status = 'COMPLETED', completed_at = ? WHERE id = ?;",
+                (now, checkpoint_id),
+            )
+
+    def fail_checkpoint_transaction(self, checkpoint_id: str) -> None:
+        """Mark a checkpoint transaction FAILED."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                "UPDATE checkpoint_transactions SET status = 'FAILED', completed_at = ? WHERE id = ?;",
+                (now, checkpoint_id),
+            )
+
+    def get_checkpoint_transaction(self, checkpoint_id: str) -> Optional[CheckpointTransaction]:
+        """Fetch checkpoint transaction by ID."""
+        conn = self.db.connect()
+        row = conn.execute("SELECT * FROM checkpoint_transactions WHERE id = ?;", (checkpoint_id,)).fetchone()
+        if not row:
+            return None
+        return CheckpointTransaction.from_dict(dict(row))
+
+    # --- Write-Ahead Promotion Transactions ---
+
+    def record_promotion_transaction(self, txn: PromotionTransaction) -> None:
+        """Persist promotion transaction record in initial status."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO promotion_transactions (
+                    id, task_id, target_branch, expected_target_sha, task_branch,
+                    task_head_sha, diff_hash, status, resulting_target_sha, error_message, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    txn.id, txn.task_id, txn.target_branch, txn.expected_target_sha,
+                    txn.task_branch, txn.task_head_sha, txn.diff_hash,
+                    txn.status.value if hasattr(txn.status, "value") else str(txn.status),
+                    txn.resulting_target_sha, txn.error_message, txn.started_at or now,
+                ),
+            )
+
+    def update_promotion_transaction(
+        self,
+        txn_id: str,
+        status: PromotionTransactionStatus,
+        resulting_target_sha: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Update promotion transaction outcome."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                """
+                UPDATE promotion_transactions
+                SET status = ?, resulting_target_sha = COALESCE(?, resulting_target_sha),
+                    error_message = ?, completed_at = ?
+                WHERE id = ?;
+                """,
+                (
+                    status.value if hasattr(status, "value") else str(status),
+                    resulting_target_sha, error_message, now, txn_id,
+                ),
+            )
+
+    def get_active_promotion_transaction(self, task_id: str) -> Optional[PromotionTransaction]:
+        """Fetch the latest promotion transaction for a task."""
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT * FROM promotion_transactions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1;",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return PromotionTransaction.from_dict(dict(row))
+
+    def get_promotion_transaction(self, txn_id: str) -> Optional[PromotionTransaction]:
+        """Fetch a promotion transaction by its ID."""
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT * FROM promotion_transactions WHERE id = ?;",
+            (txn_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return PromotionTransaction.from_dict(dict(row))
+
+    # --- Diagnostic Task Locks ---
+
+    def record_task_lock(self, task_id: str, owner_id: str, pid: int, hostname: str) -> None:
+        """Record diagnostic task execution lock in SQLite."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO task_locks (task_id, owner_id, pid, hostname, acquired_at) VALUES (?, ?, ?, ?, ?);",
+                (task_id, owner_id, pid, hostname, now),
+            )
+
+    def release_task_lock(self, task_id: str, owner_id: str) -> None:
+        """Remove diagnostic task execution lock from SQLite."""
+        conn = self.db.connect()
+        with conn:
+            conn.execute(
+                "DELETE FROM task_locks WHERE task_id = ? AND owner_id = ?;",
+                (task_id, owner_id),
+            )
+
+    def get_task_lock(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve diagnostic lock record."""
+        conn = self.db.connect()
+        row = conn.execute("SELECT * FROM task_locks WHERE task_id = ?;", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    # --- Recovery Scanning ---
+
+    def get_recoverable_tasks(self) -> List[Dict[str, Any]]:
+        """List tasks that can be safely resumed.
+
+        Scans tasks in INTERRUPTED, RECOVERABLE, or stale RUNNING/RESUMING (with no active OS lock).
+        """
+        from fusion_agent.workspace.lock import TaskExecutionLock
+        conn = self.db.connect()
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status IN ('INTERRUPTED', 'RECOVERABLE', 'RUNNING', 'RESUMING', 'IN_PROGRESS') ORDER BY created_at DESC;"
+        ).fetchall()
+        recoverable = []
+        for r in rows:
+            t_dict = dict(r)
+            task_id = t_dict["id"]
+            status = t_dict["status"]
+            if status in ("RUNNING", "IN_PROGRESS", "RESUMING"):
+                if TaskExecutionLock.is_locked(task_id):
+                    continue
+                else:
+                    self.update_task_status(task_id, TaskStatus.RECOVERABLE)
+                    t_dict["status"] = TaskStatus.RECOVERABLE.value
+            recoverable.append(t_dict)
+        return recoverable
+
+    # --- MCP Invocations Ledger ---
+
+    def _ensure_task_exists(self, conn: sqlite3.Connection, task_id: str) -> None:
+        """Ensure a task record exists to satisfy foreign key constraints for ad-hoc or test invocations."""
+        if not task_id:
+            return
+        task_row = conn.execute("SELECT id FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+        if not task_row:
+            proj_row = conn.execute("SELECT id FROM projects LIMIT 1;").fetchone()
+            if proj_row:
+                p_id = proj_row[0]
+            else:
+                p_id = "default-mcp-proj"
+                conn.execute("INSERT OR IGNORE INTO projects (id, name, root_path) VALUES (?, ?, ?);", (p_id, "Default Project", "/tmp"))
+            conn.execute(
+                "INSERT OR IGNORE INTO tasks (id, project_id, title, status, task_type, complexity) VALUES (?, ?, ?, 'RUNNING', 'CODE_MODIFICATION', 'LOW');",
+                (task_id, p_id, f"Auto-created task {task_id}"),
+            )
+
+    def record_mcp_invocation_started(
+        self,
+        invocation_id: str,
+        task_id: str,
+        server_id: str,
+        tool_name: str,
+        arguments_hash: str,
+        sanitized_arguments: str,
+        policy_decision: str,
+        approval_disposition: str,
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        provider_stage: str = "implementation",
+        logical_tool_invocation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[str, int]:
+        """Write-ahead persistence of an MCP tool invocation in STARTED status."""
+        conn = self.db.connect()
+        now = datetime.now(timezone.utc).isoformat()
+        if not logical_tool_invocation_id:
+            logical_tool_invocation_id = f"{task_id}:{plan_id or 'none'}:{step_id or 'none'}:{provider_stage}:{server_id}:{tool_name}"
+
+        with conn:
+            self._ensure_task_exists(conn, task_id)
+            att_row = conn.execute(
+                "SELECT MAX(attempt_number) FROM mcp_tool_invocations WHERE logical_tool_invocation_id = ?;",
+                (logical_tool_invocation_id,),
+            ).fetchone()
+            attempt_number = (att_row[0] or 0) + 1 if att_row else 1
+
+            conn.execute(
+                """
+                INSERT INTO mcp_tool_invocations (
+                    id, task_id, plan_id, step_id, provider_stage, server_id, tool_name,
+                    arguments_hash, sanitized_arguments, policy_decision, approval_disposition,
+                    status, duration_ms, result_chars, result_tokens, is_truncated,
+                    error_message, logical_tool_invocation_id, attempt_number, idempotency_key, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'STARTED', 0.0, 0, 0, 0, NULL, ?, ?, ?, ?);
+                """,
+                (
+                    invocation_id,
+                    task_id,
+                    plan_id,
+                    step_id,
+                    provider_stage,
+                    server_id,
+                    tool_name,
+                    arguments_hash,
+                    sanitized_arguments,
+                    policy_decision,
+                    approval_disposition,
+                    logical_tool_invocation_id,
+                    attempt_number,
+                    idempotency_key,
+                    now,
+                ),
+            )
+        return invocation_id, attempt_number
+
+    def complete_mcp_invocation(
+        self,
+        invocation_id: str,
+        status: str = "COMPLETED",
+        duration_ms: float = 0.0,
+        result_chars: int = 0,
+        result_tokens: int = 0,
+        is_truncated: bool = False,
+        error_message: Optional[str] = None,
+        is_accepted: bool = False,
+    ) -> None:
+        """Mark an MCP tool invocation as COMPLETED, FAILED, or INTERRUPTED."""
+        conn = self.db.connect()
+        with conn:
+            conn.execute(
+                """
+                UPDATE mcp_tool_invocations
+                SET status = ?, duration_ms = ?, result_chars = ?, result_tokens = ?,
+                    is_truncated = ?, error_message = ?, is_accepted = ?
+                WHERE id = ?;
+                """,
+                (
+                    status,
+                    duration_ms,
+                    result_chars,
+                    result_tokens,
+                    1 if is_truncated else 0,
+                    error_message,
+                    1 if is_accepted else 0,
+                    invocation_id,
+                ),
+            )
+
+    def record_mcp_invocation(
+        self,
+        task_id: str,
+        server_id: str,
+        tool_name: str,
+        arguments_hash: str,
+        sanitized_arguments: str,
+        policy_decision: str,
+        approval_disposition: str,
+        status: str,
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        provider_stage: str = "implementation",
+        error_message: Optional[str] = None,
+        is_accepted: bool = False,
+    ) -> str:
+        """Immediately record a one-shot MCP invocation (e.g. DENIED or DECLINED)."""
+        conn = self.db.connect()
+        inv_id = str(uuid.uuid4())[:8]
+        now = datetime.now(timezone.utc).isoformat()
+        logical_id = f"{task_id}:{plan_id or 'none'}:{step_id or 'none'}:{provider_stage}:{server_id}:{tool_name}"
+
+        with conn:
+            self._ensure_task_exists(conn, task_id)
+            conn.execute(
+                """
+                INSERT INTO mcp_tool_invocations (
+                    id, task_id, plan_id, step_id, provider_stage, server_id, tool_name,
+                    arguments_hash, sanitized_arguments, policy_decision, approval_disposition,
+                    status, duration_ms, result_chars, result_tokens, is_truncated,
+                    error_message, logical_tool_invocation_id, attempt_number, is_accepted, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0, 0, 0, ?, ?, 1, ?, ?);
+                """,
+                (
+                    inv_id,
+                    task_id,
+                    plan_id,
+                    step_id,
+                    provider_stage,
+                    server_id,
+                    tool_name,
+                    arguments_hash,
+                    sanitized_arguments,
+                    policy_decision,
+                    approval_disposition,
+                    status,
+                    error_message,
+                    logical_id,
+                    1 if is_accepted else 0,
+                    now,
+                ),
+            )
+        return inv_id
+
+    def get_mcp_invocations_for_task(self, task_id: str) -> List[Dict[str, Any]]:
+        """Retrieve all MCP invocations for a task ordered chronologically."""
+        conn = self.db.connect()
+        rows = conn.execute(
+            "SELECT * FROM mcp_tool_invocations WHERE task_id = ? ORDER BY timestamp ASC;",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def reconcile_stale_mcp_invocations(self, task_id: str) -> int:
+        """Mark uncompleted STARTED MCP invocations as INTERRUPTED on crash recovery."""
+        conn = self.db.connect()
+        with conn:
+            cur = conn.execute(
+                "UPDATE mcp_tool_invocations SET status = 'INTERRUPTED' WHERE task_id = ? AND status = 'STARTED';",
+                (task_id,),
+            )
+            return cur.rowcount

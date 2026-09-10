@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from fusion_agent.core.budget import TaskBudgetController
 from fusion_agent.models.assessment import ReviewRisk
 from fusion_agent.models.context import CodeContext
-from fusion_agent.models.plan import ExecutionPlan, PlanStep, StepStatus
+from fusion_agent.models.plan import ExecutionPlan, PlanStep, PlanStatus, StepStatus
 from fusion_agent.models.task import Complexity, Task
 from fusion_agent.providers.base import AgentProvider
 from fusion_agent.providers.normalizer import StructuredOutputNormalizer
@@ -147,18 +147,37 @@ class PlanEngine:
         planner: AgentProvider,
         reviewer: Optional[AgentProvider] = None,
         budget: Optional[TaskBudgetController] = None,
+        state_manager: Optional[Any] = None,
         emit: Optional[Callable] = None,
     ) -> ExecutionPlan:
         """Prompt planner to create a validated ExecutionPlan, with optional critique."""
         if emit is None:
             emit = lambda event, data: None
 
+        plan_id = str(uuid.uuid4())[:8]
         task_text = task.description if task.description == task.title or task.description.startswith(task.title) else f"{task.title}\n{task.description}"
         prompt = self.build_planning_prompt(task_text, self.max_steps)
 
         emit("status", {"message": f"{planner.name} is decomposing task into a bounded execution plan..."})
+        stage_run_id = None
+        if state_manager and hasattr(state_manager, "record_provider_stage_started"):
+            stage_run_id = state_manager.record_provider_stage_started(
+                task_id=task.id,
+                stage="plan_generation",
+                provider=planner.name,
+                role="planner",
+                plan_id=plan_id,
+                round_number=0,
+                prompt_summary=prompt[:200],
+            )
+
         t_start = time.perf_counter()
-        resp = planner.invoke(prompt, context=context)
+        try:
+            resp = planner.invoke(prompt, context=context)
+        except Exception as exc:
+            if stage_run_id and state_manager:
+                state_manager.fail_provider_stage(stage_run_id, error_message=str(exc))
+            raise exc
         t_dur = (time.perf_counter() - t_start) * 1000.0
 
         if budget:
@@ -177,12 +196,52 @@ class PlanEngine:
 
         data, err = self.parse_plan_json(resp.content, self.max_steps)
 
+        if stage_run_id and state_manager:
+            state_manager.complete_provider_stage(
+                run_id=stage_run_id,
+                response=resp,
+                context=context,
+                duration_ms=resp.duration_ms or t_dur,
+                status="success" if (data and not err) else "validation_error",
+            )
+        elif state_manager:
+            state_manager.record_provider_stage(
+                task_id=task.id,
+                stage="plan_generation",
+                provider=planner.name,
+                role="planner",
+                response=resp,
+                plan_id=plan_id,
+                round_number=0,
+                context=context,
+                duration_ms=resp.duration_ms or t_dur,
+                status="success" if (data and not err) else "validation_error",
+                prompt_summary=prompt[:200],
+            )
+
         # Retry once if invalid and budget allows
         if (not data or err) and budget and budget.can_call_provider()[0]:
             emit("status", {"message": f"Plan parsing error ({err}). Requesting structured correction..."})
             correction_prompt = f"Previous response had validation error: {err}\nPlease re-output strictly valid JSON following the schema contract."
+            rep_run_id = None
+            if state_manager and hasattr(state_manager, "record_provider_stage_started"):
+                rep_run_id = state_manager.record_provider_stage_started(
+                    task_id=task.id,
+                    stage="plan_repair",
+                    provider=planner.name,
+                    role="planner",
+                    plan_id=plan_id,
+                    round_number=1,
+                    prompt_summary=correction_prompt[:200],
+                )
+
             t_start = time.perf_counter()
-            resp = planner.invoke(correction_prompt, context=context)
+            try:
+                resp = planner.invoke(correction_prompt, context=context)
+            except Exception as exc:
+                if rep_run_id and state_manager:
+                    state_manager.fail_provider_stage(rep_run_id, error_message=str(exc))
+                raise exc
             t_dur = (time.perf_counter() - t_start) * 1000.0
             budget.record_call(
                 provider_name=planner.name,
@@ -193,6 +252,28 @@ class PlanEngine:
                 stage="Plan Correction",
             )
             data, err = self.parse_plan_json(resp.content, self.max_steps)
+            if rep_run_id and state_manager:
+                state_manager.complete_provider_stage(
+                    run_id=rep_run_id,
+                    response=resp,
+                    context=context,
+                    duration_ms=resp.duration_ms or t_dur,
+                    status="success" if (data and not err) else "validation_error",
+                )
+            elif state_manager:
+                state_manager.record_provider_stage(
+                    task_id=task.id,
+                    stage="plan_repair",
+                    provider=planner.name,
+                    role="planner",
+                    response=resp,
+                    plan_id=plan_id,
+                    round_number=1,
+                    context=context,
+                    duration_ms=resp.duration_ms or t_dur,
+                    status="success" if (data and not err) else "validation_error",
+                    prompt_summary=correction_prompt[:200],
+                )
 
         if not data or err:
             raise PlanValidationError(f"Failed to generate valid ExecutionPlan: {err}")
@@ -238,12 +319,12 @@ class PlanEngine:
             raise PlanValidationError(f"Invalid plan dependency structure: {dag_err}")
 
         plan = ExecutionPlan(
-            plan_id=str(uuid.uuid4())[:8],
+            plan_id=plan_id,
             task_id=task.id,
             title=data.get("title") or task.title,
             summary=data.get("summary") or "Checkpointed multi-step execution plan.",
             steps=steps,
-            status="PREPARED",
+            status=PlanStatus.PREPARED,
         )
 
         # Optional Plan Critique for High Risk Plans
@@ -256,8 +337,25 @@ class PlanEngine:
                 "Evaluate this plan for feasibility, missing dependencies, safety risks, or gaps. "
                 "If acceptable, reply [APPROVED]. If major adjustments are needed, reply [NEEDS_REVISION] with specific critique."
             )
+            crit_run_id = None
+            if state_manager and hasattr(state_manager, "record_provider_stage_started"):
+                crit_run_id = state_manager.record_provider_stage_started(
+                    task_id=task.id,
+                    stage="plan_critique",
+                    provider=reviewer.name,
+                    role="reviewer",
+                    plan_id=plan.plan_id,
+                    round_number=1,
+                    prompt_summary=critique_prompt[:200],
+                )
+
             t_start = time.perf_counter()
-            crit_resp = reviewer.invoke(critique_prompt, context=context)
+            try:
+                crit_resp = reviewer.invoke(critique_prompt, context=context)
+            except Exception as exc:
+                if crit_run_id and state_manager:
+                    state_manager.fail_provider_stage(crit_run_id, error_message=str(exc))
+                raise exc
             t_dur = (time.perf_counter() - t_start) * 1000.0
             budget.record_call(
                 provider_name=reviewer.name,
@@ -267,6 +365,28 @@ class PlanEngine:
                 fusion_context_tokens=crit_resp.fusion_context_tokens,
                 stage="Plan Critique",
             )
+            if crit_run_id and state_manager:
+                state_manager.complete_provider_stage(
+                    run_id=crit_run_id,
+                    response=crit_resp,
+                    context=context,
+                    duration_ms=crit_resp.duration_ms or t_dur,
+                    status="approved" if "[APPROVED]" in crit_resp.content else "needs_revision",
+                )
+            elif state_manager:
+                state_manager.record_provider_stage(
+                    task_id=task.id,
+                    stage="plan_critique",
+                    provider=reviewer.name,
+                    role="reviewer",
+                    response=crit_resp,
+                    plan_id=plan.plan_id,
+                    round_number=1,
+                    context=context,
+                    duration_ms=crit_resp.duration_ms or t_dur,
+                    status="approved" if "[APPROVED]" in crit_resp.content else "needs_revision",
+                    prompt_summary=critique_prompt[:200],
+                )
             emit("status", {"message": f"Plan review completed by {reviewer.name}."})
 
         emit("status", {"message": f"Generated validated execution plan with {len(plan.steps)} steps."})

@@ -11,6 +11,7 @@ from fusion_agent.config.schema import AgentConfig, FusionConfig, OptimizationMo
 from fusion_agent.core.orchestrator import FusionOrchestrator
 from fusion_agent.memory.database import Database
 from fusion_agent.models.deliberation import ReviewStatus
+from fusion_agent.models.task import PromotionDisposition
 from fusion_agent.providers.registry import ProviderRegistry
 from fusion_agent.workspace.promotion import PromotionEngine
 
@@ -108,8 +109,19 @@ def cmd_status(args) -> int:
         except Exception as e:
             print(f"  {YELLOW}{ICON_FAIL}{RESET} [{agent_id}] {agent_cfg.provider_name} - Error: {e}")
 
-    # Display recent tasks
+    # Display recoverable tasks
     conn = db.connect()
+    rec_tasks = conn.execute(
+        "SELECT id, title, status, last_checkpoint_sha FROM tasks WHERE status IN ('RUNNING', 'INTERRUPTED', 'RECOVERABLE', 'RESUMING') ORDER BY created_at DESC LIMIT 10;"
+    ).fetchall()
+    if rec_tasks:
+        print(f"\n{BOLD}{YELLOW}Recoverable Tasks:{RESET}")
+        for rt in rec_tasks:
+            chk = f"checkpoint: {rt['last_checkpoint_sha'][:8]}" if rt['last_checkpoint_sha'] else "no checkpoint"
+            print(f"  - [{rt['status']}] {BOLD}{rt['id']}{RESET}: {rt['title']} ({chk})")
+        print(f"  Run {BOLD}fusion resume <task-id>{RESET} to resume execution.")
+
+    # Display recent tasks
     tasks = conn.execute(
         "SELECT title, status, selected_strategy, created_at FROM tasks ORDER BY created_at DESC LIMIT 5;"
     ).fetchall()
@@ -122,6 +134,93 @@ def cmd_status(args) -> int:
             print(f"  - [{t['status']}] {t['title']} ({t['selected_strategy'] or 'N/A'})")
 
     db.close()
+    return 0
+
+
+def _inspect_and_promote(result, orchestrator: FusionOrchestrator, args) -> int:
+    """Inspect isolated repository edits and present the mandatory promotion confirmation gate."""
+    if getattr(result, "workspace_session", None) is not None:
+        session = result.workspace_session
+        verif = result.verification_result
+        diff = result.diff
+        review = result.review_result
+        promo = PromotionEngine()
+
+        print(f"{BOLD}{CYAN}=== ISOLATED REPOSITORY EDIT INSPECTION ==={RESET}")
+        print(f"Task Branch:  {session.task_branch}")
+        print(f"Base Commit:  {session.base_commit[:8] if session.base_commit else 'unknown'}")
+
+        if verif:
+            v_color = GREEN if verif.passed else RED
+            print(f"Verification: {v_color}{'PASSED' if verif.passed else 'FAILED'}{RESET} (exit code {verif.exit_code}, {verif.duration_seconds:.2f}s)")
+            if verif.stderr:
+                print(f"{YELLOW}Test Stderr:{RESET}\n{verif.stderr}")
+
+        if review:
+            r_color = GREEN if review.status == ReviewStatus.APPROVED else RED
+            print(f"Peer Review:  {r_color}[{review.status.value}]{RESET} by {review.reviewer_agent}")
+            print(f"{BOLD}Comments:{RESET}\n{review.comments}")
+
+        if hasattr(result, "deliberation") and result.deliberation and hasattr(result.deliberation, "reviews") and len(result.deliberation.reviews) > 1:
+            print(f"\n{BOLD}Review History ({len(result.deliberation.reviews)} rounds):{RESET}")
+            for i, r in enumerate(result.deliberation.reviews, 1):
+                rc = GREEN if r.status == ReviewStatus.APPROVED else RED
+                print(f"  Round {i}: {rc}[{r.status.value}]{RESET} by {r.reviewer_agent}")
+
+        if hasattr(result, "deliberation") and result.deliberation and hasattr(result.deliberation, "stage_metrics") and result.deliberation.stage_metrics:
+            print(f"\n{BOLD}Per-Provider Stages:{RESET}")
+            for sm in result.deliberation.stage_metrics:
+                s_in = f"{sm['input_tokens']:,}" if sm.get('input_tokens') is not None else "unavailable"
+                s_out = f"{sm['output_tokens']:,}" if sm.get('output_tokens') is not None else "unavailable"
+                print(f"  - {BOLD}{sm['stage']}{RESET} ({sm['provider']}): {sm['duration_ms']:.1f} ms | in: {s_in}, out: {s_out}")
+
+        if diff:
+            print(f"\n{BOLD}{YELLOW}--- GENERATED UNIFIED DIFF ---{RESET}")
+            print(diff)
+            print(f"{BOLD}{YELLOW}------------------------------{RESET}\n")
+        else:
+            print(f"\n{YELLOW}Notice: No file modifications detected in isolated worktree.{RESET}\n")
+
+        # Confirmation Gate: Requires tests passed, peer review approved, and non-empty diff
+        eligible = (
+            (verif is not None and verif.passed)
+            and (review is not None and review.status == ReviewStatus.APPROVED)
+            and bool(diff)
+        )
+        if eligible:
+            if getattr(args, "no_promote", False):
+                choice = "n"
+            else:
+                try:
+                    prompt_msg = f"{BOLD}Apply verified changes? [y/N]: {RESET}"
+                    choice = input(prompt_msg).strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    choice = "n"
+
+            if choice in ("y", "yes"):
+                res = promo.promote(session)
+                if res.success:
+                    orchestrator.state_manager.update_task_promotion(result.task.id, PromotionDisposition.PROMOTED)
+                    print(f"\n{BOLD}{GREEN}[SUCCESS]{RESET} {res.message}\n")
+                else:
+                    orchestrator.state_manager.update_task_promotion(result.task.id, PromotionDisposition.BLOCKED)
+                    print(f"\n{BOLD}{RED}[PROMOTION FAILED]{RESET} {res.message}\n")
+            else:
+                promo.discard(session)
+                orchestrator.state_manager.update_task_promotion(result.task.id, PromotionDisposition.DECLINED)
+                print(f"\n{YELLOW}Promotion declined. Isolated worktree and branch cleanly discarded.{RESET}\n")
+        else:
+            promo.discard(session)
+            orchestrator.state_manager.update_task_promotion(result.task.id, PromotionDisposition.BLOCKED)
+            reasons = []
+            if not (verif and verif.passed):
+                reasons.append("automated verification failed")
+            if not (review and review.status == ReviewStatus.APPROVED):
+                reasons.append("peer review was not approved")
+            if not diff:
+                reasons.append("no modifications generated")
+            print(f"\n{RED}Changes not eligible for promotion ({', '.join(reasons)}). Isolated worktree discarded.{RESET}\n")
+
     return 0
 
 
@@ -196,84 +295,147 @@ def cmd_run(args) -> int:
     print(f"\n{BOLD}{GREEN}Fusion:{RESET}")
     print(f"{result.final_answer}\n")
 
-    # Autonomous Edit Inspection & Mandatory User Confirmation Gate
-    if getattr(result, "workspace_session", None) is not None:
-        session = result.workspace_session
-        verif = result.verification_result
-        diff = result.diff
-        review = result.review_result
-        promo = PromotionEngine()
+    return _inspect_and_promote(result, orchestrator, args)
 
-        print(f"{BOLD}{CYAN}=== ISOLATED REPOSITORY EDIT INSPECTION ==={RESET}")
-        print(f"Task Branch:  {session.task_branch}")
-        print(f"Base Commit:  {session.base_commit[:8] if session.base_commit else 'unknown'}")
 
-        if verif:
-            v_color = GREEN if verif.passed else RED
-            print(f"Verification: {v_color}{'PASSED' if verif.passed else 'FAILED'}{RESET} (exit code {verif.exit_code}, {verif.duration_seconds:.2f}s)")
-            if verif.stderr:
-                print(f"{YELLOW}Test Stderr:{RESET}\n{verif.stderr}")
+def cmd_resume(args) -> int:
+    """Resume an interrupted task."""
+    config_file = ConfigLoader.find_config_file(args.dir)
+    if not config_file:
+        print(f"{YELLOW}No Fusion Agent project found. Run 'fusion init' first.{RESET}")
+        return 1
 
-        if review:
-            r_color = GREEN if review.status == ReviewStatus.APPROVED else RED
-            print(f"Peer Review:  {r_color}[{review.status.value}]{RESET} by {review.reviewer_agent}")
-            print(f"{BOLD}Comments:{RESET}\n{review.comments}")
+    config = ConfigLoader.load(config_file)
+    db = Database(Path(config.project_root) / config.storage_dir / "fusion.db")
+    orchestrator = FusionOrchestrator(config=config, database=db)
 
-        if hasattr(result.deliberation, "reviews") and len(result.deliberation.reviews) > 1:
-            print(f"\n{BOLD}Review History ({len(result.deliberation.reviews)} rounds):{RESET}")
-            for i, r in enumerate(result.deliberation.reviews, 1):
-                rc = GREEN if r.status == ReviewStatus.APPROVED else RED
-                print(f"  Round {i}: {rc}[{r.status.value}]{RESET} by {r.reviewer_agent}")
+    print(f"\n{BOLD}{CYAN}Fusion Agent — Resuming Task{RESET}")
+    print(f"{GRAY}Task ID: {args.task_id}{RESET}\n")
 
+    def handle_status_event(event_type: str, data: dict):
+        if event_type == "status":
+            print(f"  {BLUE}{ICON_BULLET}{RESET} {data.get('message')}")
+        elif event_type == "deliberation_step":
+            print(f"    {GRAY}{ICON_ARROW} {data.get('step')}{RESET}")
+        elif event_type == "routing_decision":
+            roles = data.get("role_assignments", {})
+            impl = roles.get("implementer") or data.get("primary")
+            rev = roles.get("reviewer") or data.get("secondary")
+            print(f"  {CYAN}{ICON_ARROW} Strategy: {data.get('strategy')} | Implementer: {impl} | Reviewer: {rev or 'None'}{RESET}")
+            if data.get("task_assessment"):
+                ass = data["task_assessment"]
+                print(f"    {GRAY}Assessment: {ass.get('task_type')} | Complexity: {ass.get('complexity')} | Scope: {ass.get('estimated_scope')} | Risk: {ass.get('review_risk')}{RESET}")
+            print(f"    {GRAY}Rationale: {data.get('rationale')}{RESET}")
+        elif event_type == "routing" and getattr(args, "debug", False):
+            print(f"  {YELLOW}[DEBUG Router]{RESET} Strategy: {data.get('strategy')} | Complexity: {data.get('complexity')}")
+            print(f"    Rationale: {data.get('rationale')}")
+
+    try:
+        result = orchestrator.resume_task(args.task_id, on_status=handle_status_event)
+    except Exception as exc:
+        print(f"\n{BOLD}{YELLOW}[ERROR]{RESET} Fusion Agent failed to resume task: {exc}\n")
+        return 1
+
+    # Output deliberation details if debug mode requested
+    if getattr(args, "debug", False) and hasattr(result, "deliberation") and result.deliberation:
+        print(f"\n{BOLD}{YELLOW}--- DELIBERATION INSPECTION (DEBUG) ---{RESET}")
+        print(f"Strategy:    {result.deliberation.strategy_used}")
+        print(f"Providers:   {', '.join(result.deliberation.participating_providers)}")
+        print(f"Rounds:      {result.deliberation.rounds_executed}")
+        print(f"Duration:    {result.deliberation.duration_ms:.1f} ms")
+        in_tok_str = f"{result.deliberation.total_input_tokens:,}" if result.deliberation.total_input_tokens is not None else "unavailable"
+        out_tok_str = f"{result.deliberation.total_output_tokens:,}" if result.deliberation.total_output_tokens is not None else "unavailable"
+        print(f"Input Toks:  {in_tok_str}")
+        print(f"Output Toks: {out_tok_str}")
+        if hasattr(result, "context") and result.context and result.context.metrics:
+            m = result.context.metrics
+            print(f"Context:     Permanent: {m.get('permanent_chars', 0)}c | Current: {m.get('current_chars', 0)}c | Recent: {m.get('recent_chars', 0)}c | Peer: {m.get('peer_chars', 0)}c | Est. Tokens: ~{m.get('estimated_tokens', 0)}")
         if hasattr(result.deliberation, "stage_metrics") and result.deliberation.stage_metrics:
             print(f"\n{BOLD}Per-Provider Stages:{RESET}")
             for sm in result.deliberation.stage_metrics:
                 s_in = f"{sm['input_tokens']:,}" if sm.get('input_tokens') is not None else "unavailable"
                 s_out = f"{sm['output_tokens']:,}" if sm.get('output_tokens') is not None else "unavailable"
                 print(f"  - {BOLD}{sm['stage']}{RESET} ({sm['provider']}): {sm['duration_ms']:.1f} ms | in: {s_in}, out: {s_out}")
+        for prop in getattr(result.deliberation, "proposals", []):
+            print(f"\n{BOLD}[Proposal from {prop.agent_name}]{RESET}\n{prop.content}")
+        for crit in getattr(result.deliberation, "critiques", []):
+            print(f"\n{BOLD}[Critique by {crit.reviewer_agent}]{RESET}\n{crit.content}")
+        for rev in getattr(result.deliberation, "reviews", []):
+            print(f"\n{BOLD}[Review by {rev.reviewer_agent} - {rev.status.value}]{RESET}\n{rev.comments}")
+        print(f"{BOLD}{YELLOW}---------------------------------------{RESET}\n")
 
-        if diff:
-            print(f"\n{BOLD}{YELLOW}--- GENERATED UNIFIED DIFF ---{RESET}")
-            print(diff)
-            print(f"{BOLD}{YELLOW}------------------------------{RESET}\n")
-        else:
-            print(f"\n{YELLOW}Notice: No file modifications detected in isolated worktree.{RESET}\n")
+    # Unified Single Agent Response
+    print(f"\n{BOLD}{GREEN}Fusion:{RESET}")
+    print(f"{result.final_answer}\n")
 
-        # Confirmation Gate: Requires tests passed, peer review approved, and non-empty diff
-        eligible = (
-            (verif is not None and verif.passed)
-            and (review is not None and review.status == ReviewStatus.APPROVED)
-            and bool(diff)
-        )
-        if eligible:
-            if getattr(args, "no_promote", False):
-                choice = "n"
+    return _inspect_and_promote(result, orchestrator, args)
+
+
+def cmd_mcp(args) -> int:
+    """Manage and inspect Model Context Protocol (MCP) servers and tools."""
+    config_file = ConfigLoader.find_config_file(args.dir)
+    if not config_file:
+        print(f"{YELLOW}No Fusion Agent project found. Run 'fusion init' first.{RESET}")
+        return 1
+
+    config = ConfigLoader.load(config_file)
+    from fusion_agent.mcp.registry import MCPServerRegistry
+
+    registry = MCPServerRegistry()
+    if hasattr(config, "mcp_servers") and config.mcp_servers:
+        for s_id, s_cfg in config.mcp_servers.items():
+            registry.register_server(s_cfg)
+
+    action = getattr(args, "mcp_action", "list") or "list"
+
+    if action == "list":
+        print(f"\n{BOLD}Configured MCP Servers:{RESET}")
+        servers = registry.list_servers()
+        if not servers:
+            print("  No MCP servers configured in .fusion/config.json.")
+            return 0
+        for s in servers:
+            status_color = GREEN if s.enabled else GRAY
+            print(f"  {status_color}{ICON_BULLET}{RESET} {BOLD}{s.server_id}{RESET} ({s.display_name or 'unnamed'})")
+            print(f"     Transport: {s.transport.value} | Executable: {s.command} {' '.join(s.args)}")
+            print(f"     Enabled: {s.enabled} | Timeout: {s.timeout_seconds}s")
+        return 0
+
+    elif action == "tools":
+        server_id = args.server_id
+        server_cfg = registry.get_server_config(server_id)
+        if not server_cfg:
+            print(f"{RED}{ICON_FAIL} Server '{server_id}' not found in registry.{RESET}")
+            return 1
+
+        print(f"\n{BOLD}Tools for MCP Server '{server_id}':{RESET}")
+        tools = registry.list_tools(server_id)
+        if not tools:
+            print("  No tools registered or discovered for this server.")
+            return 0
+        for t in tools:
+            caps_str = ", ".join(c.value for c in t.capabilities)
+            print(f"  {CYAN}{ICON_BULLET}{RESET} {BOLD}{t.tool_name}{RESET} [{caps_str}]")
+            print(f"     Side-effect: {t.side_effect.value} | Sensitivity: {t.sensitivity.value}")
+            print(f"     Supports Idempotency: {t.supports_idempotency}")
+        return 0
+
+    elif action == "health":
+        print(f"\n{BOLD}MCP Server Health Checks:{RESET}")
+        servers = registry.list_servers()
+        if not servers:
+            print("  No MCP servers configured.")
+            return 0
+        from fusion_agent.mcp.models import ServerHealthState
+        all_healthy = True
+        for s in servers:
+            status, latency, err = registry.check_health(s.server_id)
+            if status == ServerHealthState.HEALTHY:
+                print(f"  {GREEN}{ICON_OK}{RESET} {BOLD}{s.server_id}{RESET}: Healthy ({latency:.1f}ms)")
             else:
-                try:
-                    prompt_msg = f"{BOLD}Apply verified changes? [y/N]: {RESET}"
-                    choice = input(prompt_msg).strip().lower()
-                except (KeyboardInterrupt, EOFError):
-                    choice = "n"
-
-            if choice in ("y", "yes"):
-                res = promo.promote(session)
-                if res.success:
-                    print(f"\n{BOLD}{GREEN}[SUCCESS]{RESET} {res.message}\n")
-                else:
-                    print(f"\n{BOLD}{RED}[PROMOTION FAILED]{RESET} {res.message}\n")
-            else:
-                promo.discard(session)
-                print(f"\n{YELLOW}Promotion declined. Isolated worktree and branch cleanly discarded.{RESET}\n")
-        else:
-            promo.discard(session)
-            reasons = []
-            if not (verif and verif.passed):
-                reasons.append("automated verification failed")
-            if not (review and review.status == ReviewStatus.APPROVED):
-                reasons.append("peer review was not approved")
-            if not diff:
-                reasons.append("no modifications generated")
-            print(f"\n{RED}Changes not eligible for promotion ({', '.join(reasons)}). Isolated worktree discarded.{RESET}\n")
+                print(f"  {RED}{ICON_FAIL}{RESET} {BOLD}{s.server_id}{RESET}: {status.value} ({err or 'Check failed'})")
+                all_healthy = False
+        return 0 if all_healthy else 1
 
     return 0
 
@@ -339,8 +501,21 @@ def main():
     p_run.add_argument("task", help="The programming task or question")
     p_run.add_argument("--no-promote", action="store_true", help="Do not promote changes to base branch")
 
+    # Resume
+    p_resume = subparsers.add_parser("resume", parents=[common_parser], help="Resume an interrupted Fusion Agent task")
+    p_resume.add_argument("task_id", help="The task ID to resume")
+    p_resume.add_argument("--no-promote", action="store_true", help="Do not promote changes to base branch")
+
     # Interactive
     subparsers.add_parser("interactive", parents=[common_parser], help="Start an interactive session")
+
+    # MCP
+    p_mcp = subparsers.add_parser("mcp", parents=[common_parser], help="Manage and inspect MCP tool servers")
+    mcp_sub = p_mcp.add_subparsers(dest="mcp_action")
+    mcp_sub.add_parser("list", parents=[common_parser], help="List configured MCP servers")
+    p_mcp_tools = mcp_sub.add_parser("tools", parents=[common_parser], help="List tools for a specific MCP server")
+    p_mcp_tools.add_argument("server_id", help="The server ID to inspect")
+    mcp_sub.add_parser("health", parents=[common_parser], help="Check connectivity to all MCP servers")
 
     args = parser.parse_args()
 
@@ -354,8 +529,12 @@ def main():
         return cmd_status(args)
     elif args.command == "run":
         return cmd_run(args)
+    elif args.command == "resume":
+        return cmd_resume(args)
     elif args.command == "interactive":
         return cmd_interactive(args)
+    elif args.command == "mcp":
+        return cmd_mcp(args)
     else:
         parser.print_help()
         return 0

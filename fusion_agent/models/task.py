@@ -12,8 +12,12 @@ class TaskStatus(str, Enum):
     DELIBERATING = "DELIBERATING"
     IMPLEMENTING = "IMPLEMENTING"
     REVIEWING = "REVIEWING"
+    INTERRUPTED = "INTERRUPTED"
+    RECOVERABLE = "RECOVERABLE"
+    RESUMING = "RESUMING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class TaskType(str, Enum):
@@ -32,6 +36,15 @@ class Complexity(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class PromotionDisposition(str, Enum):
+    """Disposition of task promotion to base branch."""
+    NOT_OFFERED = "NOT_OFFERED"
+    PENDING = "PENDING"
+    PROMOTED = "PROMOTED"
+    DECLINED = "DECLINED"
+    BLOCKED = "BLOCKED"
+
+
 @dataclass
 class Task:
     id: str
@@ -42,5 +55,17 @@ class Task:
     complexity: Complexity = Complexity.MEDIUM
     status: TaskStatus = TaskStatus.PENDING
     selected_strategy: Optional[str] = None
+    verification_passed: bool = False
+    repair_rounds: int = 0
+    promotion_disposition: PromotionDisposition = PromotionDisposition.NOT_OFFERED
+    active_stage: Optional[str] = None
+    last_checkpoint_sha: Optional[str] = None
+    interruption_reason: Optional[str] = None
+    interrupted_at: Optional[str] = None
+    recovery_attempts: int = 0
+    resumed_at: Optional[str] = None
+    execution_config_snapshot: Optional[str] = None
+    repo_fingerprint: Optional[str] = None
+    base_commit: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     completed_at: Optional[str] = None

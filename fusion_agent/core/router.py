@@ -220,6 +220,20 @@ class TaskRouter:
 
         return round(score, 3)
 
+    def assess_mcp_capabilities(
+        self,
+        task_prompt: str,
+        mcp_registry: Optional[Any] = None,
+    ) -> List[str]:
+        """Inspect registered MCP tools to determine if external tools are available."""
+        if not mcp_registry or not hasattr(mcp_registry, "list_all_tools"):
+            return []
+        try:
+            tools = mcp_registry.list_all_tools()
+            return [f"{t.server_id}/{t.tool_name}" for t in tools]
+        except Exception:
+            return []
+
     def route(
         self,
         task_prompt: str,
@@ -227,11 +241,13 @@ class TaskRouter:
         optimization_mode: OptimizationMode = OptimizationMode.BALANCED,
         provider_stats: Optional[Dict[str, Any]] = None,
         allow_multi_step_planning: bool = True,
+        mcp_registry: Optional[Any] = None,
     ) -> RoutingDecision:
         """Deterministically determine collaboration strategy and dynamic provider roles."""
         assessment = self.assess_task(task_prompt)
         task_type = assessment.task_type
         complexity = assessment.complexity
+        relevant_mcp_tools = self.assess_mcp_capabilities(task_prompt, mcp_registry)
 
 
         # 1. Filter providers by constraints

@@ -79,10 +79,15 @@ class WorkspaceSession:
         # 2. Check uncommitted or untracked changes in main working tree (Strict refusal in V1)
         status = self._run_git(["status", "--porcelain"])
         # Filter out internal .fusion directory entries if any
-        dirty_lines = [
-            line for line in status.splitlines()
-            if line.strip() and not line.strip().endswith(".fusion") and ".fusion/" not in line
-        ]
+        dirty_lines = []
+        for line in status.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            path_part = line[3:].strip() if len(line) >= 3 else line_str
+            if path_part == ".fusion" or path_part.startswith(".fusion/") or path_part.startswith(".fusion\\"):
+                continue
+            dirty_lines.append(line)
         if dirty_lines:
             sample = "\n".join(dirty_lines[:5])
             raise DirtyWorkingTreeError(
@@ -110,6 +115,76 @@ class WorkspaceSession:
         ])
 
         self.state = WorkspaceState.PREPARED
+
+    def attach_or_reconstruct(
+        self,
+        expected_checkpoint_sha: Optional[str] = None,
+        original_base_commit: Optional[str] = None,
+    ) -> None:
+        """Attach to an existing task worktree/branch for resume, or reconstruct it safely.
+
+        Does NOT delete the existing task branch!
+        """
+        # 1. Verify git repository
+        is_git = self._run_git(["rev-parse", "--is-inside-work-tree"], check=False)
+        if is_git != "true":
+            raise RuntimeError(f"Directory {self.repo_root} is not a valid Git repository.")
+
+        # 2. Check uncommitted or untracked changes in main working tree (Strict refusal in V1)
+        status = self._run_git(["status", "--porcelain"])
+        dirty_lines = []
+        for line in status.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            path_part = line[3:].strip() if len(line) >= 3 else line_str
+            if path_part == ".fusion" or path_part.startswith(".fusion/") or path_part.startswith(".fusion\\"):
+                continue
+            dirty_lines.append(line)
+        if dirty_lines:
+            sample = "\n".join(dirty_lines[:5])
+            raise DirtyWorkingTreeError(
+                f"Cannot resume isolated workspace: target repository has uncommitted or untracked changes.\n"
+                f"Dirty files:\n{sample}"
+            )
+
+        if original_base_commit:
+            self.base_commit = original_base_commit
+        elif not self.base_commit:
+            self.base_commit = self._run_git(["rev-parse", "HEAD"])
+        self.base_branch = self._run_git(["branch", "--show-current"]) or "master"
+
+        # Check if task branch exists in Git
+        branch_exists = self._run_git(["branch", "--list", self.task_branch], check=False)
+        has_branch = bool(branch_exists.strip())
+
+        if not has_branch:
+            if expected_checkpoint_sha:
+                # Recreate the task branch from the verified checkpoint commit
+                self._run_git(["branch", self.task_branch, expected_checkpoint_sha])
+                has_branch = True
+            else:
+                raise RuntimeError(
+                    f"Cannot resume task {self.task_id}: task branch '{self.task_branch}' not found "
+                    f"and no verified checkpoint SHA provided."
+                )
+
+        # Check if worktree directory exists on disk and is a valid git worktree
+        worktree_valid = False
+        if self.worktree_dir.exists():
+            wt_branch = self._run_git(["branch", "--show-current"], cwd=self.worktree_dir, check=False)
+            if wt_branch.strip() == self.task_branch:
+                worktree_valid = True
+            else:
+                self._run_git(["worktree", "remove", "--force", str(self.worktree_dir)], check=False)
+                shutil.rmtree(self.worktree_dir, ignore_errors=True)
+
+        if not worktree_valid:
+            self._run_git(["worktree", "prune"], check=False)
+            self.worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._run_git(["worktree", "add", str(self.worktree_dir), self.task_branch])
+
+        self.state = WorkspaceState.ACTIVE
 
     def teardown(self, delete_branch: bool = True) -> None:
         """Tear down and prune the ephemeral worktree and task branch."""

@@ -1,8 +1,9 @@
 """The primary orchestrator coordinating providers, routing, deliberation, and shared memory."""
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fusion_agent.config.schema import FusionConfig
 from fusion_agent.core.budget import TaskBudgetController
@@ -23,11 +24,13 @@ from fusion_agent.models.plan import (
     Checkpoint,
     ExecutionPlan,
     PlanStep,
+    PlanStatus,
     StepResult,
     StepStatus,
+    VerificationType,
 )
 from fusion_agent.models.strategy import StrategyType
-from fusion_agent.models.task import Task, TaskStatus
+from fusion_agent.models.task import Complexity, Task, TaskStatus, TaskType
 from fusion_agent.providers.base import AgentProvider
 from fusion_agent.providers.normalizer import StructuredOutputNormalizer
 from fusion_agent.providers.registry import ProviderRegistry
@@ -45,6 +48,26 @@ from fusion_agent.workspace.editor import WorkspaceEditor
 
 from fusion_agent.workspace.session import DirtyWorkingTreeError, WorkspaceSession, WorkspaceState
 from fusion_agent.workspace.verifier import VerificationResult, WorkspaceVerifier
+from fusion_agent.workspace.lock import TaskExecutionLock, TaskLockError
+from fusion_agent.workspace.recovery import CheckpointRecoveryManager, RecoveryError, ReconciliationResult
+from fusion_agent.workspace.promotion import PromotionEngine, PromotionResult, PromotionTransactionStatus
+import json
+import os
+import socket
+
+from fusion_agent.mcp.approval import MCPApprovalHandler
+from fusion_agent.mcp.budgeter import ToolResultBudgeter
+from fusion_agent.mcp.gateway import MCPGateway
+from fusion_agent.mcp.models import (
+    MCPEvidence,
+    NormalizedProviderOutput,
+    PolicyDecision,
+    ProviderOutputType,
+    ToolRequest,
+    ToolResult,
+)
+from fusion_agent.mcp.policy import MCPPolicyEngine
+from fusion_agent.mcp.registry import MCPServerRegistry
 
 
 class OrchestratorResult:
@@ -81,12 +104,26 @@ class FusionOrchestrator:
         config: FusionConfig,
         database: Optional[Database] = None,
         providers: Optional[Dict[str, AgentProvider]] = None,
+        mcp_registry: Optional[MCPServerRegistry] = None,
+        mcp_gateway: Optional[MCPGateway] = None,
     ):
         self.config = config
         self.db = database or Database(f"{config.storage_dir}/fusion.db")
         self.state_manager = ProjectStateManager(self.db)
         self.router = TaskRouter()
         self.deliberation_engine = DeliberationEngine(config.deliberation)
+
+        # Initialize MCP Registry and Gateway
+        self.mcp_registry = mcp_registry or MCPServerRegistry()
+        if hasattr(config, "mcp_servers") and config.mcp_servers:
+            for s_id, s_cfg in config.mcp_servers.items():
+                self.mcp_registry.register_server(s_cfg)
+        self.mcp_gateway = mcp_gateway or MCPGateway(
+            registry=self.mcp_registry,
+            policy_engine=MCPPolicyEngine(self.config),
+            budgeter=ToolResultBudgeter(max_chars_per_call=getattr(self.config.deliberation, "mcp_max_result_chars_per_call", 8000)),
+            approval_handler=MCPApprovalHandler(self.config),
+        )
 
         # Initialize or discover providers
         self.providers: Dict[str, AgentProvider] = providers if providers is not None else {}
@@ -109,6 +146,147 @@ class FusionOrchestrator:
             name=config.project_name,
             root_path=config.project_root,
         )
+
+    def _invoke_provider_stage_with_tools(
+        self,
+        provider: AgentProvider,
+        prompt: str,
+        code_context: CodeContext,
+        task_id: str,
+        stage_name: str,
+        budget: TaskBudgetController,
+        emit: Callable,
+        plan_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        role: str = "implementer",
+        db_stage: Optional[str] = None,
+    ) -> Tuple[Any, CodeContext, List[Dict[str, Any]]]:
+        """Execute a provider stage within the bounded tool-assisted loop.
+
+        Evaluates provider output:
+        - FINAL_RESPONSE: completes loop and returns response.
+        - CONTEXT_INSUFFICIENT: breaks loop to allow context expansion.
+        - TOOL_REQUEST: validates policy, budgets, and executes tool; reinvokes provider.
+        """
+        max_tool_turns = getattr(self.config.deliberation, "max_tool_turns_per_stage", 2)
+        tool_turns = 0
+        current_prompt = prompt
+        current_context = code_context
+        stage_metrics: List[Dict[str, Any]] = []
+        last_resp = None
+
+        while True:
+            can_call, call_reason = budget.can_call_provider()
+            if not can_call:
+                if last_resp is not None:
+                    return last_resp, current_context, stage_metrics
+                raise RuntimeError(f"Budget ceiling reached in {stage_name}: {call_reason}")
+
+            stage_run_id = self.state_manager.record_provider_stage_started(
+                task_id=task_id,
+                stage=db_stage or stage_name,
+                provider=provider.name,
+                role=role,
+                plan_id=plan_id,
+                step_id=step_id,
+                round_number=tool_turns,
+                prompt_summary=current_prompt[:200],
+            )
+            t_start = time.perf_counter()
+            try:
+                resp = provider.invoke(current_prompt, context=current_context)
+            except Exception as exc:
+                self.state_manager.fail_provider_stage(stage_run_id, error_message=str(exc))
+                raise exc
+            t_dur = (time.perf_counter() - t_start) * 1000.0
+
+            ctx_tokens = current_context.metrics.get("fusion_context_tokens", 0) if hasattr(current_context, "metrics") and isinstance(current_context.metrics, dict) else 0
+            budget.record_call(
+                provider_name=provider.name,
+                duration_ms=resp.duration_ms or t_dur,
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                fusion_context_tokens=resp.fusion_context_tokens or ctx_tokens,
+                reasoning_tokens=resp.reasoning_tokens,
+                visible_output_tokens=resp.visible_output_tokens,
+                cached_tokens=resp.cached_tokens,
+                raw_usage=resp.metadata.get("usage") if hasattr(resp, "metadata") and resp.metadata else None,
+                stage=stage_name if tool_turns == 0 else f"{stage_name} (turn {tool_turns})",
+            )
+            self.state_manager.complete_provider_stage(
+                run_id=stage_run_id,
+                response=resp,
+                context=current_context,
+                duration_ms=resp.duration_ms or t_dur,
+                status="success",
+            )
+            stage_metrics.append({
+                "stage": stage_name,
+                "provider": provider.name,
+                "role": role,
+                "duration_ms": resp.duration_ms or t_dur,
+                "input_tokens": resp.input_tokens,
+                "output_tokens": resp.output_tokens,
+            })
+            last_resp = resp
+
+            # Evaluate output via MCP Gateway normalizer
+            norm = self.mcp_gateway.parse_provider_output(resp.content)
+            if norm.output_type != ProviderOutputType.TOOL_REQUEST or not norm.tool_request:
+                return resp, current_context, stage_metrics
+
+            # Tool request received: check turn bound
+            tool_req = norm.tool_request
+            if tool_turns >= max_tool_turns:
+                if tool_turns > max_tool_turns:
+                    emit("status", {"message": f"Hard tool turn limit reached for {stage_name}; terminating tool loop."})
+                    return resp, current_context, stage_metrics
+
+                emit("status", {"message": f"Tool turn limit ({max_tool_turns}) reached for {stage_name}; prompting final answer."})
+                current_prompt = (
+                    f"{current_prompt}\n\n"
+                    f"### Tool Execution Denied\n"
+                    f"Maximum tool turns per stage ({max_tool_turns}) reached. Please provide your final structured engineering response without further tool requests."
+                )
+                tool_turns += 1
+                continue
+
+            emit("status", {"message": f"Executing MCP tool '{tool_req.tool_name}' on server '{tool_req.server_id}'..."})
+            tool_res = self.mcp_gateway.execute_tool(
+                request=tool_req,
+                task_id=task_id,
+                plan_id=plan_id,
+                step_id=step_id,
+                stage=stage_name,
+                stage_calls_made=tool_turns,
+                budget_controller=budget,
+                state_manager=self.state_manager,
+            )
+
+            # Accumulate evidence
+            evidence = MCPEvidence(
+                server_id=tool_res.server_id,
+                tool_name=tool_res.tool_name,
+                content=tool_res.content if tool_res.success else "",
+                duration_ms=tool_res.duration_ms,
+                error=tool_res.error if not tool_res.success else None,
+            )
+            if hasattr(current_context, "mcp_evidence"):
+                current_context.mcp_evidence.append(evidence)
+
+            tool_feedback = (
+                f"### Bounded Tool Result from {tool_res.server_id}/{tool_res.tool_name}:\n"
+                f"{tool_res.content if tool_res.success else 'ERROR: ' + (tool_res.error or 'Tool execution failed')}\n"
+            )
+            if tool_res.is_truncated and tool_res.omission_reason:
+                tool_feedback += f"\n[Result truncated: {tool_res.omission_reason}]\n"
+
+            current_prompt = (
+                f"{current_prompt}\n\n"
+                f"{tool_feedback}\n"
+                f"Please incorporate this external data and provide your final structured engineering patch or answer."
+            )
+            tool_turns += 1
 
     def _run_autonomous_edit(
         self,
@@ -198,9 +376,19 @@ class FusionOrchestrator:
             "If context is strictly insufficient, respond:\n"
             "CONTEXT_INSUFFICIENT\n- need_file: path/to/file.ext (reason: why needed)"
         )
-        t_start = time.perf_counter()
-        prop_resp = impl.invoke(patch_prompt, context=code_context)
-        t_prop = (time.perf_counter() - t_start) * 1000.0
+        prop_resp, code_context, impl_metrics = self._invoke_provider_stage_with_tools(
+            provider=impl,
+            prompt=patch_prompt,
+            code_context=code_context,
+            task_id=task.id,
+            stage_name="Initial Implementation",
+            db_stage="step_implementation",
+            budget=budget,
+            emit=emit,
+            role="implementer",
+        )
+        stage_metrics.extend(impl_metrics)
+        t_prop = impl_metrics[-1]["duration_ms"] if impl_metrics else 0.0
 
         # Check for Context Expansion Request
         max_expansions = getattr(self.config.deliberation, "max_context_expansion_rounds", 1)
@@ -225,22 +413,19 @@ class FusionOrchestrator:
                     architecture_decisions=arch_summary,
                 )
                 emit("status", {"message": f"Retrying {impl.name} with expanded context ({len(code_context.selected_files)} files)..."})
-                t_start = time.perf_counter()
-                prop_resp = impl.invoke(patch_prompt, context=code_context)
-                t_prop = (time.perf_counter() - t_start) * 1000.0
-
-        budget.record_call(
-            provider_name=impl.name,
-            duration_ms=prop_resp.duration_ms or t_prop,
-            input_tokens=prop_resp.input_tokens,
-            output_tokens=prop_resp.output_tokens,
-            fusion_context_tokens=prop_resp.fusion_context_tokens or ctx_tokens,
-            reasoning_tokens=prop_resp.reasoning_tokens,
-            visible_output_tokens=prop_resp.visible_output_tokens,
-            cached_tokens=prop_resp.cached_tokens,
-            raw_usage=prop_resp.metadata.get("usage"),
-            stage="Initial Implementation",
-        )
+                prop_resp, code_context, retry_metrics = self._invoke_provider_stage_with_tools(
+                    provider=impl,
+                    prompt=patch_prompt,
+                    code_context=code_context,
+                    task_id=task.id,
+                    stage_name="Initial Implementation",
+                    db_stage="step_implementation",
+                    budget=budget,
+                    emit=emit,
+                    role="implementer",
+                )
+                stage_metrics.extend(retry_metrics)
+                t_prop = retry_metrics[-1]["duration_ms"] if retry_metrics else t_prop
 
         proposals.append(
             Proposal(
@@ -271,6 +456,16 @@ class FusionOrchestrator:
         # 4. Automated verification inside worktree
         emit("status", {"message": "Executing automated verification suite inside isolated worktree..."})
         verif_result = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+        self.state_manager.record_verification(
+            task_id=task.id,
+            verification_type=VerificationType.STEP,
+            command=verif_result.command or (self.config.verification_command or ""),
+            exit_code=verif_result.exit_code,
+            passed=verif_result.passed,
+            duration_seconds=verif_result.duration_seconds,
+            stdout=verif_result.stdout,
+            stderr=verif_result.stderr,
+        )
 
         # 5. Extract unified diff
         diff = verifier.get_diff(session)
@@ -313,6 +508,18 @@ class FusionOrchestrator:
                 cached_tokens=review_resp.cached_tokens,
                 raw_usage=review_resp.metadata.get("usage"),
                 stage="Review Round 1",
+            )
+            self.state_manager.record_provider_stage(
+                task_id=task.id,
+                stage="final_review",
+                provider=rev.name,
+                role="reviewer",
+                response=review_resp,
+                round_number=1,
+                context=context,
+                duration_ms=review_resp.duration_ms or t_rev,
+                status="approved" if review_resp.status == ReviewStatus.APPROVED else "needs_revision",
+                prompt_summary=rev_content[:200],
             )
 
             review_result = ReviewResult(
@@ -432,6 +639,18 @@ class FusionOrchestrator:
                 raw_usage=repair_resp.metadata.get("usage"),
                 stage=f"Repair Round {repair_rounds}",
             )
+            self.state_manager.record_provider_stage(
+                task_id=task.id,
+                stage="final_repair",
+                provider=impl.name,
+                role="implementer",
+                response=repair_resp,
+                round_number=repair_rounds,
+                context=repair_code_context,
+                duration_ms=repair_resp.duration_ms or t_repair,
+                status="success",
+                prompt_summary=repair_prompt[:200],
+            )
 
             proposals.append(
                 Proposal(
@@ -461,6 +680,16 @@ class FusionOrchestrator:
 
             emit("status", {"message": f"Re-executing verification suite (Round {repair_rounds})..."})
             verif_result = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+            self.state_manager.record_verification(
+                task_id=task.id,
+                verification_type=VerificationType.POST_REPAIR,
+                command=verif_result.command or (self.config.verification_command or ""),
+                exit_code=verif_result.exit_code,
+                passed=verif_result.passed,
+                duration_seconds=verif_result.duration_seconds,
+                stdout=verif_result.stdout,
+                stderr=verif_result.stderr,
+            )
             diff = verifier.get_diff(session)
 
             can_rev, _ = budget.can_call_provider()
@@ -500,6 +729,18 @@ class FusionOrchestrator:
                     cached_tokens=review_resp.cached_tokens,
                     raw_usage=review_resp.metadata.get("usage"),
                     stage=f"Review Round {review_round_num}",
+                )
+                self.state_manager.record_provider_stage(
+                    task_id=task.id,
+                    stage="final_rereview",
+                    provider=rev.name,
+                    role="reviewer",
+                    response=review_resp,
+                    round_number=review_round_num,
+                    context=context,
+                    duration_ms=review_resp.duration_ms or t_rev,
+                    status="approved" if review_resp.status == ReviewStatus.APPROVED else "needs_revision",
+                    prompt_summary=rev_content[:200],
                 )
 
                 review_result = ReviewResult(
@@ -569,6 +810,11 @@ class FusionOrchestrator:
         implementer: Optional[AgentProvider] = None,
         reviewer: Optional[AgentProvider] = None,
         budget: Optional[TaskBudgetController] = None,
+        session: Optional[WorkspaceSession] = None,
+        existing_plan: Optional[ExecutionPlan] = None,
+        start_step_index: int = 0,
+        last_verified_sha: Optional[str] = None,
+        rerun_final_verification: bool = False,
     ) -> Tuple[DeliberationResult, WorkspaceSession, VerificationResult, str, Optional[ReviewResult]]:
         """Execute multi-step checkpointed execution plan inside an isolated worktree."""
         planner_agent = lead or primary_agent
@@ -585,12 +831,13 @@ class FusionOrchestrator:
             budget = TaskBudgetController(self.config.deliberation)
 
         repo_path = Path(self.config.project_root).resolve()
-        session = WorkspaceSession(task_id=task.id, repo_root=repo_path)
-
-        # 1. Pre-flight check & worktree allocation
-        emit("status", {"message": "Pre-flight check: verifying repository working tree is clean..."})
-        session.prepare()
-        emit("status", {"message": f"Allocated isolated worktree on task branch '{session.task_branch}' (base: {session.base_branch})."})
+        if session is None:
+            session = WorkspaceSession(task_id=task.id, repo_root=repo_path)
+            # 1. Pre-flight check & worktree allocation
+            emit("status", {"message": "Pre-flight check: verifying repository working tree is clean..."})
+            session.prepare()
+            emit("status", {"message": f"Allocated isolated worktree on task branch '{session.task_branch}' (base: {session.base_branch})."})
+            self.state_manager.update_task_recovery_fields(task.id, base_commit=session.base_commit)
 
         broker = ExecutionBroker(session)
         verifier = WorkspaceVerifier()
@@ -599,12 +846,6 @@ class FusionOrchestrator:
         max_steps = getattr(self.config.deliberation, "max_plan_steps", 5)
         max_amendments = getattr(self.config.deliberation, "max_plan_amendments", 1)
         plan_engine = PlanEngine(max_steps=max_steps, max_amendments=max_amendments)
-
-        # 2. Build high-level planning context
-        indexer = RepositoryIndexer()
-        repo_index = indexer.index_project(session.worktree_path)
-        selector = RelevantFileSelector(repo_index)
-        ranked_candidates, symbol_refs = selector.select_relevant_files(f"{task.title}\n{task.description}")
 
         budget_cfg = ContextBudgetConfig(
             max_files=getattr(self.config.deliberation, "context_max_files", 5),
@@ -616,35 +857,51 @@ class FusionOrchestrator:
             require_minimal_workspace=getattr(self.config.deliberation, "context_require_minimal_workspace", False),
         )
         budgeter = ContextBudgeter(budget_cfg)
-        arch_summary = context.permanent_context if (context and hasattr(context, "permanent_context")) else ""
-        plan_code_context = budgeter.build_code_context(
-            task_requirements=f"{task.title}\n{task.description}",
-            ranked_candidates=ranked_candidates,
-            symbol_refs=symbol_refs,
-            index=repo_index,
-            architecture_decisions=arch_summary,
-        )
+        indexer = RepositoryIndexer()
 
-        # 3. Plan Generation (Fail Closed on Error)
-        try:
-            plan = plan_engine.generate_plan(
-                task=task,
-                context=plan_code_context,
-                planner=planner_agent,
-                reviewer=rev_agent,
-                budget=budget,
-                emit=emit,
+        if existing_plan is not None:
+            plan = existing_plan
+            plan_code_context = context
+        else:
+            # 2. Build high-level planning context
+            repo_index = indexer.index_project(session.worktree_path)
+            selector = RelevantFileSelector(repo_index)
+            ranked_candidates, symbol_refs = selector.select_relevant_files(f"{task.title}\n{task.description}")
+
+            arch_summary = context.permanent_context if (context and hasattr(context, "permanent_context")) else ""
+            plan_code_context = budgeter.build_code_context(
+                task_requirements=f"{task.title}\n{task.description}",
+                ranked_candidates=ranked_candidates,
+                symbol_refs=symbol_refs,
+                index=repo_index,
+                architecture_decisions=arch_summary,
             )
-        except Exception as exc:
-            # FAIL CLOSED: Never silently degrade to one-shot execution!
-            session.teardown(delete_branch=True)
-            raise RuntimeError(f"Multi-step planning failed: {exc}")
 
-        self.state_manager.create_plan(plan)
-        emit("status", {"message": f"Execution plan established: '{plan.title}' ({len(plan.steps)} steps)."})
+            # 3. Plan Generation (Fail Closed on Error)
+            try:
+                plan = plan_engine.generate_plan(
+                    task=task,
+                    context=plan_code_context,
+                    planner=planner_agent,
+                    reviewer=rev_agent,
+                    budget=budget,
+                    state_manager=self.state_manager,
+                    emit=emit,
+                )
+            except Exception as exc:
+                has_chk = bool(self.state_manager.get_checkpoints_for_task(task.id))
+                if not has_chk:
+                    session.teardown(delete_branch=True)
+                raise RuntimeError(f"Multi-step planning failed: {exc}")
+
+            self.state_manager.create_plan(plan)
+            self.state_manager.update_plan_status(plan.plan_id, PlanStatus.RUNNING)
+            plan.status = PlanStatus.RUNNING
+            self.state_manager.update_task_stage(task.id, "plan_generation")
+            emit("status", {"message": f"Execution plan established: '{plan.title}' ({len(plan.steps)} steps)."})
 
         # 4. Step Execution Loop
-        last_verified_sha = session.base_commit
+        current_verified_sha = last_verified_sha or session.base_commit
         stage_metrics: List[Dict[str, Any]] = []
         proposals: List[Proposal] = []
         reviews: List[ReviewResult] = []
@@ -653,7 +910,15 @@ class FusionOrchestrator:
         last_verif_result: Optional[VerificationResult] = None
         max_feedback_chars = getattr(self.config.deliberation, "max_feedback_chars", 2000)
 
-        for step_idx, step in enumerate(plan.steps):
+        for prev_s in plan.steps[:start_step_index]:
+            if prev_s.status == StepStatus.COMPLETED and prev_s.result:
+                completed_steps_info.append(f"{prev_s.id} ({prev_s.objective}): {', '.join(prev_s.result.files_modified)}")
+                for f in prev_s.result.files_modified:
+                    if f not in all_modified_files:
+                        all_modified_files.append(f)
+
+        for step_idx in range(start_step_index, len(plan.steps)):
+            step = plan.steps[step_idx]
             # Check DAG dependencies
             if not plan.is_step_runnable(step):
                 step.status = StepStatus.SKIPPED
@@ -671,10 +936,14 @@ class FusionOrchestrator:
                 emit("status", {"message": f"Budget ceiling reached ({b_reason}); halting remaining steps."})
                 step.status = StepStatus.SKIPPED
                 self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.SKIPPED)
+                self.state_manager.update_plan_status(plan.plan_id, PlanStatus.BUDGET_EXHAUSTED)
+                plan.status = PlanStatus.BUDGET_EXHAUSTED
+                self.state_manager.update_task_stage(task.id, "budget_exhausted")
                 break
 
             step.status = StepStatus.IN_PROGRESS
             self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.IN_PROGRESS)
+            self.state_manager.update_task_stage(task.id, f"step_{step.id}")
             emit("status", {"message": f"--- Step {step_idx+1}/{len(plan.steps)} ({step.id}): {step.objective} ---"})
 
             # Post-edit CodeContext built from current worktree
@@ -722,21 +991,22 @@ class FusionOrchestrator:
                 "Provide complete, valid code without placeholder comments."
             )
 
-            t_start = time.perf_counter()
-            step_resp = impl_agent.invoke(step_prompt, context=step_code_context)
-            t_dur = (time.perf_counter() - t_start) * 1000.0
-            budget.record_call(
-                provider_name=impl_agent.name,
-                duration_ms=step_resp.duration_ms or t_dur,
-                input_tokens=step_resp.input_tokens,
-                output_tokens=step_resp.output_tokens,
-                fusion_context_tokens=step_resp.fusion_context_tokens,
-                reasoning_tokens=step_resp.reasoning_tokens,
-                visible_output_tokens=step_resp.visible_output_tokens,
-                cached_tokens=step_resp.cached_tokens,
-                raw_usage=step_resp.metadata.get("usage"),
-                stage=f"Step {step.id} Implementation",
+            step_resp, step_code_context, step_metrics = self._invoke_provider_stage_with_tools(
+                provider=impl_agent,
+                prompt=step_prompt,
+                code_context=step_code_context,
+                task_id=task.id,
+                stage_name=f"Step {step.id} Implementation",
+                db_stage="step_implementation",
+                plan_id=plan.plan_id,
+                step_id=step.id,
+                budget=budget,
+                emit=emit,
+                role="implementer",
             )
+            stage_metrics.extend(step_metrics)
+            t_dur = step_metrics[-1]["duration_ms"] if step_metrics else 0.0
+
             proposals.append(
                 Proposal(
                     agent_name=impl_agent.name,
@@ -747,14 +1017,6 @@ class FusionOrchestrator:
                     output_tokens=step_resp.output_tokens,
                 )
             )
-            stage_metrics.append({
-                "stage": f"Step {step.id} Implementation",
-                "provider": impl_agent.name,
-                "role": "implementer",
-                "duration_ms": step_resp.duration_ms or t_dur,
-                "input_tokens": step_resp.input_tokens,
-                "output_tokens": step_resp.output_tokens,
-            })
 
             # Apply edits strictly via ExecutionBroker
             step_modified_files = WorkspaceEditor.apply_edits(step_resp.content, broker)
@@ -840,6 +1102,18 @@ class FusionOrchestrator:
                     step_verif = verifier.run_tests(session, test_command=None, broker=broker)
 
             last_verif_result = step_verif
+            last_verif_id = self.state_manager.record_verification(
+                task_id=task.id,
+                verification_type=VerificationType.STEP,
+                command=step_verif.command or (test_cmd or ""),
+                exit_code=step_verif.exit_code,
+                passed=step_verif.passed,
+                duration_seconds=step_verif.duration_seconds,
+                plan_id=plan.plan_id,
+                step_id=step.id,
+                stdout=step_verif.stdout,
+                stderr=step_verif.stderr,
+            )
 
             # Bounded Step Repair Loop
             step_repair_rounds = 0
@@ -868,8 +1142,22 @@ class FusionOrchestrator:
                     "```language\nfull updated file content\n```"
                 )
 
+                rep_run_id = self.state_manager.record_provider_stage_started(
+                    task_id=task.id,
+                    stage="step_repair",
+                    provider=impl_agent.name,
+                    role="implementer",
+                    plan_id=plan.plan_id,
+                    step_id=step.id,
+                    round_number=step_repair_rounds,
+                    prompt_summary=repair_prompt[:200],
+                )
                 t_start = time.perf_counter()
-                rep_resp = impl_agent.invoke(repair_prompt, context=step_code_context)
+                try:
+                    rep_resp = impl_agent.invoke(repair_prompt, context=step_code_context)
+                except Exception as exc:
+                    self.state_manager.fail_provider_stage(rep_run_id, error_message=str(exc))
+                    raise exc
                 t_dur = (time.perf_counter() - t_start) * 1000.0
                 budget.record_call(
                     provider_name=impl_agent.name,
@@ -878,6 +1166,13 @@ class FusionOrchestrator:
                     output_tokens=rep_resp.output_tokens,
                     fusion_context_tokens=rep_resp.fusion_context_tokens,
                     stage=f"Step {step.id} Repair Round {step_repair_rounds}",
+                )
+                self.state_manager.complete_provider_stage(
+                    run_id=rep_run_id,
+                    response=rep_resp,
+                    context=step_code_context,
+                    duration_ms=rep_resp.duration_ms or t_dur,
+                    status="success",
                 )
                 repaired = WorkspaceEditor.apply_edits(rep_resp.content, broker)
                 for rf in repaired:
@@ -888,6 +1183,18 @@ class FusionOrchestrator:
 
                 step_verif = verifier.run_tests(session, test_command=test_cmd, broker=broker)
                 last_verif_result = step_verif
+                last_verif_id = self.state_manager.record_verification(
+                    task_id=task.id,
+                    verification_type=VerificationType.STEP,
+                    command=step_verif.command or (test_cmd or ""),
+                    exit_code=step_verif.exit_code,
+                    passed=step_verif.passed,
+                    duration_seconds=step_verif.duration_seconds,
+                    plan_id=plan.plan_id,
+                    step_id=step.id,
+                    stdout=step_verif.stdout,
+                    stderr=step_verif.stderr,
+                )
 
             # Handle Step Outcome
             if step_verif.passed:
@@ -903,11 +1210,15 @@ class FusionOrchestrator:
                         token_metrics={
                             "input_tokens": step_resp.input_tokens,
                             "output_tokens": step_resp.output_tokens,
+                            "fusion_context_tokens": step_resp.fusion_context_tokens,
                         },
-                        base_commit_sha=last_verified_sha,
+                        base_commit_sha=current_verified_sha,
+                        verification_id=last_verif_id,
+                        state_manager=self.state_manager,
                     )
-                    last_verified_sha = checkpoint.commit_sha
+                    current_verified_sha = checkpoint.commit_sha
                     self.state_manager.record_checkpoint(checkpoint)
+                    self.state_manager.update_task_stage(task.id, f"step_{step.id}", last_checkpoint_sha=checkpoint.commit_sha)
                     emit("status", {"message": f"Step {step.id} verified and checkpointed ({checkpoint.commit_sha[:8]})."})
                 except UnexpectedFilesError as u_exc:
                     emit("status", {"message": f"Step {step.id} checkpoint failed: {u_exc}"})
@@ -925,7 +1236,7 @@ class FusionOrchestrator:
                     step_id=step.id,
                     status=StepStatus.COMPLETED,
                     files_modified=step_modified_files,
-                    checkpoint_sha=last_verified_sha,
+                    checkpoint_sha=current_verified_sha,
                     verification_passed=True,
                     provider=impl_agent.name,
                     repair_rounds=step_repair_rounds,
@@ -940,7 +1251,7 @@ class FusionOrchestrator:
                     step_id=step.id,
                     status=StepStatus.FAILED,
                     files_modified=step_modified_files,
-                    checkpoint_sha=last_verified_sha,
+                    checkpoint_sha=current_verified_sha,
                     verification_passed=False,
                     verification_output=step_verif.stderr or step_verif.stdout,
                     provider=impl_agent.name,
@@ -949,11 +1260,11 @@ class FusionOrchestrator:
                 step.status = StepStatus.FAILED
                 step.result = res
                 self.state_manager.update_step_status(plan.plan_id, step.id, StepStatus.FAILED, result=res)
-                emit("status", {"message": f"Step {step.id} failed after repairs. Performing exact rollback to {last_verified_sha[:8]}..."})
+                emit("status", {"message": f"Step {step.id} failed after repairs. Performing exact rollback to {current_verified_sha[:8]}..."})
 
                 checkpoint_mgr.rollback_to_checkpoint(
                     session=session,
-                    checkpoint_sha=last_verified_sha,
+                    checkpoint_sha=current_verified_sha,
                     created_files=step_modified_files,
                 )
 
@@ -969,9 +1280,21 @@ class FusionOrchestrator:
         has_failed_steps = any(s.status == StepStatus.FAILED for s in plan.steps)
         any_completed = any(s.status == StepStatus.COMPLETED for s in plan.steps)
 
-        if any_completed and not has_failed_steps:
+        if (any_completed and not has_failed_steps) or rerun_final_verification:
             emit("status", {"message": "All plan steps completed. Executing full repository verification suite..."})
+            self.state_manager.update_task_stage(task.id, "final_verification")
             final_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+            self.state_manager.record_verification(
+                task_id=task.id,
+                verification_type=VerificationType.FINAL,
+                command=final_verif.command or (self.config.verification_command or ""),
+                exit_code=final_verif.exit_code,
+                passed=final_verif.passed,
+                duration_seconds=final_verif.duration_seconds,
+                plan_id=plan.plan_id,
+                stdout=final_verif.stdout,
+                stderr=final_verif.stderr,
+            )
         else:
             final_verif = last_verif_result or VerificationResult(
                 passed=False,
@@ -981,6 +1304,17 @@ class FusionOrchestrator:
                 duration_seconds=0.0,
                 command="",
             )
+            self.state_manager.record_verification(
+                task_id=task.id,
+                verification_type=VerificationType.FINAL,
+                command=final_verif.command or "",
+                exit_code=final_verif.exit_code,
+                passed=final_verif.passed,
+                duration_seconds=final_verif.duration_seconds,
+                plan_id=plan.plan_id,
+                stdout=final_verif.stdout,
+                stderr=final_verif.stderr,
+            )
 
         # 6. Extract Unified Diff against original base commit
         diff = verifier.get_diff(session)
@@ -988,6 +1322,7 @@ class FusionOrchestrator:
         # 7. Final Peer Review & Bounded Final Repair
         review_result = None
         if rev_agent and final_verif.passed and budget.can_call_provider()[0]:
+            self.state_manager.update_task_stage(task.id, "final_review")
             emit("status", {"message": f"{rev_agent.name} is conducting final peer review on consolidated plan diff..."})
             plan_summary_text = "\n".join([
                 f"- {s.id} ({s.status.value}): {s.objective}" for s in plan.steps
@@ -999,16 +1334,29 @@ class FusionOrchestrator:
                 f"Status: {'PASSED' if final_verif.passed else 'FAILED'}\n"
                 f"Exit Code: {final_verif.exit_code}\n"
             )
-            t_start = time.perf_counter()
-            review_resp = rev_agent.review(
-                content=rev_content,
-                criteria=(
-                    "Evaluate complete unified diff across all plan steps for correctness, security, syntax, and regressions. "
-                    "If the plan implementation is sound and handles all edge cases, return [APPROVED]. "
-                    "If issues remain, return [NEEDS_REVISION] with specific critique."
-                ),
-                context=context,
+            rev_run_id = self.state_manager.record_provider_stage_started(
+                task_id=task.id,
+                stage="final_review",
+                provider=rev_agent.name,
+                role="reviewer",
+                plan_id=plan.plan_id,
+                round_number=1,
+                prompt_summary=rev_content[:200],
             )
+            t_start = time.perf_counter()
+            try:
+                review_resp = rev_agent.review(
+                    content=rev_content,
+                    criteria=(
+                        "Evaluate complete unified diff across all plan steps for correctness, security, syntax, and regressions. "
+                        "If the plan implementation is sound and handles all edge cases, return [APPROVED]. "
+                        "If issues remain, return [NEEDS_REVISION] with specific critique."
+                    ),
+                    context=context,
+                )
+            except Exception as exc:
+                self.state_manager.fail_provider_stage(rev_run_id, error_message=str(exc))
+                raise exc
             t_rev = (time.perf_counter() - t_start) * 1000.0
             budget.record_call(
                 provider_name=rev_agent.name,
@@ -1017,6 +1365,13 @@ class FusionOrchestrator:
                 output_tokens=review_resp.output_tokens,
                 fusion_context_tokens=review_resp.fusion_context_tokens or (len(rev_content) // 4),
                 stage="Final Plan Peer Review",
+            )
+            self.state_manager.complete_provider_stage(
+                run_id=rev_run_id,
+                response=review_resp,
+                context=context,
+                duration_ms=review_resp.duration_ms or t_rev,
+                status="approved" if review_resp.status == ReviewStatus.APPROVED else "needs_revision",
             )
             review_result = ReviewResult(
                 reviewer_agent=rev_agent.name,
@@ -1032,6 +1387,7 @@ class FusionOrchestrator:
 
             # Bounded Final Repair Cycle if reviewer requested revision
             if review_result.status == ReviewStatus.NEEDS_REVISION and budget.can_attempt_repair(0)[0]:
+                self.state_manager.update_task_stage(task.id, "final_repair")
                 emit("status", {"message": f"Final review requested revision. {impl_agent.name} is attempting final consolidated repair..."})
                 bounded_critique = review_result.comments[:max_feedback_chars]
                 final_repair_prompt = (
@@ -1042,8 +1398,21 @@ class FusionOrchestrator:
                     "Address all critiques. Format updated files strictly as:\n"
                     "### File: relative/path/to/file.ext\n```language\nfull file content\n```"
                 )
+                rep_run_id = self.state_manager.record_provider_stage_started(
+                    task_id=task.id,
+                    stage="final_repair",
+                    provider=impl_agent.name,
+                    role="implementer",
+                    plan_id=plan.plan_id,
+                    round_number=1,
+                    prompt_summary=final_repair_prompt[:200],
+                )
                 t_start = time.perf_counter()
-                rep_resp = impl_agent.invoke(final_repair_prompt, context=plan_code_context)
+                try:
+                    rep_resp = impl_agent.invoke(final_repair_prompt, context=plan_code_context)
+                except Exception as exc:
+                    self.state_manager.fail_provider_stage(rep_run_id, error_message=str(exc))
+                    raise exc
                 t_dur = (time.perf_counter() - t_start) * 1000.0
                 budget.record_call(
                     provider_name=impl_agent.name,
@@ -1052,19 +1421,51 @@ class FusionOrchestrator:
                     output_tokens=rep_resp.output_tokens,
                     stage="Final Consolidated Repair",
                 )
+                self.state_manager.complete_provider_stage(
+                    run_id=rep_run_id,
+                    response=rep_resp,
+                    context=plan_code_context,
+                    duration_ms=rep_resp.duration_ms or t_dur,
+                    status="success",
+                )
                 WorkspaceEditor.apply_edits(rep_resp.content, broker)
                 final_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+                self.state_manager.record_verification(
+                    task_id=task.id,
+                    verification_type=VerificationType.POST_REPAIR,
+                    command=final_verif.command or (self.config.verification_command or ""),
+                    exit_code=final_verif.exit_code,
+                    passed=final_verif.passed,
+                    duration_seconds=final_verif.duration_seconds,
+                    plan_id=plan.plan_id,
+                    stdout=final_verif.stdout,
+                    stderr=final_verif.stderr,
+                )
                 diff = verifier.get_diff(session)
 
                 if budget.can_call_provider()[0]:
+                    self.state_manager.update_task_stage(task.id, "final_rereview")
                     emit("status", {"message": f"{rev_agent.name} is re-evaluating updated diff..."})
                     rev_content_2 = f"### UNIFIED DIFF (After Final Repair)\n{diff}\n\n### VERIFICATION\nPassed: {final_verif.passed}\n"
-                    t_start2 = time.perf_counter()
-                    review_resp_2 = rev_agent.review(
-                        content=rev_content_2,
-                        criteria="Re-evaluate updated unified diff after repair for correctness and resolution of previous critique.",
-                        context=context,
+                    rerev_run_id = self.state_manager.record_provider_stage_started(
+                        task_id=task.id,
+                        stage="final_rereview",
+                        provider=rev_agent.name,
+                        role="reviewer",
+                        plan_id=plan.plan_id,
+                        round_number=2,
+                        prompt_summary=rev_content_2[:200],
                     )
+                    t_start2 = time.perf_counter()
+                    try:
+                        review_resp_2 = rev_agent.review(
+                            content=rev_content_2,
+                            criteria="Re-evaluate updated unified diff after repair for correctness and resolution of previous critique.",
+                            context=context,
+                        )
+                    except Exception as exc:
+                        self.state_manager.fail_provider_stage(rerev_run_id, error_message=str(exc))
+                        raise exc
                     t_rev2 = (time.perf_counter() - t_start2) * 1000.0
                     budget.record_call(
                         provider_name=rev_agent.name,
@@ -1073,6 +1474,13 @@ class FusionOrchestrator:
                         output_tokens=review_resp_2.output_tokens,
                         stage="Final Plan Peer Re-Review",
                     )
+                    self.state_manager.complete_provider_stage(
+                        run_id=rerev_run_id,
+                        response=review_resp_2,
+                        context=context,
+                        duration_ms=review_resp_2.duration_ms or t_rev2,
+                        status="approved" if review_resp_2.status == ReviewStatus.APPROVED else "needs_revision",
+                    )
                     review_result = ReviewResult(
                         reviewer_agent=rev_agent.name,
                         subject_agent=impl_agent.name,
@@ -1080,6 +1488,21 @@ class FusionOrchestrator:
                         comments=review_resp_2.comments,
                     )
                     reviews.append(review_result)
+
+        # Update final plan status and task stage
+        if plan.status != PlanStatus.BUDGET_EXHAUSTED:
+            if has_failed_steps or not final_verif.passed:
+                plan.status = PlanStatus.FAILED
+                self.state_manager.update_plan_status(plan.plan_id, PlanStatus.FAILED)
+                self.state_manager.update_task_stage(task.id, "failed")
+            elif all(s.status == StepStatus.COMPLETED for s in plan.steps) and final_verif.passed:
+                plan.status = PlanStatus.COMPLETED
+                self.state_manager.update_plan_status(plan.plan_id, PlanStatus.COMPLETED)
+                self.state_manager.update_task_stage(task.id, "completed")
+            else:
+                plan.status = PlanStatus.FAILED
+                self.state_manager.update_plan_status(plan.plan_id, PlanStatus.FAILED)
+                self.state_manager.update_task_stage(task.id, "failed")
 
         plan_summary_msg = (
             f"Checkpointed execution plan completed in isolated worktree ({session.task_branch}).\n"
@@ -1156,271 +1579,516 @@ class FusionOrchestrator:
         )
         self.state_manager.update_task_status(task.id, TaskStatus.IN_PROGRESS)
 
-        # 3. Construct 3-Tier Context Snapshot
-        context = self.state_manager.build_context_snapshot(self.project["id"], current_task=task)
+        repo_path = Path(self.config.project_root).resolve()
+        task_lock = TaskExecutionLock(task.id, repo_path)
+        if not task_lock.acquire():
+            raise TaskLockError(f"Task '{task.id}' is currently locked by another process.")
+        self.state_manager.record_task_lock(
+            task_id=task.id,
+            owner_id=task_lock.owner_id,
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+        )
 
-        # 4. Resolve Providers & Health Verification
-        budget = TaskBudgetController(self.config.deliberation)
-
-        impl_key = routing.role_assignments.get("implementer") or routing.primary_provider
-        rev_key = routing.role_assignments.get("reviewer") or routing.secondary_provider
-        lead_key = routing.role_assignments.get("lead") or routing.primary_provider
-
-        implementer_agent = self.providers.get(impl_key)
-        reviewer_agent = self.providers.get(rev_key) if rev_key else None
-        lead_agent = self.providers.get(lead_key)
-
-        primary_agent = implementer_agent if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_agent
-        secondary_agent = reviewer_agent
-
-        if not primary_agent:
-            raise RuntimeError(f"Primary provider '{impl_key if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_key}' not found.")
-
-        active_strategy = routing.strategy
-        health_primary = primary_agent.health_check()
-
-        if not health_primary.healthy:
-            emit("status", {"message": f"Primary provider '{primary_agent.name}' is unavailable: {health_primary.message}"})
-            if secondary_agent and secondary_agent.health_check().healthy:
-                emit("status", {"message": f"Gracefully falling back to available provider '{secondary_agent.name}'..."})
-                primary_agent = secondary_agent
-                secondary_agent = None
-                active_strategy = StrategyType.DIRECT
-            else:
-                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
-                task.status = TaskStatus.FAILED
-                err_msg = (
-                    f"Provider '{primary_agent.name}' is unavailable:\n{health_primary.message}\n"
-                    "No alternative healthy provider is configured to handle this task."
-                )
-                return OrchestratorResult(
-                    task=task,
-                    routing=routing,
-                    deliberation=DeliberationResult(
-                        strategy_used="FAILED",
-                        synthesized_output=err_msg,
-                        participating_providers=[primary_agent.name],
-                    ),
-                    final_answer=err_msg,
-                )
-
-        # 5. Execute Multi-Agent Deliberation, Autonomous Edit, or Checkpointed Plan
-        workspace_session = None
-        verification_result = None
-        diff = None
-        review_result = None
-
-        if active_strategy == StrategyType.CHECKPOINTED_PLAN:
-            emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
-            try:
-                deliberation, workspace_session, verification_result, diff, review_result = (
-                    self._run_checkpointed_plan(
-                        task=task,
-                        lead=lead_agent,
-                        implementer=implementer_agent,
-                        reviewer=reviewer_agent,
-                        context=context,
-                        emit=emit,
-                        budget=budget,
-                    )
-                )
-            except DirtyWorkingTreeError as exc:
-                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
-                task.status = TaskStatus.FAILED
-                err_msg = str(exc)
-                emit("status", {"message": f"Refusal: {err_msg}"})
-                return OrchestratorResult(
-                    task=task,
-                    routing=routing,
-                    deliberation=DeliberationResult(
-                        strategy_used="FAILED",
-                        synthesized_output=err_msg,
-                        participating_providers=[primary_agent.name],
-                    ),
-                    final_answer=err_msg,
-                )
-            except Exception as exc:
-                try:
-                    WorkspaceSession(task_id=task.id, repo_root=Path(self.config.project_root).resolve()).teardown(delete_branch=True)
-                except Exception:
-                    pass
-                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
-                task.status = TaskStatus.FAILED
-                err_msg = f"Checkpointed plan execution failed: {exc}"
-                emit("status", {"message": f"Error: {err_msg}"})
-                return OrchestratorResult(
-                    task=task,
-                    routing=routing,
-                    deliberation=DeliberationResult(
-                        strategy_used="FAILED",
-                        synthesized_output=err_msg,
-                        participating_providers=[primary_agent.name],
-                    ),
-                    final_answer=err_msg,
-                )
-        elif active_strategy == StrategyType.AUTONOMOUS_EDIT:
-
-            emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
-            try:
-                deliberation, workspace_session, verification_result, diff, review_result = (
-                    self._run_autonomous_edit(
-                        task=task,
-                        implementer=implementer_agent,
-                        reviewer=reviewer_agent,
-                        context=context,
-                        emit=emit,
-                        budget=budget,
-                    )
-                )
-            except DirtyWorkingTreeError as exc:
-                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
-                task.status = TaskStatus.FAILED
-                err_msg = str(exc)
-                emit("status", {"message": f"Refusal: {err_msg}"})
-                return OrchestratorResult(
-                    task=task,
-                    routing=routing,
-                    deliberation=DeliberationResult(
-                        strategy_used="FAILED",
-                        synthesized_output=err_msg,
-                        participating_providers=[primary_agent.name],
-                    ),
-                    final_answer=err_msg,
-                )
-            except Exception as exc:
-                try:
-                    WorkspaceSession(task_id=task.id, repo_root=Path(self.config.project_root).resolve()).teardown(delete_branch=True)
-                except Exception:
-                    pass
-                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
-                task.status = TaskStatus.FAILED
-                err_msg = f"Autonomous edit failed: {exc}"
-                emit("status", {"message": f"Error: {exc}"})
-                return OrchestratorResult(
-                    task=task,
-                    routing=routing,
-                    deliberation=DeliberationResult(
-                        strategy_used="FAILED",
-                        synthesized_output=err_msg,
-                        participating_providers=[primary_agent.name],
-                    ),
-                    final_answer=err_msg,
-                )
-        else:
-            emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
-            try:
-                deliberation = self.deliberation_engine.run(
-                    strategy=active_strategy,
-                    task=task,
-                    primary_agent=primary_agent,
-                    secondary_agent=secondary_agent,
-                    context=context,
-                    on_event=on_status,
-                )
-            except Exception as exc:
-                self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
-                task.status = TaskStatus.FAILED
-                err_msg = f"Task execution halted during deliberation: {exc}"
-                emit("status", {"message": f"Error: {exc}"})
-                return OrchestratorResult(
-                    task=task,
-                    routing=routing,
-                    deliberation=DeliberationResult(
-                        strategy_used="FAILED",
-                        synthesized_output=err_msg,
-                        participating_providers=[primary_agent.name],
-                    ),
-                    final_answer=err_msg,
-                )
-
-        # 6. Persist Agent Runs, Reviews, and Decisions
-        for prop in deliberation.proposals:
-            self.state_manager.record_agent_run(
-                task_id=task.id,
-                provider_name=prop.agent_name,
-                role="proposer",
-                response_content=prop.content,
-                prompt_summary=prop.summary,
-                input_tokens=prop.input_tokens or 0,
-                output_tokens=prop.output_tokens or 0,
-                duration_ms=prop.duration_ms,
-            )
-
-        for crit in deliberation.critiques:
-            self.state_manager.record_agent_run(
-                task_id=task.id,
-                provider_name=crit.reviewer_agent,
-                role="critic",
-                response_content=crit.content,
-                prompt_summary=f"Critique for {crit.target_agent}",
-                input_tokens=crit.input_tokens or 0,
-                output_tokens=crit.output_tokens or 0,
-                duration_ms=crit.duration_ms,
-            )
-
-        # Record synthesis run if present in stage_metrics
-        for sm in getattr(deliberation, "stage_metrics", []):
-            if sm.get("role") == "synthesizer":
-                self.state_manager.record_agent_run(
-                    task_id=task.id,
-                    provider_name=sm["provider"],
-                    role="synthesizer",
-                    response_content=deliberation.synthesized_output,
-                    prompt_summary=f"Consolidated synthesis by {sm['provider']}",
-                    input_tokens=sm["input_tokens"] or 0,
-                    output_tokens=sm["output_tokens"] or 0,
-                    duration_ms=sm["duration_ms"],
-                )
-
-        for rev in deliberation.reviews:
-            self.state_manager.record_review(
-                task_id=task.id,
-                reviewer_provider=rev.reviewer_agent,
-                subject_agent=rev.subject_agent,
-                status=rev.status,
-                comments=rev.comments,
-            )
-            if active_strategy == StrategyType.AUTONOMOUS_EDIT:
-                self.state_manager.record_agent_run(
-                    task_id=task.id,
-                    provider_name=rev.reviewer_agent,
-                    role="critic",
-                    response_content=rev.comments,
-                    prompt_summary=f"Diff Review ({rev.status.value})",
-                    input_tokens=rev.input_tokens or 0,
-                    output_tokens=rev.output_tokens or 0,
-                    duration_ms=rev.duration_ms,
-                )
-
-        # Auto-record design decision if strategy involved deliberation or autonomous edit
-        if len(deliberation.proposals) > 0 or len(deliberation.critiques) > 0:
-            self.state_manager.record_decision(
-                project_id=self.project["id"],
-                task_id=task.id,
-                title=task.title,
-                decision=deliberation.synthesized_output[:200] + "...",
-                rationale=routing.rationale,
-                agent_source="Fusion Agent Orchestrator",
-            )
-
-        # 7. Update Task Status
-        task.status = TaskStatus.COMPLETED
-        self.state_manager.update_task_status(
+        recovery_mgr = CheckpointRecoveryManager()
+        repo_fingerprint = recovery_mgr.get_repo_fingerprint(repo_path)
+        config_snapshot = json.dumps({
+            "verification_command": self.config.verification_command or "",
+            "optimization_mode": self.config.optimization_mode.value,
+            "strategy": routing.strategy.value,
+        })
+        self.state_manager.update_task_recovery_fields(
             task.id,
-            TaskStatus.COMPLETED,
-            verification_passed=(verification_result.passed if verification_result else True),
-            repair_rounds=getattr(deliberation, "rounds_executed", 1) - 1 if deliberation else 0,
+            repo_fingerprint=repo_fingerprint,
+            execution_config_snapshot=config_snapshot,
         )
-        emit("status", {"message": "Task completed successfully."})
 
-        return OrchestratorResult(
-            task=task,
-            routing=routing,
-            deliberation=deliberation,
-            final_answer=deliberation.synthesized_output,
-            context=context,
-            workspace_session=workspace_session,
-            verification_result=verification_result,
-            diff=diff,
-            review_result=review_result,
+        try:
+            # 3. Construct 3-Tier Context Snapshot
+            context = self.state_manager.build_context_snapshot(self.project["id"], current_task=task)
+
+            # 4. Resolve Providers & Health Verification
+            budget = TaskBudgetController(self.config.deliberation)
+
+            impl_key = routing.role_assignments.get("implementer") or routing.primary_provider
+            rev_key = routing.role_assignments.get("reviewer") or routing.secondary_provider
+            lead_key = routing.role_assignments.get("lead") or routing.primary_provider
+
+            implementer_agent = self.providers.get(impl_key)
+            reviewer_agent = self.providers.get(rev_key) if rev_key else None
+            lead_agent = self.providers.get(lead_key)
+
+            primary_agent = implementer_agent if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_agent
+            secondary_agent = reviewer_agent
+
+            if not primary_agent:
+                raise RuntimeError(f"Primary provider '{impl_key if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_key}' not found.")
+
+            active_strategy = routing.strategy
+            health_primary = primary_agent.health_check()
+
+            if not health_primary.healthy:
+                emit("status", {"message": f"Primary provider '{primary_agent.name}' is unavailable: {health_primary.message}"})
+                if secondary_agent and secondary_agent.health_check().healthy:
+                    emit("status", {"message": f"Gracefully falling back to available provider '{secondary_agent.name}'..."})
+                    primary_agent = secondary_agent
+                    secondary_agent = None
+                    active_strategy = StrategyType.DIRECT
+                else:
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    err_msg = (
+                        f"Provider '{primary_agent.name}' is unavailable:\n{health_primary.message}\n"
+                        "No alternative healthy provider is configured to handle this task."
+                    )
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=err_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=err_msg,
+                    )
+
+            # 5. Execute Multi-Agent Deliberation, Autonomous Edit, or Checkpointed Plan
+            workspace_session = None
+            verification_result = None
+            diff = None
+            review_result = None
+
+            if active_strategy == StrategyType.CHECKPOINTED_PLAN:
+                emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
+                try:
+                    deliberation, workspace_session, verification_result, diff, review_result = (
+                        self._run_checkpointed_plan(
+                            task=task,
+                            lead=lead_agent,
+                            implementer=implementer_agent,
+                            reviewer=reviewer_agent,
+                            context=context,
+                            emit=emit,
+                            budget=budget,
+                        )
+                    )
+                except DirtyWorkingTreeError as exc:
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    err_msg = str(exc)
+                    emit("status", {"message": f"Refusal: {err_msg}"})
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=err_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=err_msg,
+                    )
+                except Exception as exc:
+                    has_chk = bool(self.state_manager.get_checkpoints_for_task(task.id))
+                    if not has_chk:
+                        try:
+                            WorkspaceSession(task_id=task.id, repo_root=Path(self.config.project_root).resolve()).teardown(delete_branch=True)
+                        except Exception:
+                            pass
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    err_msg = f"Checkpointed plan execution failed: {exc}"
+                    emit("status", {"message": f"Error: {err_msg}"})
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=err_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=err_msg,
+                    )
+            elif active_strategy == StrategyType.AUTONOMOUS_EDIT:
+                emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
+                try:
+                    deliberation, workspace_session, verification_result, diff, review_result = (
+                        self._run_autonomous_edit(
+                            task=task,
+                            implementer=implementer_agent,
+                            reviewer=reviewer_agent,
+                            context=context,
+                            emit=emit,
+                            budget=budget,
+                        )
+                    )
+                except DirtyWorkingTreeError as exc:
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    err_msg = str(exc)
+                    emit("status", {"message": f"Refusal: {err_msg}"})
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=err_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=err_msg,
+                    )
+                except Exception as exc:
+                    try:
+                        WorkspaceSession(task_id=task.id, repo_root=Path(self.config.project_root).resolve()).teardown(delete_branch=True)
+                    except Exception:
+                        pass
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    err_msg = f"Autonomous edit failed: {exc}"
+                    emit("status", {"message": f"Error: {exc}"})
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=err_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=err_msg,
+                    )
+            else:
+                emit("status", {"message": f"Executing strategy: {active_strategy.value}..."})
+                try:
+                    deliberation = self.deliberation_engine.run(
+                        strategy=active_strategy,
+                        task=task,
+                        primary_agent=primary_agent,
+                        secondary_agent=secondary_agent,
+                        context=context,
+                        on_event=on_status,
+                    )
+                except Exception as exc:
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    err_msg = f"Task execution halted during deliberation: {exc}"
+                    emit("status", {"message": f"Error: {exc}"})
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=err_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=err_msg,
+                    )
+
+            # 6. Persist Agent Runs, Reviews, and Decisions
+            if active_strategy not in (StrategyType.CHECKPOINTED_PLAN, StrategyType.AUTONOMOUS_EDIT):
+                for prop in deliberation.proposals:
+                    self.state_manager.record_provider_stage(
+                        task_id=task.id,
+                        stage="deliberation_proposal",
+                        provider=prop.agent_name,
+                        role="proposer",
+                        response_content=prop.content,
+                        prompt_summary=prop.summary,
+                        input_tokens=prop.input_tokens,
+                        output_tokens=prop.output_tokens,
+                        duration_ms=prop.duration_ms,
+                        status="success",
+                    )
+
+                for crit in deliberation.critiques:
+                    self.state_manager.record_provider_stage(
+                        task_id=task.id,
+                        stage="deliberation_critique",
+                        provider=crit.reviewer_agent,
+                        role="critic",
+                        response_content=crit.content,
+                        prompt_summary=f"Critique for {crit.target_agent}",
+                        input_tokens=crit.input_tokens,
+                        output_tokens=crit.output_tokens,
+                        duration_ms=crit.duration_ms,
+                        status="success",
+                    )
+
+                for sm in getattr(deliberation, "stage_metrics", []):
+                    if sm.get("role") == "synthesizer":
+                        self.state_manager.record_provider_stage(
+                            task_id=task.id,
+                            stage="deliberation_synthesis",
+                            provider=sm["provider"],
+                            role="synthesizer",
+                            response_content=deliberation.synthesized_output,
+                            prompt_summary=f"Consolidated synthesis by {sm['provider']}",
+                            input_tokens=sm.get("input_tokens"),
+                            output_tokens=sm.get("output_tokens"),
+                            duration_ms=sm.get("duration_ms", 0.0),
+                            status="success",
+                        )
+
+            for rev in deliberation.reviews:
+                self.state_manager.record_review(
+                    task_id=task.id,
+                    reviewer_provider=rev.reviewer_agent,
+                    subject_agent=rev.subject_agent,
+                    status=rev.status,
+                    comments=rev.comments,
+                )
+
+            if len(deliberation.proposals) > 0 or len(deliberation.critiques) > 0:
+                self.state_manager.record_decision(
+                    project_id=self.project["id"],
+                    task_id=task.id,
+                    title=task.title,
+                    decision=deliberation.synthesized_output[:200] + "...",
+                    rationale=routing.rationale,
+                    agent_source="Fusion Agent Orchestrator",
+                )
+
+            # 7. Update Task Status
+            task.status = TaskStatus.COMPLETED
+            self.state_manager.update_task_status(
+                task.id,
+                TaskStatus.COMPLETED,
+                verification_passed=(verification_result.passed if verification_result else True),
+                repair_rounds=getattr(deliberation, "rounds_executed", 1) - 1 if deliberation else 0,
+            )
+            emit("status", {"message": "Task completed successfully."})
+
+            return OrchestratorResult(
+                task=task,
+                routing=routing,
+                deliberation=deliberation,
+                final_answer=deliberation.synthesized_output,
+                context=context,
+                workspace_session=workspace_session,
+                verification_result=verification_result,
+                diff=diff,
+                review_result=review_result,
+            )
+        finally:
+            task_lock.release()
+            try:
+                self.state_manager.release_task_lock(task.id, task_lock.owner_id)
+            except Exception:
+                pass
+
+    def resume_task(
+        self,
+        task_id: str,
+        on_status: Optional[Callable] = None,
+    ) -> OrchestratorResult:
+        """Resume an interrupted or crashed task from its latest verified state."""
+        def emit(event_type: str, data: Dict[str, Any]):
+            if on_status:
+                try:
+                    on_status(event_type, data)
+                except TypeError:
+                    on_status({"event": event_type, **data})
+
+        emit("status", {"message": f"Locating task '{task_id}' for resume..."})
+        task = self.state_manager.get_task(task_id)
+        if not task:
+            raise RecoveryError(f"Task '{task_id}' not found in database.")
+
+        if task.status == TaskStatus.COMPLETED:
+            emit("status", {"message": f"Task '{task_id}' is already COMPLETED."})
+            strat_val = (task.selected_strategy or "CHECKPOINTED_PLAN").upper()
+            try:
+                strat_enum = StrategyType(strat_val)
+            except ValueError:
+                strat_enum = StrategyType.CHECKPOINTED_PLAN
+            t_type = task.task_type if isinstance(task.task_type, TaskType) else TaskType(task.task_type or "GENERAL")
+            t_comp = task.complexity if isinstance(task.complexity, Complexity) else Complexity(task.complexity or "MEDIUM")
+            return OrchestratorResult(
+                task=task,
+                routing=RoutingDecision(
+                    task_type=t_type,
+                    complexity=t_comp,
+                    strategy=strat_enum,
+                    primary_provider="system",
+                    secondary_provider=None,
+                    rationale="Task already completed",
+                ),
+                deliberation=DeliberationResult(
+                    strategy_used=task.selected_strategy or "CHECKPOINTED_PLAN",
+                    synthesized_output=f"Task '{task_id}' was previously completed successfully.",
+                ),
+                final_answer=f"Task '{task_id}' is already COMPLETED.",
+            )
+
+        repo_path = Path(self.config.project_root).resolve()
+        task_lock = TaskExecutionLock(task_id, repo_path)
+        if not task_lock.acquire():
+            raise TaskLockError(f"Task '{task_id}' is currently locked by another process.")
+
+        self.state_manager.record_task_lock(
+            task_id=task_id,
+            owner_id=task_lock.owner_id,
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
         )
+
+        try:
+            # Reconcile stale provider runs left behind in STARTED state to INTERRUPTED
+            stale_count = self.state_manager.reconcile_stale_provider_runs(task.id)
+            if stale_count > 0:
+                emit("status", {"message": f"Reconciled {stale_count} interrupted provider run(s) from previous session."})
+
+            new_recovery_attempts = (task.recovery_attempts or 0) + 1
+            task.recovery_attempts = new_recovery_attempts
+            now_iso = datetime.now(timezone.utc).isoformat()
+            self.state_manager.update_task_status(
+                task.id,
+                TaskStatus.RESUMING,
+                recovery_attempts=new_recovery_attempts,
+                resumed_at=now_iso,
+            )
+            task.status = TaskStatus.RESUMING
+
+            # 1. Validate repository identity & config drift
+            recovery_mgr = CheckpointRecoveryManager()
+            if not recovery_mgr.validate_repository_identity(
+                repo_root=repo_path,
+                expected_fingerprint=task.repo_fingerprint,
+                expected_base_commit=task.base_commit,
+            ):
+                raise RecoveryError(
+                    f"Repository identity validation failed: repository at '{repo_path}' cannot be proven "
+                    f"to match original task repository (expected base: {task.base_commit}, fingerprint: {task.repo_fingerprint})."
+                )
+
+            curr_cfg = {"verification_command": self.config.verification_command or ""}
+            drift_ok, drift_err = recovery_mgr.validate_config_drift(curr_cfg, task.execution_config_snapshot)
+            if not drift_ok:
+                raise RecoveryError(drift_err)
+
+            # 2. Check for pending or interrupted promotion transaction
+            promo_engine = PromotionEngine()
+            latest_promo = self.state_manager.get_active_promotion_transaction(task.id)
+            if latest_promo:
+                emit("status", {"message": "Detected promotion transaction from prior session. Reconciling..."})
+                temp_session = WorkspaceSession(task_id=task.id, repo_root=repo_path)
+                promo_res = promo_engine.reconcile_interrupted_promotion(temp_session, state_manager=self.state_manager)
+                if promo_res.success:
+                    self.state_manager.update_task_status(task.id, TaskStatus.COMPLETED)
+                    task.status = TaskStatus.COMPLETED
+                    emit("status", {"message": f"Task was already promoted: {promo_res.message}"})
+                    strat_val = (task.selected_strategy or "CHECKPOINTED_PLAN").upper()
+                    try:
+                        strat_enum = StrategyType(strat_val)
+                    except ValueError:
+                        strat_enum = StrategyType.CHECKPOINTED_PLAN
+                    t_type = task.task_type if isinstance(task.task_type, TaskType) else TaskType(task.task_type or "GENERAL")
+                    t_comp = task.complexity if isinstance(task.complexity, Complexity) else Complexity(task.complexity or "MEDIUM")
+                    return OrchestratorResult(
+                        task=task,
+                        routing=RoutingDecision(
+                            task_type=t_type,
+                            complexity=t_comp,
+                            strategy=strat_enum,
+                            primary_provider="system",
+                            secondary_provider=None,
+                            rationale="Reconciled completed promotion",
+                        ),
+                        deliberation=DeliberationResult(
+                            strategy_used=task.selected_strategy or "CHECKPOINTED_PLAN",
+                            synthesized_output=promo_res.message,
+                        ),
+                        final_answer=promo_res.message,
+                    )
+                elif promo_res.requires_manual_reconciliation:
+                    self.state_manager.update_task_status(task.id, TaskStatus.FAILED)
+                    task.status = TaskStatus.FAILED
+                    raise RecoveryError(f"Ambiguous promotion state: {promo_res.message} Manual reconciliation required.")
+
+            # 3. Attach or reconstruct workspace session
+            session = WorkspaceSession(task_id=task.id, repo_root=repo_path)
+            session.attach_or_reconstruct(
+                expected_checkpoint_sha=task.last_checkpoint_sha,
+                original_base_commit=task.base_commit,
+            )
+
+            # 4. Checkpoint Reconciliation
+            plan = self.state_manager.get_plan_by_task_id(task.id)
+            reconcile_res = recovery_mgr.reconcile_checkpoints(session, task, plan, self.state_manager)
+            emit("status", {"message": reconcile_res.message})
+            task.last_checkpoint_sha = reconcile_res.verified_checkpoint_sha
+            self.state_manager.update_task_stage(task.id, "resuming", last_checkpoint_sha=task.last_checkpoint_sha)
+
+            # 5. Restore Budget from History
+            budget = TaskBudgetController.restore_from_history(task.id, self.state_manager, self.config.deliberation)
+            emit("status", {"message": f"Restored budget: {budget.calls_made} call(s), {budget.repair_rounds_attempted} repair round(s) consumed."})
+
+            # 6. Resolve Providers & Health Verification
+            stats_tracker = ProviderStatsTracker(self.db)
+            provider_stats = stats_tracker.get_all_provider_stats(list(self.providers.keys()))
+            routing = self.router.route(
+                task_prompt=task.description or task.title,
+                available_providers=self.providers,
+                optimization_mode=self.config.optimization_mode,
+                provider_stats=provider_stats,
+                allow_multi_step_planning=getattr(self.config.deliberation, "allow_multi_step_planning", True),
+            )
+            impl_key = routing.role_assignments.get("implementer") or routing.primary_provider
+            rev_key = routing.role_assignments.get("reviewer") or routing.secondary_provider
+            lead_key = routing.role_assignments.get("lead") or routing.primary_provider
+
+            implementer_agent = self.providers.get("implementer") or self.providers.get(impl_key)
+            reviewer_agent = self.providers.get("reviewer") or (self.providers.get(rev_key) if rev_key else None)
+            lead_agent = self.providers.get("planner") or self.providers.get("lead") or self.providers.get(lead_key)
+            primary_agent = implementer_agent if routing.strategy == StrategyType.AUTONOMOUS_EDIT else lead_agent
+
+            if not primary_agent or not primary_agent.health_check().healthy:
+                raise RuntimeError(f"Primary provider for resume '{impl_key}' is unavailable or unhealthy.")
+
+            # 7. Construct 3-Tier Context Snapshot
+            context = self.state_manager.build_context_snapshot(self.project["id"], current_task=task)
+
+            # 8. Continue Plan Execution
+            rerun_verif = (reconcile_res.resumed_step_index >= len(plan.steps)) if plan else False
+            deliberation, workspace_session, verification_result, diff, review_result = (
+                self._run_checkpointed_plan(
+                    task=task,
+                    lead=lead_agent,
+                    implementer=implementer_agent,
+                    reviewer=reviewer_agent,
+                    context=context,
+                    emit=emit,
+                    budget=budget,
+                    session=session,
+                    existing_plan=plan,
+                    start_step_index=reconcile_res.resumed_step_index,
+                    last_verified_sha=reconcile_res.verified_checkpoint_sha,
+                    rerun_final_verification=rerun_verif,
+                )
+            )
+
+            # Update final task status
+            task.status = TaskStatus.COMPLETED if (verification_result and verification_result.passed) else TaskStatus.FAILED
+            self.state_manager.update_task_status(
+                task.id,
+                task.status,
+                verification_passed=(verification_result.passed if verification_result else True),
+                repair_rounds=getattr(deliberation, "rounds_executed", 1) - 1 if deliberation else 0,
+            )
+
+            return OrchestratorResult(
+                task=task,
+                routing=routing,
+                deliberation=deliberation,
+                final_answer=deliberation.synthesized_output,
+                context=context,
+                workspace_session=workspace_session,
+                verification_result=verification_result,
+                diff=diff,
+                review_result=review_result,
+            )
+
+        finally:
+            task_lock.release()
+            try:
+                self.state_manager.release_task_lock(task.id, task_lock.owner_id)
+            except Exception:
+                pass
