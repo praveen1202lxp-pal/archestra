@@ -100,14 +100,14 @@ class BenchmarkRunner:
         for rep_idx in range(repetitions):
             print(f"\n--- Repetition {rep_idx + 1}/{repetitions} ---")
 
-            for task in active_tasks:
+            for task_idx, task in enumerate(active_tasks):
                 task_hash = compute_task_definition_hash(task)
 
                 # Rotate or randomize SUT order to eliminate execution bias
                 current_suts = list(active_suts)
                 if randomize_order:
-                    # Deterministic rotation based on repetition index
-                    rotate_by = rep_idx % len(current_suts)
+                    # Deterministic rotation based on repetition and task index
+                    rotate_by = (rep_idx + task_idx) % len(current_suts)
                     current_suts = current_suts[rotate_by:] + current_suts[:rotate_by]
                 
                 print(f"Task {task.task_id} ({task.category.value}) - Execution Order: {[s.value for s in current_suts]}")
@@ -154,7 +154,7 @@ class BenchmarkRunner:
 
         # 1. Clean Snapshot Isolation: create fresh disposable Git repo with deterministic initial commit
         with DisposableBenchmarkEnvironment(task_id=task.task_id, run_id=run_id, base_temp_dir=self.base_temp_dir) as env:
-            baseline_hash = env.baseline_commit_hash
+            baseline_hash = env.baseline_snapshot_hash or env.baseline_commit_hash
 
             # Verify hidden tests do NOT exist in the repository before/during SUT execution
             assert not (env.repo_path / "tests" / "_hidden_eval.py").exists(), "Hidden test leaked into baseline repo"

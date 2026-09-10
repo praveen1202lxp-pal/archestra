@@ -5,6 +5,7 @@ with a deterministic fresh initial commit. Prevents future commits, tags,
 or solution branches from being discoverable by agents via git log --all.
 """
 
+import hashlib
 import os
 import shutil
 import stat
@@ -14,6 +15,18 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from benchmarks.tasks.catalog import setup_task_fixtures
+
+
+def compute_baseline_snapshot_hash(repo_path: Path) -> str:
+    """Compute deterministic full SHA-256 digest of all files in the baseline repo snapshot."""
+    file_records = []
+    for p in sorted(repo_path.rglob("*")):
+        if p.is_file() and ".git" not in p.parts:
+            rel = p.relative_to(repo_path).as_posix()
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            file_records.append(f"{rel}:{digest}")
+    payload = "\n".join(file_records).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _on_rm_error(func, path, exc_info):
@@ -35,6 +48,7 @@ class DisposableBenchmarkEnvironment:
         self.temp_dir: Optional[tempfile.TemporaryDirectory] = None
         self.repo_path: Optional[Path] = None
         self.baseline_commit_hash: str = ""
+        self.baseline_snapshot_hash: str = ""
 
     def __enter__(self) -> "DisposableBenchmarkEnvironment":
         self.create()
@@ -98,6 +112,7 @@ class DisposableBenchmarkEnvironment:
             text=True,
         )
         self.baseline_commit_hash = rev.stdout.strip()
+        self.baseline_snapshot_hash = compute_baseline_snapshot_hash(self.repo_path)
         return self.repo_path
 
     def get_touched_files(self) -> List[str]:

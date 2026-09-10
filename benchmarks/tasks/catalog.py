@@ -235,19 +235,19 @@ def get_task_by_id(task_id: str) -> Optional[BenchmarkTask]:
 
 
 def compute_task_definition_hash(task: BenchmarkTask) -> str:
-    """Compute deterministic SHA-256 hash of task definition."""
+    """Compute deterministic full SHA-256 hash of task definition."""
     dumped = json.dumps(task.to_dict(), sort_keys=True)
-    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
 
 def compute_hidden_evaluator_hash(task: BenchmarkTask) -> str:
-    """Compute SHA-256 hash of the decisive hidden evaluator module."""
+    """Compute full SHA-256 hash of the decisive hidden evaluator module."""
     eval_dir = Path(__file__).parent.parent / "hidden_evaluators"
     target = eval_dir / task.hidden_evaluator_module
     if target.exists():
         content = target.read_bytes()
-        return hashlib.sha256(content).hexdigest()[:16]
-    return "0000000000000000"
+        return hashlib.sha256(content).hexdigest()
+    return "0" * 64
 
 
 def compute_benchmark_suite_hash() -> str:
@@ -258,7 +258,7 @@ def compute_benchmark_suite_hash() -> str:
         h_hash = compute_hidden_evaluator_hash(t)
         all_elements.append(f"{t.task_id}:{t_hash}:{h_hash}")
     combined = ":".join(sorted(all_elements))
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
 def setup_task_fixtures(task_id: str, target_dir: Path) -> None:

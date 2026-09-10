@@ -24,6 +24,7 @@ from benchmarks.storage import BenchmarkStorage
 from benchmarks.tasks.catalog import (
     BENCHMARK_TASKS,
     compute_benchmark_suite_hash,
+    compute_hidden_evaluator_hash,
     compute_task_definition_hash,
     get_task_by_id,
 )
@@ -36,11 +37,13 @@ def test_catalog_integrity_and_hashes():
     assert len(set(task_ids)) == 12
 
     suite_hash = compute_benchmark_suite_hash()
-    assert isinstance(suite_hash, str) and len(suite_hash) > 0
+    assert isinstance(suite_hash, str) and len(suite_hash) == 64
 
     for task in BENCHMARK_TASKS:
         t_hash = compute_task_definition_hash(task)
-        assert len(t_hash) > 0
+        assert len(t_hash) == 64
+        h_hash = compute_hidden_evaluator_hash(task)
+        assert len(h_hash) == 64
         assert task.required_paths is not None
         assert task.hidden_evaluator_module.startswith("eval_task_")
 
@@ -53,6 +56,7 @@ def test_disposable_environment_isolation(tmp_path):
     with DisposableBenchmarkEnvironment(task_id=task_id, run_id=run_id, base_temp_dir=tmp_path) as env:
         repo_path = env.repo_path
         assert repo_path.exists()
+        assert len(env.baseline_snapshot_hash) == 64
         assert (repo_path / "src" / "pagination.py").exists()
         assert (repo_path / "tests" / "test_pagination.py").exists()
 
