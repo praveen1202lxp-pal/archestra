@@ -1,6 +1,7 @@
 """Adapter for running Fusion Agent as System Under Test."""
 
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -39,19 +40,21 @@ class FusionSUTAdapter(BaseSUTAdapter):
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
 
-        # Build workspace config
+        temp_state_dir = tempfile.TemporaryDirectory(prefix="fusion_bench_state_")
+        state_dir_path = Path(temp_state_dir.name).resolve()
+
+        # Build workspace config with EXTERNAL storage_dir
         cfg = self.config or FusionConfig(
             project_name=f"Bench_{task.task_id}",
             project_root=str(repo_path),
-            storage_dir=str(repo_path / ".fusion_state"),
+            storage_dir=str(state_dir_path),
             verification_command="pytest",
             optimization_mode=OptimizationMode.BEST_QUALITY,
         )
         cfg.project_root = str(repo_path)
-        cfg.storage_dir = str(repo_path / ".fusion_state")
+        cfg.storage_dir = str(state_dir_path)
 
-        db_path = f"{cfg.storage_dir}/fusion.db"
-        Path(cfg.storage_dir).mkdir(parents=True, exist_ok=True)
+        db_path = str(state_dir_path / "fusion.db")
         db = Database(db_path)
         orchestrator = FusionOrchestrator(
             config=cfg,
@@ -68,6 +71,7 @@ class FusionSUTAdapter(BaseSUTAdapter):
         pre_review_test_passed = None
         repair_patch = None
         error_message = None
+        verification_duration = None
 
         try:
             result = orchestrator.run_task(task.prompt)
@@ -77,7 +81,7 @@ class FusionSUTAdapter(BaseSUTAdapter):
                 rev = result.review_result
                 reviewer_verdict = rev.status.value if hasattr(rev.status, "value") else str(rev.status)
                 reviewer_findings = rev.comments
-                if rev.status in (ReviewStatus.CHANGES_REQUESTED, ReviewStatus.REJECTED, ReviewStatus.NEEDS_REVISION):
+                if rev.status in (ReviewStatus.REJECTED, ReviewStatus.NEEDS_REVISION):
                     reviewer_found_defect = True
 
             # Deliberation proposals & pre-review state
@@ -85,12 +89,13 @@ class FusionSUTAdapter(BaseSUTAdapter):
                 delib = result.deliberation
                 if hasattr(delib, "proposals") and delib.proposals:
                     pre_review_patch = delib.proposals[0].content
-                    if len(delib.proposals) > 1 and reviewer_found_defect:
+                    if len(delib.proposals) > 1:
                         repair_patch = delib.proposals[-1].content
                         repair_rounds = len(delib.proposals) - 1
 
             if hasattr(result, "verification_result") and result.verification_result:
                 pre_review_test_passed = result.verification_result.passed
+                verification_duration = getattr(result.verification_result, "duration_seconds", None)
 
             # Transfer candidate patch from worktree to repo_path
             if hasattr(result, "workspace_session") and result.workspace_session:
@@ -127,32 +132,51 @@ class FusionSUTAdapter(BaseSUTAdapter):
         except Exception as exc:
             error_message = str(exc)
 
-        # Remove Fusion internal bookkeeping before evaluation diff is captured
+        # Remove any lingering Fusion internal bookkeeping inside repo_path as defense-in-depth
         for junk in [repo_path / ".fusion_state", repo_path / ".fusion_worktrees"]:
             if junk.exists():
                 shutil.rmtree(junk, ignore_errors=True)
 
         duration = max(0.01, time.time() - t0)
 
-        # Aggregate telemetry from SQLite state database
+        # Aggregate telemetry from authoritative SQLite execution ledger (external storage)
         native_in = 0
         native_out = 0
         native_reasoning = 0
         fusion_ctx = 0
         provider_calls = 0
         active_provider_dur = 0.0
+        provider_stages = []
+        has_ledger_data = False
 
         try:
             conn = db.connect()
             runs = conn.execute("SELECT * FROM agent_runs;").fetchall()
             for r in runs:
+                has_ledger_data = True
                 provider_calls += 1
-                native_in += r["input_tokens"] if "input_tokens" in r.keys() and r["input_tokens"] else 0
-                native_out += r["output_tokens"] if "output_tokens" in r.keys() and r["output_tokens"] else 0
-                fusion_ctx += r["fusion_context_tokens"] if "fusion_context_tokens" in r.keys() and r["fusion_context_tokens"] else 0
-                native_reasoning += r["reasoning_tokens"] if "reasoning_tokens" in r.keys() and r["reasoning_tokens"] else 0
-                dur_ms = r["duration_ms"] if "duration_ms" in r.keys() and r["duration_ms"] else 0.0
-                active_provider_dur += (dur_ms / 1000.0)
+                if "stage" in r.keys() and r["stage"]:
+                    provider_stages.append(r["stage"])
+                if "input_tokens" in r.keys() and r["input_tokens"] is not None:
+                    native_in += r["input_tokens"]
+                if "output_tokens" in r.keys() and r["output_tokens"] is not None:
+                    native_out += r["output_tokens"]
+                if "fusion_context_tokens" in r.keys() and r["fusion_context_tokens"] is not None:
+                    fusion_ctx += r["fusion_context_tokens"]
+                if "reasoning_tokens" in r.keys() and r["reasoning_tokens"] is not None:
+                    native_reasoning += r["reasoning_tokens"]
+                if "duration_ms" in r.keys() and r["duration_ms"]:
+                    active_provider_dur += (r["duration_ms"] / 1000.0)
+
+            # Query reviews if not already populated from result
+            if not reviewer_verdict:
+                reviews = conn.execute("SELECT * FROM reviews ORDER BY timestamp DESC;").fetchall()
+                if reviews:
+                    latest = reviews[0]
+                    reviewer_verdict = latest["status"]
+                    reviewer_findings = latest["comments"]
+                    if latest["status"] in ("CHANGES_REQUESTED", "REJECTED", "NEEDS_REVISION"):
+                        reviewer_found_defect = True
         except Exception:
             pass
         finally:
@@ -160,24 +184,47 @@ class FusionSUTAdapter(BaseSUTAdapter):
                 db.close()
             except Exception:
                 pass
+            try:
+                temp_state_dir.cleanup()
+            except Exception:
+                pass
 
-        if native_in == 0 and not self.is_live:
-            # Offline mock estimates
-            native_in = 1450
-            native_out = 380
-            fusion_ctx = 1100
-            provider_calls = 2
-            active_provider_dur = duration * 0.85
+        if has_ledger_data:
+            res_native_in = native_in if native_in > 0 else None
+            res_native_out = native_out if native_out > 0 else None
+            res_native_reasoning = native_reasoning if native_reasoning > 0 else None
+            res_fusion_ctx = fusion_ctx if fusion_ctx > 0 else None
+            res_active_dur = active_provider_dur if active_provider_dur > 0 else (duration * 0.85)
+            res_provider_calls = provider_calls
+        elif not self.is_live:
+            # Offline mock estimates only when no orchestrator executed
+            res_native_in = 1450
+            res_native_out = 380
+            res_native_reasoning = None
+            res_fusion_ctx = 1100
+            res_provider_calls = 2
+            res_active_dur = duration * 0.85
+            provider_stages = ["analysis", "deliberation"]
+        else:
+            # Live run missing ledger data: preserve None (NULL)
+            res_native_in = None
+            res_native_out = None
+            res_native_reasoning = None
+            res_fusion_ctx = None
+            res_provider_calls = 0
+            res_active_dur = duration * 0.85
 
         return AdapterRunTelemetry(
             system_under_test=SystemUnderTest.FUSION,
             wall_clock_duration_seconds=duration,
-            active_provider_duration_seconds=active_provider_dur or (duration * 0.85),
-            native_input_tokens=native_in,
-            native_output_tokens=native_out,
-            native_reasoning_tokens=native_reasoning if native_reasoning > 0 else None,
-            fusion_controlled_context_tokens=fusion_ctx if fusion_ctx > 0 else None,
-            provider_calls_count=provider_calls,
+            active_provider_duration_seconds=res_active_dur,
+            verification_duration_seconds=verification_duration,
+            native_input_tokens=res_native_in,
+            native_output_tokens=res_native_out,
+            native_reasoning_tokens=res_native_reasoning,
+            fusion_controlled_context_tokens=res_fusion_ctx,
+            provider_calls_count=res_provider_calls,
+            provider_stages=provider_stages,
             mcp_calls_count=1 if task.mcp_context else 0,
             provider_model_id="fusion-orchestrated(codex+agy)",
             cli_version="0.11.0",

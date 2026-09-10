@@ -7,9 +7,10 @@ from src.notifier import NotificationDispatcher
 def test_hidden_custom_strategy_registration():
     d = NotificationDispatcher()
     # Must support registering custom notification strategies
-    if hasattr(d, "register"):
-        d.register("pagerduty", lambda msg: f"PAGERDUTY: {msg}")
-        assert d.dispatch("pagerduty", "Critical Alert") == "PAGERDUTY: Critical Alert"
+    assert hasattr(d, "register") or hasattr(d, "register_handler"), "NotificationDispatcher must implement register() strategy registration"
+    reg_fn = getattr(d, "register", None) or getattr(d, "register_handler")
+    reg_fn("pagerduty", lambda msg: f"PAGERDUTY: {msg}")
+    assert d.dispatch("pagerduty", "Critical Alert") == "PAGERDUTY: Critical Alert"
     assert d.dispatch("email", "Report") == "EMAIL: Report"
 
 

@@ -13,17 +13,58 @@ from benchmarks.schema import BenchmarkRunRecord, BenchmarkScore, SystemUnderTes
 from benchmarks.storage import BenchmarkStorage
 
 
+from benchmarks.tasks.catalog import BENCHMARK_SUITE_VERSION, compute_benchmark_suite_hash
+
+
 class BenchmarkReporter:
     """Generates comparative statistical reports from benchmark run records."""
 
     def __init__(self, storage: Optional[BenchmarkStorage] = None):
         self.storage = storage or BenchmarkStorage()
 
-    def generate_report_markdown(self, records: Optional[List[BenchmarkRunRecord]] = None) -> str:
-        """Generate comprehensive markdown evaluation report."""
-        runs = records if records is not None else self.storage.get_runs()
+    def generate_report_markdown(
+        self,
+        records: Optional[List[BenchmarkRunRecord]] = None,
+        suite_version: Optional[str] = None,
+        suite_hash: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+        allow_mixed: bool = False,
+    ) -> str:
+        """Generate comprehensive markdown evaluation report isolating result sets."""
+        if records is not None:
+            runs = records
+        else:
+            # Query runs respecting result-set isolation
+            raw_runs = self.storage.get_runs(
+                suite_version=suite_version,
+                suite_hash=suite_hash,
+                execution_mode=execution_mode,
+            )
+            if not allow_mixed and raw_runs:
+                # Disallow silent mixing of incompatible suite versions, suite hashes, or execution modes
+                target_ver = suite_version or BENCHMARK_SUITE_VERSION
+                target_mode = execution_mode or raw_runs[-1].execution_mode
+                runs = [
+                    r for r in raw_runs
+                    if r.benchmark_suite_version == target_ver and r.execution_mode == target_mode
+                ]
+            else:
+                runs = raw_runs
+
+        all_runs = self.storage.get_runs(include_invalidated=True)
+        invalidated = [r for r in all_runs if r.validity_disposition != "VALID"]
+
         if not runs:
-            return "# Benchmark Report\n\nNo benchmark runs found in storage."
+            md = ["# Benchmark Report\n\nNo valid benchmark runs found matching the requested filters."]
+            if invalidated:
+                md.append("\n## Invalidation & Methodology Audit Trail\n")
+                md.append(f"The following {len(invalidated)} run(s) have been explicitly invalidated and are excluded from comparative statistics:\n")
+                md.append("| Run ID | Task | SUT | Disposition | Invalidation Reasons |")
+                md.append("|---|---|---|---|---|")
+                for inv in invalidated:
+                    reasons = ", ".join(inv.invalidation_reasons)
+                    md.append(f"| `{inv.run_id}` | {inv.task_id} | {inv.system_under_test.value} | `{inv.validity_disposition}` | {reasons} |")
+            return "\n".join(md)
 
         # Group by SUT
         by_sut: Dict[SystemUnderTest, List[BenchmarkRunRecord]] = defaultdict(list)
@@ -142,4 +183,37 @@ class BenchmarkReporter:
             md.append(f"| **{tid}** | {cat} | {f_score} | {c_score} | {a_score} |")
 
         md.append("")
+
+        # 5. Invalidation Audit Trail
+        all_runs = self.storage.get_runs(include_invalidated=True)
+        invalidated = [r for r in all_runs if r.validity_disposition != "VALID"]
+        if invalidated:
+            md.append("## Invalidation & Methodology Audit Trail")
+            md.append("")
+            md.append(f"The following {len(invalidated)} run(s) have been explicitly invalidated and are excluded from comparative statistics:")
+            md.append("")
+            md.append("| Run ID | Task | SUT | Disposition | Invalidation Reasons |")
+            md.append("|---|---|---|---|---|")
+            for inv in invalidated:
+                reasons = ", ".join(inv.invalidation_reasons)
+                md.append(f"| `{inv.run_id}` | {inv.task_id} | {inv.system_under_test.value} | `{inv.validity_disposition}` | {reasons} |")
+            md.append("")
+
         return "\n".join(md)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate Benchmark Report")
+    parser.add_argument("--db", type=str, default="benchmarks/results/benchmark_results.db", help="Path to SQLite database")
+    parser.add_argument("--output", type=str, default="benchmarks/results/benchmark_report.md", help="Path to output markdown file")
+    args = parser.parse_args()
+
+    storage = BenchmarkStorage(db_path=Path(args.db))
+    reporter = BenchmarkReporter(storage=storage)
+    md_content = reporter.generate_report_markdown()
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(md_content, encoding="utf-8")
+    print(f"Report written to {out_path}")

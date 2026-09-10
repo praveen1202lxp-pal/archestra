@@ -30,23 +30,24 @@ class MockSUTAdapter(BaseSUTAdapter):
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
 
-        # 1. Fault injection simulations
+        # 1. Apply reference solution if requested
+        if task.task_id in self.solve_tasks:
+            self._apply_reference_solution(task.task_id, repo_path)
+
+        # 2. Fault injection simulations
         if self.simulate_syntax_error and task.required_paths:
             target = repo_path / task.required_paths[0]
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("def broken_syntax(:\n    pass\n", encoding="utf-8")
 
-        elif self.simulate_forbidden_write and task.forbidden_paths:
+        if self.simulate_forbidden_write and task.forbidden_paths:
             forbidden = repo_path / task.forbidden_paths[0]
             forbidden.parent.mkdir(parents=True, exist_ok=True)
             forbidden.write_text("# FORBIDDEN MODIFICATION\n", encoding="utf-8")
 
-        elif self.simulate_unintended_write:
+        if self.simulate_unintended_write:
             unintended = repo_path / "unintended_file.py"
             unintended.write_text("# UNINTENDED FILE\n", encoding="utf-8")
-
-        elif task.task_id in self.solve_tasks:
-            self._apply_reference_solution(task.task_id, repo_path)
 
         duration = max(0.01, time.time() - t0)
 
@@ -95,22 +96,22 @@ class MockSUTAdapter(BaseSUTAdapter):
             )
         elif task_id == "TASK-02":
             (src_dir / "serializer.py").write_text(
-                "def serialize_user(user):\n"
+                "def serialize_user(data):\n"
                 "    return {\n"
-                "        'id': user['id'],\n"
-                "        'name': user['name'].strip() if user.get('name') else '',\n"
-                "        'email': user['email'].strip() if user.get('email') else None,\n"
-                "        'bio': user['bio'].strip() if user.get('bio') else '',\n"
+                "        'username': data['username'].strip().lower(),\n"
+                "        'email': data['email'].strip().lower() if data.get('email') is not None else None,\n"
+                "        'bio': data['bio'].strip() if data.get('bio') is not None else None,\n"
                 "    }\n",
                 encoding="utf-8",
             )
         elif task_id == "TASK-03":
             (src_dir / "client.py").write_text(
                 "class ClientConfig:\n"
-                "    def __init__(self, endpoint: str = 'https://api.example.com', timeout_seconds: float = 30.0):\n"
+                "    def __init__(self, base_url: str, retries: int = 3, timeout_seconds: float = 30.0):\n"
                 "        if timeout_seconds <= 0:\n"
                 "            raise ValueError('timeout_seconds must be positive')\n"
-                "        self.endpoint = endpoint\n"
+                "        self.base_url = base_url\n"
+                "        self.retries = retries\n"
                 "        self.timeout_seconds = float(timeout_seconds)\n",
                 encoding="utf-8",
             )
@@ -119,31 +120,31 @@ class MockSUTAdapter(BaseSUTAdapter):
                 "from collections import OrderedDict\n"
                 "from src.cache_interface import CacheInterface\n\n"
                 "class LRUCache(CacheInterface):\n"
-                "    def __init__(self, capacity: int = 10):\n"
-                "        self.capacity = capacity\n"
-                "        self.cache = OrderedDict()\n"
+                "    def __init__(self, max_size: int = 2):\n"
+                "        self.max_size = max_size\n"
+                "        self.data = OrderedDict()\n"
                 "    def get(self, key: str):\n"
-                "        if key not in self.cache:\n"
+                "        if key not in self.data:\n"
                 "            return None\n"
-                "        self.cache.move_to_end(key)\n"
-                "        return self.cache[key]\n"
-                "    def put(self, key: str, value):\n"
-                "        if key in self.cache:\n"
-                "            self.cache.move_to_end(key)\n"
-                "        self.cache[key] = value\n"
-                "        if len(self.cache) > self.capacity:\n"
-                "            self.cache.popitem(last=False)\n",
+                "        self.data.move_to_end(key)\n"
+                "        return self.data[key]\n"
+                "    def set(self, key: str, value):\n"
+                "        if key in self.data:\n"
+                "            self.data.move_to_end(key)\n"
+                "        self.data[key] = value\n"
+                "        if len(self.data) > self.max_size:\n"
+                "            self.data.popitem(last=False)\n",
                 encoding="utf-8",
             )
             (src_dir / "store.py").write_text(
                 "from src.lru_cache import LRUCache\n\n"
                 "class Store:\n"
-                "    def __init__(self, capacity: int = 10):\n"
-                "        self.cache = LRUCache(capacity)\n"
-                "    def set(self, k, v):\n"
-                "        self.cache.put(k, v)\n"
-                "    def get(self, k):\n"
-                "        return self.cache.get(k)\n",
+                "    def __init__(self, max_size: int = 2):\n"
+                "        self.cache = LRUCache(max_size=max_size)\n"
+                "    def save(self, key: str, val):\n"
+                "        self.cache.set(key, val)\n"
+                "    def load(self, key: str):\n"
+                "        return self.cache.get(key)\n",
                 encoding="utf-8",
             )
         elif task_id == "TASK-05":
@@ -152,34 +153,31 @@ class MockSUTAdapter(BaseSUTAdapter):
                 "from typing import Optional\n\n"
                 "@dataclass\n"
                 "class FeeOptions:\n"
-                "    discount_rate: float = 0.0\n"
-                "    waive_tax: bool = False\n\n"
-                "def calculate_fee(amount: float, tax_rate: float = 0.05, options: Optional[FeeOptions] = None) -> float:\n"
-                "    opts = options or FeeOptions()\n"
-                "    rate = 0.0 if opts.waive_tax else tax_rate\n"
-                "    subtotal = amount * (1.0 - opts.discount_rate)\n"
-                "    return subtotal * (1.0 + rate)\n",
+                "    rate: float = 0.1\n"
+                "    discount: float = 0.0\n\n"
+                "def calculate_fee(amount: float, rate: float = 0.1, discount: float = 0.0, options: Optional[FeeOptions] = None) -> float:\n"
+                "    if options is not None:\n"
+                "        return (amount * options.rate) - options.discount\n"
+                "    return (amount * rate) - discount\n",
                 encoding="utf-8",
             )
         elif task_id == "TASK-06":
             (src_dir / "shared_utils.py").write_text(
                 "import re\n\n"
-                "def sanitize_identifier(raw: str) -> str:\n"
-                "    return re.sub(r'[^a-zA-Z0-9_]', '', raw).lower()\n",
+                "def sanitize_identifier(val: str) -> str:\n"
+                "    return re.sub(r'[^a-zA-Z0-9_-]', '', val).lower().strip()\n",
                 encoding="utf-8",
             )
             (src_dir / "user_service.py").write_text(
                 "from src.shared_utils import sanitize_identifier\n\n"
-                "class UserService:\n"
-                "    def clean_username(self, name: str) -> str:\n"
-                "        return sanitize_identifier(name)\n",
+                "def register_user(name: str):\n"
+                "    return {'user_id': sanitize_identifier(name)}\n",
                 encoding="utf-8",
             )
             (src_dir / "item_service.py").write_text(
                 "from src.shared_utils import sanitize_identifier\n\n"
-                "class ItemService:\n"
-                "    def clean_sku(self, sku: str) -> str:\n"
-                "        return sanitize_identifier(sku)\n",
+                "def register_item(sku: str):\n"
+                "    return {'sku': sanitize_identifier(sku)}\n",
                 encoding="utf-8",
             )
         elif task_id == "TASK-07":

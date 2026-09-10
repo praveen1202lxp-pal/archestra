@@ -9,6 +9,7 @@ Implements:
 """
 
 import ast
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -21,6 +22,34 @@ from benchmarks.schema import BenchmarkScore, BenchmarkTask, ScoringResult
 HIDDEN_EVALUATORS_DIR = Path(__file__).parent / "hidden_evaluators"
 
 
+class ArtifactPolicy:
+    """Defines files and directories that are ignored during scope checking (deterministic runtime artifacts)."""
+
+    IGNORED_PATTERNS = [
+        "__pycache__/*",
+        "*/__pycache__/*",
+        "*.pyc",
+        "*.pyo",
+        ".pytest_cache/*",
+        "*/.pytest_cache/*",
+        ".coverage*",
+        "tests/_hidden_eval.py",
+        ".gitignore",
+        ".git/*",
+        "*/.git/*",
+    ]
+
+    @classmethod
+    def is_ignored(cls, path_str: str) -> bool:
+        norm = path_str.replace("\\", "/")
+        if norm.startswith("./"):
+            norm = norm[2:]
+        for pat in cls.IGNORED_PATTERNS:
+            if fnmatch.fnmatch(norm, pat) or fnmatch.fnmatch(Path(norm).name, pat):
+                return True
+        return False
+
+
 class ScopeOracle:
     """Evaluates whether changes adhere to task-specific file path constraints."""
 
@@ -30,24 +59,61 @@ class ScopeOracle:
         required_paths: List[str],
         allowed_paths: List[str],
         forbidden_paths: List[str],
-    ) -> Tuple[bool, List[str], List[str], List[str]]:
+        protected_paths: Optional[List[str]] = None,
+        allowed_new_test_paths: Optional[List[str]] = None,
+        allowed_source_paths: Optional[List[str]] = None,
+    ) -> Tuple[bool, List[str], List[str], List[str], List[str]]:
         """Evaluate file scope.
         
         Returns:
-            (scope_violated, forbidden_touched, unintended_files, missing_required)
+            (scope_violated, forbidden_touched, unintended_files, missing_required, protected_test_mutations)
         """
-        touched_set = set(p.replace("\\", "/") for p in files_touched)
+        protected_set = set(p.replace("\\", "/") for p in (protected_paths or []))
+        new_test_patterns = allowed_new_test_paths or []
+        allowed_src_set = set(p.replace("\\", "/") for p in (allowed_source_paths or []))
+
+        # Filter out ignored deterministic runtime/evaluator artifacts
+        meaningful_touched = [
+            p.replace("\\", "/") for p in files_touched if not ArtifactPolicy.is_ignored(p)
+        ]
+        touched_set = set(meaningful_touched)
+
         required_set = set(p.replace("\\", "/") for p in required_paths)
         allowed_set = set(p.replace("\\", "/") for p in allowed_paths)
         forbidden_set = set(p.replace("\\", "/") for p in forbidden_paths)
 
-        permitted_set = required_set | allowed_set
-        forbidden_touched = sorted(list(touched_set & forbidden_set))
-        unintended_files = sorted(list(touched_set - permitted_set))
+        # Base permitted paths
+        permitted_set = required_set | allowed_set | allowed_src_set
+
+        # Check for mutations to protected preexisting tests/files
+        protected_test_mutations = sorted(list(touched_set & protected_set))
+
+        # Check for forbidden paths
+        forbidden_touched_list = []
+        for p in touched_set:
+            if p in forbidden_set:
+                forbidden_touched_list.append(p)
+            else:
+                for f_pat in forbidden_set:
+                    if fnmatch.fnmatch(p, f_pat):
+                        forbidden_touched_list.append(p)
+                        break
+        forbidden_touched = sorted(list(set(forbidden_touched_list)))
+
+        # Unintended files are touched files that are not permitted and don't match allowed new test patterns
+        unintended_list = []
+        for p in touched_set:
+            if p in permitted_set:
+                continue
+            matches_new_test = any(fnmatch.fnmatch(p, pat) for pat in new_test_patterns)
+            if not matches_new_test:
+                unintended_list.append(p)
+        unintended_files = sorted(list(set(unintended_list)))
+
         missing_required = sorted(list(required_set - touched_set))
 
-        scope_violated = bool(forbidden_touched or unintended_files or missing_required)
-        return scope_violated, forbidden_touched, unintended_files, missing_required
+        scope_violated = bool(forbidden_touched or unintended_files or missing_required or protected_test_mutations)
+        return scope_violated, forbidden_touched, unintended_files, missing_required, protected_test_mutations
 
 
 class SyntaxValidator:
@@ -113,20 +179,26 @@ class BenchmarkEvaluator:
         """Run complete post-exit evaluation sequence."""
         failure_reasons = []
 
-        # 1. AST Syntax Check
-        syntax_valid, syntax_errors = SyntaxValidator.validate_files(repo_path, files_touched)
+        # 1. AST Syntax Check on non-ignored files
+        meaningful_files = [f for f in files_touched if not ArtifactPolicy.is_ignored(f)]
+        syntax_valid, syntax_errors = SyntaxValidator.validate_files(repo_path, meaningful_files)
         if not syntax_valid:
             failure_reasons.extend(syntax_errors)
 
         # 2. SUT-Independent Scope Oracle
-        scope_violated, forbidden_touched, unintended_files, missing_required = ScopeOracle.evaluate(
+        scope_violated, forbidden_touched, unintended_files, missing_required, protected_mutations = ScopeOracle.evaluate(
             files_touched=files_touched,
             required_paths=task.required_paths,
             allowed_paths=task.allowed_paths,
             forbidden_paths=task.forbidden_paths,
+            protected_paths=task.protected_paths,
+            allowed_new_test_paths=task.allowed_new_test_paths,
+            allowed_source_paths=task.allowed_source_paths,
         )
         if forbidden_touched:
             failure_reasons.append(f"Modified forbidden paths: {forbidden_touched}")
+        if protected_mutations:
+            failure_reasons.append(f"Modified protected test/source paths: {protected_mutations}")
         if unintended_files:
             failure_reasons.append(f"Modified unintended paths: {unintended_files}")
         if missing_required:
@@ -183,21 +255,23 @@ class BenchmarkEvaluator:
             and hidden_tests_passed
             and regressions_passed
             and not forbidden_touched
+            and not protected_mutations
             and not unintended_files
             and not missing_required
         ):
             score = BenchmarkScore.PASS
-        # FAIL: Syntax error, touched forbidden paths, missing required when hidden tests failed, or both hidden and visible failed
+        # FAIL: Syntax error, touched forbidden paths, protected test mutations, missing required when hidden tests failed, or both hidden and visible failed
         elif (
             not syntax_valid
             or bool(forbidden_touched)
+            or bool(protected_mutations)
             or (not hidden_tests_passed and bool(missing_required))
             or (not hidden_tests_passed and not task_tests_passed)
         ):
             score = BenchmarkScore.FAIL
         # PARTIAL: Core task passes but has non-catastrophic scope violation or minor regressions
         elif (hidden_tests_passed and (unintended_files or not regressions_passed)) or (
-            task_tests_passed and not hidden_tests_passed and not forbidden_touched and not missing_required
+            task_tests_passed and not hidden_tests_passed and not forbidden_touched and not protected_mutations and not missing_required
         ):
             score = BenchmarkScore.PARTIAL
         else:
@@ -212,7 +286,8 @@ class BenchmarkEvaluator:
             regressions_count=regressions_count,
             regressions_passed=regressions_passed,
             syntax_valid=syntax_valid,
-            files_touched=files_touched,
+            scope_valid=not scope_violated,
+            files_touched=meaningful_files,
             scope_violated=scope_violated,
             unintended_files=unintended_files,
             verification_exit_code=0 if score == BenchmarkScore.PASS else 1,

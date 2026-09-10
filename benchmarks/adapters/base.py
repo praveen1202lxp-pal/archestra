@@ -14,13 +14,15 @@ class AdapterRunTelemetry:
     system_under_test: SystemUnderTest
     wall_clock_duration_seconds: float = 0.0
     active_provider_duration_seconds: float = 0.0
+    verification_duration_seconds: Optional[float] = None
     
     # Token Telemetry
-    native_input_tokens: int = 0
-    native_output_tokens: int = 0
+    native_input_tokens: Optional[int] = None
+    native_output_tokens: Optional[int] = None
     native_reasoning_tokens: Optional[int] = None
     fusion_controlled_context_tokens: Optional[int] = None
     provider_calls_count: int = 0
+    provider_stages: List[str] = field(default_factory=list)
     mcp_calls_count: int = 0
     
     # Provenance

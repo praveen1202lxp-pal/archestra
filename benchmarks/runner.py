@@ -28,10 +28,12 @@ from benchmarks.schema import (
     BenchmarkRunRecord,
     BenchmarkScore,
     BenchmarkTask,
+    RunExecutionStatus,
     SystemUnderTest,
 )
 from benchmarks.storage import BenchmarkStorage
 from benchmarks.tasks.catalog import (
+    BENCHMARK_SUITE_VERSION,
     BENCHMARK_TASKS,
     compute_benchmark_suite_hash,
     compute_hidden_evaluator_hash,
@@ -172,9 +174,11 @@ class BenchmarkRunner:
             # Verify hidden tests were not created during SUT execution
             assert not (env.repo_path / "tests" / "_hidden_eval.py").exists(), "Hidden test created during SUT execution"
 
-            # 3. Capture changes
-            files_touched = env.get_touched_files()
-            git_diff = env.capture_diff()
+            # 3. Capture & freeze candidate state immediately on SUT exit before hidden evaluator injection
+            sut_touched_files, sut_git_diff, sut_candidate_tree_hash = env.freeze_sut_candidate_state()
+            files_touched = sut_touched_files
+            git_diff = sut_git_diff
+            sut_tree_hash = sut_candidate_tree_hash
 
             # 4. Objective Review Evaluation against pre-registered defect criteria
             pre_review_failed, mapped_criteria, reviewer_found_valid = self.evaluator.evaluate_pre_review_criteria(
@@ -184,22 +188,33 @@ class BenchmarkRunner:
             )
 
             # 5. Hidden Acceptance & Scope Oracle Evaluation (Materialized ONLY post-exit)
-            scoring = self.evaluator.evaluate_task(task, env.repo_path, files_touched)
+            scoring = self.evaluator.evaluate_task(task, env.repo_path, sut_touched_files)
 
-            # Check for infrastructure failure vs engineering failure
-            final_score = scoring.score
-            if telemetry.error_message and any(
-                x in telemetry.error_message.lower()
-                for x in ["rate limit", "transport", "auth", "unauthenticated", "not logged in", "connection error"]
-            ):
+            # 6. Orthogonal Execution Status vs Patch Correctness Separation
+            err_lower = (telemetry.error_message or "").lower()
+            if "timed out" in err_lower or "timeout" in err_lower:
+                run_status = RunExecutionStatus.TIMEOUT
+                # Candidate correctness is independently evaluated regardless of timeout
+                final_score = scoring.score
+            elif any(x in err_lower for x in ["auth", "not logged in", "unauthenticated", "invalid credentials", "login required"]):
+                run_status = RunExecutionStatus.AUTH_FAILURE
                 final_score = BenchmarkScore.INFRASTRUCTURE_FAILURE
+            elif any(x in err_lower for x in ["rate limit", "quota", "provider unavailable", "service unavailable"]):
+                run_status = RunExecutionStatus.PROVIDER_UNAVAILABLE
+                final_score = BenchmarkScore.INFRASTRUCTURE_FAILURE
+            elif any(x in err_lower for x in ["transport", "connection error", "network", "connection refused", "econnrefused"]):
+                run_status = RunExecutionStatus.INFRASTRUCTURE_FAILURE
+                final_score = BenchmarkScore.INFRASTRUCTURE_FAILURE
+            else:
+                run_status = RunExecutionStatus.COMPLETED
+                final_score = scoring.score
 
             # Verify hidden test was cleanly unlinked post-exit
             assert not (env.repo_path / "tests" / "_hidden_eval.py").exists(), "Hidden test left behind after evaluation"
 
         end_utc = datetime.now(timezone.utc).isoformat()
 
-        # 6. Token metrics: calculate estimated provider overhead residual
+        # 7. Token metrics: calculate estimated provider overhead residual
         residual = None
         if telemetry.native_input_tokens and telemetry.fusion_controlled_context_tokens is not None:
             residual = telemetry.native_input_tokens - telemetry.fusion_controlled_context_tokens
@@ -212,10 +227,10 @@ class BenchmarkRunner:
             and telemetry.repair_rounds > 0
         )
 
-        # 7. Assemble complete persistent run record
+        # 8. Assemble complete persistent run record
         record = BenchmarkRunRecord(
             run_id=run_id,
-            benchmark_suite_version="1.0.0",
+            benchmark_suite_version=BENCHMARK_SUITE_VERSION,
             benchmark_suite_hash=suite_hash,
             task_definition_hash=task_hash,
             hidden_evaluator_hash=hidden_hash,
@@ -224,6 +239,11 @@ class BenchmarkRunner:
             category=task.category.value,
             system_under_test=sut,
             repetition_index=repetition_index,
+            run_status=run_status,
+            validity_disposition="VALID",
+            invalidation_reasons=[],
+            execution_mode="LIVE" if self.is_live else "MOCK",
+            experiment_phase="PHASE_B_PILOT" if self.is_live else "MOCK_VALIDATION",
             start_time=start_utc,
             end_time=end_utc,
             wall_clock_duration_seconds=telemetry.wall_clock_duration_seconds,
@@ -241,6 +261,12 @@ class BenchmarkRunner:
             files_touched=files_touched,
             unintended_files=scoring.unintended_files,
             git_diff=git_diff,
+            sut_tree_hash=sut_tree_hash,
+            sut_candidate_tree_hash=sut_candidate_tree_hash,
+            sut_git_diff=sut_git_diff,
+            sut_touched_files=sut_touched_files,
+            verification_duration_seconds=telemetry.verification_duration_seconds,
+            provider_stages=telemetry.provider_stages,
             reviewer_verdict=telemetry.reviewer_verdict,
             reviewer_found_defect=telemetry.reviewer_found_defect,
             reviewer_found_valid_defect=reviewer_found_valid,

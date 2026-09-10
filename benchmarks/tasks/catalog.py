@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 from benchmarks.schema import BenchmarkCategory, BenchmarkTask
 
 
+BENCHMARK_SUITE_VERSION = "1.1.0"
+
 BENCHMARK_TASKS: List[BenchmarkTask] = [
     # 1. Simple single-file bug fix
     BenchmarkTask(
@@ -24,6 +26,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/pagination.py"],
         allowed_paths=["src/pagination.py"],
         forbidden_paths=["src/critical_auth.py", "config.json"],
+        allowed_source_paths=["src/pagination.py"],
+        protected_paths=["tests/test_pagination.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         registered_defect_criteria=["criterion_last_page_boundary", "criterion_empty_list"],
         timeout_seconds=120.0,
     ),
@@ -41,6 +46,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/serializer.py"],
         allowed_paths=["src/serializer.py"],
         forbidden_paths=["src/database.py"],
+        allowed_source_paths=["src/serializer.py"],
+        protected_paths=["tests/test_serializer.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=120.0,
     ),
     # 3. Small feature addition
@@ -57,6 +65,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/client.py"],
         allowed_paths=["src/client.py"],
         forbidden_paths=["tests/test_client.py"],
+        allowed_source_paths=["src/client.py"],
+        protected_paths=["tests/test_client.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=120.0,
     ),
     # 4. Multi-file feature
@@ -73,6 +84,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/lru_cache.py", "src/store.py"],
         allowed_paths=["src/lru_cache.py", "src/store.py"],
         forbidden_paths=["src/cache_interface.py"],
+        allowed_source_paths=["src/lru_cache.py", "src/store.py"],
+        protected_paths=["src/cache_interface.py", "tests/test_cache.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=180.0,
     ),
     # 5. API/interface change
@@ -89,6 +103,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/billing.py"],
         allowed_paths=["src/billing.py"],
         forbidden_paths=["src/payment_gateway.py"],
+        allowed_source_paths=["src/billing.py"],
+        protected_paths=["tests/test_billing.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=150.0,
     ),
     # 6. Refactor
@@ -105,6 +122,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/shared_utils.py", "src/user_service.py", "src/item_service.py"],
         allowed_paths=["src/shared_utils.py", "src/user_service.py", "src/item_service.py"],
         forbidden_paths=["tests/test_services.py"],
+        allowed_source_paths=["src/shared_utils.py", "src/user_service.py", "src/item_service.py"],
+        protected_paths=["tests/test_services.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=150.0,
     ),
     # 7. Edge-case bug
@@ -121,6 +141,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/session_manager.py"],
         allowed_paths=["src/session_manager.py"],
         forbidden_paths=["src/auth.py"],
+        allowed_source_paths=["src/session_manager.py"],
+        protected_paths=["tests/test_session_manager.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         registered_defect_criteria=["criterion_dict_size_change_during_iteration"],
         timeout_seconds=120.0,
     ),
@@ -138,6 +161,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["tests/test_rate_limiter.py"],
         allowed_paths=["tests/test_rate_limiter.py"],
         forbidden_paths=["src/rate_limiter.py"],
+        allowed_source_paths=[],
+        protected_paths=["src/rate_limiter.py"],
+        allowed_new_test_paths=["tests/test_rate_limiter.py", "tests/test_*.py"],
         timeout_seconds=150.0,
     ),
     # 9. Architecture/design task
@@ -154,6 +180,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/notifier.py"],
         allowed_paths=["src/notifier.py"],
         forbidden_paths=["tests/test_notifier.py"],
+        allowed_source_paths=["src/notifier.py"],
+        protected_paths=["tests/test_notifier.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=180.0,
     ),
     # 10. Multi-step dependent task
@@ -170,6 +199,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/db_schema.py", "src/models.py", "src/repo.py"],
         allowed_paths=["src/db_schema.py", "src/models.py", "src/repo.py"],
         forbidden_paths=["src/unrelated_audit.py"],
+        allowed_source_paths=["src/db_schema.py", "src/models.py", "src/repo.py"],
+        protected_paths=["tests/test_repo.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         timeout_seconds=200.0,
     ),
     # 11. Resource lifecycle management (Neutralized)
@@ -186,6 +218,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/network_client.py"],
         allowed_paths=["src/network_client.py"],
         forbidden_paths=["src/tls.py"],
+        allowed_source_paths=["src/network_client.py"],
+        protected_paths=["tests/test_network.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         registered_defect_criteria=["criterion_socket_resource_leak_on_failure"],
         timeout_seconds=150.0,
     ),
@@ -209,6 +244,9 @@ BENCHMARK_TASKS: List[BenchmarkTask] = [
         required_paths=["src/markdown_parser.py"],
         allowed_paths=["src/markdown_parser.py"],
         forbidden_paths=["src/html_sanitizer.py"],
+        allowed_source_paths=["src/markdown_parser.py"],
+        protected_paths=["tests/test_markdown.py"],
+        allowed_new_test_paths=["tests/test_*.py"],
         registered_defect_criteria=["criterion_trailing_hashes_stripped"],
         timeout_seconds=150.0,
         mcp_context={
@@ -251,8 +289,8 @@ def compute_hidden_evaluator_hash(task: BenchmarkTask) -> str:
 
 
 def compute_benchmark_suite_hash() -> str:
-    """Compute overall suite hash binding task definitions and hidden evaluators."""
-    all_elements = []
+    """Compute overall suite hash binding suite version, task definitions, and hidden evaluators."""
+    all_elements = [f"suite_version:{BENCHMARK_SUITE_VERSION}"]
     for t in BENCHMARK_TASKS:
         t_hash = compute_task_definition_hash(t)
         h_hash = compute_hidden_evaluator_hash(t)
@@ -270,6 +308,12 @@ def setup_task_fixtures(task_id: str, target_dir: Path) -> None:
     tests_dir = target_dir / "tests"
     src_dir.mkdir(parents=True, exist_ok=True)
     tests_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write standard .gitignore to isolate transient and evaluator artifacts
+    (target_dir / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n*.pyo\n.pytest_cache/\n.coverage*\ntests/_hidden_eval.py\n",
+        encoding="utf-8",
+    )
 
     if task_id == "TASK-01":
         (src_dir / "pagination.py").write_text(
@@ -307,9 +351,11 @@ def setup_task_fixtures(task_id: str, target_dir: Path) -> None:
             '    assert res["username"] == "alice"\n'
             '    assert res["email"] == "alice@ex.com"\n\n'
             'def test_null_fields_repro():\n'
-            '    # Visible reproduction test\n'
-            '    with pytest.raises(AttributeError):\n'
-            '        serialize_user({"username": "Bob", "email": None, "bio": None})\n',
+            '    # Visible reproduction test: optional fields must not raise AttributeError\n'
+            '    res = serialize_user({"username": "Bob", "email": None, "bio": None})\n'
+            '    assert res["username"] == "bob"\n'
+            '    assert res["email"] is None\n'
+            '    assert res["bio"] is None\n',
             encoding="utf-8",
         )
 
@@ -352,14 +398,14 @@ def setup_task_fixtures(task_id: str, target_dir: Path) -> None:
             encoding="utf-8",
         )
         (src_dir / "store.py").write_text(
-            'from src.lru_cache import LRUCache\n\n'
             'class Store:\n'
             '    def __init__(self, max_size: int = 2):\n'
-            '        self.cache = LRUCache(max_size=max_size)\n'
+            '        self.max_size = max_size\n'
+            '        self.raw_data = {}\n'
             '    def save(self, key: str, val):\n'
-            '        self.cache.set(key, val)\n'
+            '        self.raw_data[key] = val\n'
             '    def load(self, key: str):\n'
-            '        return self.cache.get(key)\n',
+            '        return self.raw_data.get(key)\n',
             encoding="utf-8",
         )
         (tests_dir / "test_cache.py").write_text(

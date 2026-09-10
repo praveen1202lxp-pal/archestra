@@ -36,7 +36,7 @@ def test_antigravity_cli_detection_localappdata_resolution():
         provider = AntigravityCLIProvider(name="test_agy")
         exe = provider._resolve_executable()
         assert exe is not None
-        assert "agy.exe" in exe
+        assert "agy.exe" in exe.lower()
 
 
 def test_antigravity_cli_custom_executable_path():

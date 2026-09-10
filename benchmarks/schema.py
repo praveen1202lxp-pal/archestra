@@ -37,6 +37,23 @@ class BenchmarkScore(str, Enum):
     INFRASTRUCTURE_FAILURE = "INFRASTRUCTURE_FAILURE"
 
 
+class RunExecutionStatus(str, Enum):
+    """SUT execution process status separated from patch correctness."""
+    COMPLETED = "COMPLETED"
+    TIMEOUT = "TIMEOUT"
+    INFRASTRUCTURE_FAILURE = "INFRASTRUCTURE_FAILURE"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    HARNESS_FAILURE = "HARNESS_FAILURE"
+
+
+class ValidityDisposition(str, Enum):
+    """Benchmark run validity disposition ensuring auditability without silent mixing."""
+    VALID = "VALID"
+    INVALIDATED_METHODOLOGY = "INVALIDATED_METHODOLOGY"
+    INVALIDATED_INFRASTRUCTURE = "INVALIDATED_INFRASTRUCTURE"
+
+
 @dataclass
 class BenchmarkTask:
     """Specification of an engineering task in the benchmark catalog.
@@ -60,6 +77,11 @@ class BenchmarkTask:
     required_paths: List[str] = field(default_factory=list)
     allowed_paths: List[str] = field(default_factory=list)
     forbidden_paths: List[str] = field(default_factory=list)
+
+    # Test Modification Policy (Phase B.1)
+    protected_paths: List[str] = field(default_factory=list)
+    allowed_new_test_paths: List[str] = field(default_factory=list)
+    allowed_source_paths: List[str] = field(default_factory=list)
     
     # Pre-registered defect/acceptance criteria for objective cross-model review scoring
     registered_defect_criteria: List[str] = field(default_factory=list)
@@ -72,12 +94,23 @@ class BenchmarkTask:
         data["category"] = self.category.value
         return data
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "BenchmarkTask":
-        d = dict(data)
-        if isinstance(d.get("category"), str):
-            d["category"] = BenchmarkCategory(d["category"])
-        return cls(**d)
+
+@dataclass
+class SyntaxValidationResult:
+    """Result of syntax/parse check on modified files."""
+    valid: bool
+    invalid_files: List[str] = field(default_factory=list)
+    error_messages: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ScopeOracleResult:
+    """Result of evaluating modified files against SUT-independent path constraints."""
+    passed: bool
+    required_missing: List[str] = field(default_factory=list)
+    unintended_files: List[str] = field(default_factory=list)
+    forbidden_modified: List[str] = field(default_factory=list)
+    protected_test_mutations: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,9 +119,10 @@ class ScoringResult:
     score: BenchmarkScore
     task_tests_passed: bool
     hidden_tests_passed: bool
-    regressions_count: int
-    regressions_passed: bool
-    syntax_valid: bool
+    regressions_count: int = 0
+    regressions_passed: bool = True
+    syntax_valid: bool = True
+    scope_valid: bool = True
     files_touched: List[str] = field(default_factory=list)
     scope_violated: bool = False
     unintended_files: List[str] = field(default_factory=list)
@@ -105,12 +139,15 @@ class ScoringResult:
         return data
 
 
+TaskScoringResult = ScoringResult
+
+
 @dataclass
 class BenchmarkRunRecord:
-    """Persistent execution record with complete provenance and telemetry."""
+    """Persistent execution record with complete provenance, telemetry, and validity audit trail."""
     # Provenance & Suite Versioning
     run_id: str
-    benchmark_suite_version: str = "1.0.0"
+    benchmark_suite_version: str = "1.1.0"
     benchmark_suite_hash: str = ""
     task_definition_hash: str = ""
     hidden_evaluator_hash: str = ""
@@ -120,6 +157,13 @@ class BenchmarkRunRecord:
     system_under_test: SystemUnderTest = SystemUnderTest.FUSION
     repetition_index: int = 0
     
+    # Execution Status & Validity Audit Trail (Phase B.1)
+    run_status: RunExecutionStatus = RunExecutionStatus.COMPLETED
+    validity_disposition: str = ValidityDisposition.VALID.value
+    invalidation_reasons: List[str] = field(default_factory=list)
+    execution_mode: str = "MOCK"  # "MOCK" | "LIVE"
+    experiment_phase: str = "PHASE_B_PILOT"
+
     # Environment & Timestamps
     start_time: str = ""
     end_time: str = ""
@@ -140,7 +184,13 @@ class BenchmarkRunRecord:
     files_touched: List[str] = field(default_factory=list)
     unintended_files: List[str] = field(default_factory=list)
     git_diff: str = ""
-    
+    sut_tree_hash: Optional[str] = None
+
+    # Candidate Snapshot Fields (Phase B.1)
+    sut_candidate_tree_hash: Optional[str] = None
+    sut_git_diff: Optional[str] = None
+    sut_touched_files: List[str] = field(default_factory=list)
+
     # Objective Cross-Model Review Value (Fusion)
     reviewer_verdict: Optional[str] = None
     reviewer_found_defect: bool = False
@@ -158,11 +208,13 @@ class BenchmarkRunRecord:
     
     # Token Telemetry (Separately tracked)
     fusion_controlled_context_tokens: Optional[int] = None
-    native_input_tokens: int = 0
-    native_output_tokens: int = 0
+    native_input_tokens: Optional[int] = None
+    native_output_tokens: Optional[int] = None
     native_reasoning_tokens: Optional[int] = None
     provider_managed_overhead_residual: Optional[int] = None
     provider_calls_count: int = 0
+    provider_stages: List[str] = field(default_factory=list)
+    verification_duration_seconds: Optional[float] = None
     mcp_calls_count: int = 0
     
     # Operational Signals
@@ -170,8 +222,26 @@ class BenchmarkRunRecord:
     policy_denials: int = 0
     error_message: Optional[str] = None
 
+    def __post_init__(self):
+        # Synchronize candidate aliases
+        if self.sut_candidate_tree_hash is None and self.sut_tree_hash is not None:
+            self.sut_candidate_tree_hash = self.sut_tree_hash
+        elif self.sut_tree_hash is None and self.sut_candidate_tree_hash is not None:
+            self.sut_tree_hash = self.sut_candidate_tree_hash
+
+        if self.sut_git_diff is None and self.git_diff:
+            self.sut_git_diff = self.git_diff
+        elif not self.git_diff and self.sut_git_diff:
+            self.git_diff = self.sut_git_diff
+
+        if not self.sut_touched_files and self.files_touched:
+            self.sut_touched_files = list(self.files_touched)
+        elif not self.files_touched and self.sut_touched_files:
+            self.files_touched = list(self.sut_touched_files)
+
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["system_under_test"] = self.system_under_test.value
         data["score"] = self.score.value
+        data["run_status"] = self.run_status.value if isinstance(self.run_status, RunExecutionStatus) else str(self.run_status)
         return data
