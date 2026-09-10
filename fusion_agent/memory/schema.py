@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 
 CREATE TABLE IF NOT EXISTS plan_steps (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     plan_id TEXT NOT NULL,
     step_index INTEGER NOT NULL,
     objective TEXT NOT NULL,
@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS plan_steps (
     repair_rounds INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT,
+    PRIMARY KEY (plan_id, id),
     FOREIGN KEY(plan_id) REFERENCES plans(id)
 );
 

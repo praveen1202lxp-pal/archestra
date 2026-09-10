@@ -43,6 +43,38 @@ class Database:
                 except sqlite3.OperationalError:
                     pass
 
+            # Migrate plan_steps to composite primary key (plan_id, id) if needed
+            try:
+                pk_cols = [r[1] for r in conn.execute("PRAGMA table_info(plan_steps)") if r[5] > 0]
+                if pk_cols == ["id"]:
+                    conn.execute("""
+                        CREATE TABLE plan_steps_mig (
+                            id TEXT NOT NULL,
+                            plan_id TEXT NOT NULL,
+                            step_index INTEGER NOT NULL,
+                            objective TEXT NOT NULL,
+                            rationale TEXT,
+                            expected_files TEXT,
+                            expected_symbols TEXT,
+                            dependencies TEXT,
+                            verification_expectations TEXT,
+                            risk_level TEXT NOT NULL,
+                            estimated_complexity TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            provider_name TEXT,
+                            repair_rounds INTEGER DEFAULT 0,
+                            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                            completed_at TEXT,
+                            PRIMARY KEY (plan_id, id),
+                            FOREIGN KEY(plan_id) REFERENCES plans(id)
+                        );
+                    """)
+                    conn.execute("INSERT OR IGNORE INTO plan_steps_mig SELECT * FROM plan_steps;")
+                    conn.execute("DROP TABLE plan_steps;")
+                    conn.execute("ALTER TABLE plan_steps_mig RENAME TO plan_steps;")
+            except sqlite3.OperationalError:
+                pass
+
             cursor = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;")
             row = cursor.fetchone()
             if not row:
