@@ -770,24 +770,74 @@ class FusionOrchestrator:
                     worktree_path=session.worktree_path,
                 )
                 if not val_ok:
-                    emit("status", {"message": f"Security Notice: Rejected unsafe verification expectation: {val_err}"})
-                    step_verif = VerificationResult(
-                        passed=False,
-                        exit_code=-1,
-                        stdout="",
-                        stderr=f"Security Policy: Rejected verification expectation: {val_err}",
-                        duration_seconds=0.0,
-                        command="",
-                    )
+                    if "does not exist in worktree" in (val_err or ""):
+                        emit("status", {"message": f"Notice: Step test expectation '{step.verification_expectations}' not yet present in worktree; verifying syntax of modified files."})
+                        py_files = [f for f in step_modified_files if f.endswith(".py")]
+                        syntax_passed = True
+                        syntax_err = ""
+                        for pf in py_files:
+                            comp_res = broker.run_command(f"python -m py_compile {pf}", cwd=session.worktree_path)
+                            if comp_res.returncode != 0:
+                                syntax_passed = False
+                                syntax_err = comp_res.stderr or comp_res.stdout
+                                break
+                        step_verif = VerificationResult(
+                            passed=syntax_passed,
+                            exit_code=0 if syntax_passed else 1,
+                            stdout="Step syntax verification passed." if syntax_passed else "",
+                            stderr=syntax_err,
+                            duration_seconds=0.1,
+                            command="py_compile",
+                        )
+                    else:
+                        emit("status", {"message": f"Security Notice: Rejected unsafe verification expectation: {val_err}"})
+                        step_verif = VerificationResult(
+                            passed=False,
+                            exit_code=-1,
+                            stdout="",
+                            stderr=f"Security Policy: Rejected verification expectation: {val_err}",
+                            duration_seconds=0.0,
+                            command="",
+                        )
                 else:
                     trusted_runner = verifier.detect_trusted_test_command(session.repo_root)
                     if trusted_runner:
                         test_cmd = f"{trusted_runner} {step.verification_expectations.strip()}"
+                    elif self.config.verification_command:
+                        test_cmd = f"{self.config.verification_command} {step.verification_expectations.strip()}"
                     else:
                         test_cmd = self.config.verification_command
                     step_verif = verifier.run_tests(session, test_command=test_cmd, broker=broker)
+            elif self.config.verification_command:
+                test_cmd = self.config.verification_command
+                step_verif = verifier.run_tests(session, test_command=test_cmd, broker=broker)
             else:
-                step_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+                trusted_runner = verifier.detect_trusted_test_command(session.repo_root)
+                py_files = [f for f in step_modified_files if f.endswith(".py")]
+                test_files_modified = [f for f in step_modified_files if f.startswith("tests/") and f.endswith(".py")]
+                if test_files_modified and trusted_runner:
+                    test_cmd = f"{trusted_runner} {' '.join(test_files_modified)}"
+                    step_verif = verifier.run_tests(session, test_command=test_cmd, broker=broker)
+                elif py_files:
+                    syntax_passed = True
+                    syntax_err = ""
+                    for pf in py_files:
+                        comp_res = broker.run_command(f"python -m py_compile {pf}", cwd=session.worktree_path)
+                        if comp_res.returncode != 0:
+                            syntax_passed = False
+                            syntax_err = comp_res.stderr or comp_res.stdout
+                            break
+                    step_verif = VerificationResult(
+                        passed=syntax_passed,
+                        exit_code=0 if syntax_passed else 1,
+                        stdout="Step syntax verification passed." if syntax_passed else "",
+                        stderr=syntax_err,
+                        duration_seconds=0.1,
+                        command="py_compile",
+                    )
+                else:
+                    test_cmd = None
+                    step_verif = verifier.run_tests(session, test_command=None, broker=broker)
 
             last_verif_result = step_verif
 

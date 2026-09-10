@@ -136,7 +136,8 @@ class PlanEngine:
             f"RULES:\n"
             f"1. Maximum {max_steps} steps. Keep each step small, atomic, and verifiable.\n"
             "2. Dependencies must reference earlier step IDs only.\n"
-            "3. Do not include extraneous markdown commentary outside the JSON block."
+            "3. Do not include extraneous markdown commentary outside the JSON block.\n"
+            "4. verification_expectations must be data (e.g. an existing test file 'tests/test_foo.py'), never shell commands. Leave empty if unit tests will be created in a later step."
         )
 
     def generate_plan(
