@@ -73,6 +73,10 @@ class BenchmarkStorage:
                     repair_rounds INTEGER NOT NULL DEFAULT 0,
                     repair_successful INTEGER NOT NULL DEFAULT 0,
                     human_promotion_disposition TEXT,
+                    pre_review_patch TEXT,
+                    pre_review_test_passed INTEGER,
+                    reviewer_findings TEXT,
+                    repair_patch TEXT,
                     
                     fusion_controlled_context_tokens INTEGER,
                     native_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -88,6 +92,16 @@ class BenchmarkStorage:
                 )
                 """
             )
+            # Automatic schema migration for new review state columns
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(benchmark_runs);").fetchall()}
+            for col, col_type in [
+                ("pre_review_patch", "TEXT"),
+                ("pre_review_test_passed", "INTEGER"),
+                ("reviewer_findings", "TEXT"),
+                ("repair_patch", "TEXT"),
+            ]:
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE benchmark_runs ADD COLUMN {col} {col_type}")
             conn.commit()
 
     def record_run(self, record: BenchmarkRunRecord) -> None:
@@ -107,12 +121,13 @@ class BenchmarkStorage:
                     reviewer_verdict, reviewer_found_defect, reviewer_found_valid_defect,
                     pre_review_criteria_failed_json, reviewer_mapped_defect_criteria_json,
                     defect_in_test_passing_patch, repair_rounds, repair_successful,
-                    human_promotion_disposition, fusion_controlled_context_tokens,
+                    human_promotion_disposition, pre_review_patch, pre_review_test_passed,
+                    reviewer_findings, repair_patch, fusion_controlled_context_tokens,
                     native_input_tokens, native_output_tokens, native_reasoning_tokens,
                     provider_managed_overhead_residual, provider_calls_count, mcp_calls_count,
                     recovery_events, policy_denials, error_message
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -152,6 +167,10 @@ class BenchmarkStorage:
                     record.repair_rounds,
                     1 if record.repair_successful else 0,
                     record.human_promotion_disposition,
+                    record.pre_review_patch,
+                    1 if record.pre_review_test_passed is True else (0 if record.pre_review_test_passed is False else None),
+                    record.reviewer_findings,
+                    record.repair_patch,
                     record.fusion_controlled_context_tokens,
                     record.native_input_tokens,
                     record.native_output_tokens,
@@ -223,6 +242,10 @@ class BenchmarkStorage:
                     repair_rounds=r["repair_rounds"],
                     repair_successful=bool(r["repair_successful"]),
                     human_promotion_disposition=r["human_promotion_disposition"],
+                    pre_review_patch=r["pre_review_patch"] if "pre_review_patch" in r.keys() else None,
+                    pre_review_test_passed=bool(r["pre_review_test_passed"]) if ("pre_review_test_passed" in r.keys() and r["pre_review_test_passed"] is not None) else None,
+                    reviewer_findings=r["reviewer_findings"] if "reviewer_findings" in r.keys() else None,
+                    repair_patch=r["repair_patch"] if "repair_patch" in r.keys() else None,
                     fusion_controlled_context_tokens=r["fusion_controlled_context_tokens"],
                     native_input_tokens=r["native_input_tokens"],
                     native_output_tokens=r["native_output_tokens"],

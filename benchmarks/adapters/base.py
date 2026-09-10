@@ -36,6 +36,10 @@ class AdapterRunTelemetry:
     repair_rounds: int = 0
     repair_successful: bool = False
     human_promotion_disposition: Optional[str] = None
+    pre_review_patch: Optional[str] = None
+    pre_review_test_passed: Optional[bool] = None
+    reviewer_findings: Optional[str] = None
+    repair_patch: Optional[str] = None
     
     # Operational Signals
     recovery_events: int = 0

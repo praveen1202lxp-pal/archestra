@@ -34,6 +34,7 @@ class BenchmarkScore(str, Enum):
     PASS = "PASS"
     PARTIAL = "PARTIAL"
     FAIL = "FAIL"
+    INFRASTRUCTURE_FAILURE = "INFRASTRUCTURE_FAILURE"
 
 
 @dataclass
@@ -150,6 +151,10 @@ class BenchmarkRunRecord:
     repair_rounds: int = 0
     repair_successful: bool = False
     human_promotion_disposition: Optional[str] = None
+    pre_review_patch: Optional[str] = None
+    pre_review_test_passed: Optional[bool] = None
+    reviewer_findings: Optional[str] = None
+    repair_patch: Optional[str] = None
     
     # Token Telemetry (Separately tracked)
     fusion_controlled_context_tokens: Optional[int] = None

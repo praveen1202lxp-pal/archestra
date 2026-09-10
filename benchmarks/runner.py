@@ -186,6 +186,14 @@ class BenchmarkRunner:
             # 5. Hidden Acceptance & Scope Oracle Evaluation (Materialized ONLY post-exit)
             scoring = self.evaluator.evaluate_task(task, env.repo_path, files_touched)
 
+            # Check for infrastructure failure vs engineering failure
+            final_score = scoring.score
+            if telemetry.error_message and any(
+                x in telemetry.error_message.lower()
+                for x in ["rate limit", "transport", "auth", "unauthenticated", "not logged in", "connection error"]
+            ):
+                final_score = BenchmarkScore.INFRASTRUCTURE_FAILURE
+
             # Verify hidden test was cleanly unlinked post-exit
             assert not (env.repo_path / "tests" / "_hidden_eval.py").exists(), "Hidden test left behind after evaluation"
 
@@ -226,7 +234,7 @@ class BenchmarkRunner:
             cli_version=telemetry.cli_version,
             reasoning_effort=telemetry.reasoning_effort,
             fusion_config_hash=telemetry.fusion_config_hash,
-            score=scoring.score,
+            score=final_score,
             verification_passed=scoring.task_tests_passed,
             hidden_tests_passed=scoring.hidden_tests_passed,
             regressions_count=scoring.regressions_count,
@@ -242,6 +250,10 @@ class BenchmarkRunner:
             repair_rounds=telemetry.repair_rounds,
             repair_successful=repair_successful,
             human_promotion_disposition=telemetry.human_promotion_disposition,
+            pre_review_patch=telemetry.pre_review_patch,
+            pre_review_test_passed=telemetry.pre_review_test_passed,
+            reviewer_findings=telemetry.reviewer_findings,
+            repair_patch=telemetry.repair_patch,
             fusion_controlled_context_tokens=telemetry.fusion_controlled_context_tokens,
             native_input_tokens=telemetry.native_input_tokens,
             native_output_tokens=telemetry.native_output_tokens,
