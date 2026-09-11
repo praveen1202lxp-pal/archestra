@@ -6,11 +6,58 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from benchmarks.adapters.base import AdapterRunTelemetry, BaseSUTAdapter
 from benchmarks.schema import BenchmarkTask, SystemUnderTest
 from fusion_agent.providers.codex_cli import CodexCLIProvider
+
+
+def parse_codex_jsonl_events(stdout_text: str) -> Tuple[Optional[int], Optional[int], Optional[int], int]:
+    """Parse JSONL events stream from Codex CLI for token usage and turn count.
+
+    Returns:
+        (input_tokens, output_tokens, reasoning_tokens, turn_count)
+        Unexposed or unparsed metrics are returned as None (NULL), never 0.
+    """
+    total_in: Optional[int] = None
+    total_out: Optional[int] = None
+    total_reasoning: Optional[int] = None
+    turns: int = 0
+
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                continue
+            ev_type = event.get("type")
+            if ev_type == "turn.started":
+                turns += 1
+
+            usage = None
+            if ev_type in ("turn.completed", "turn.finished", "response.completed"):
+                usage = event.get("usage")
+            elif "usage" in event and isinstance(event["usage"], dict):
+                usage = event["usage"]
+
+            if usage and isinstance(usage, dict):
+                in_tok = usage.get("input_tokens")
+                out_tok = usage.get("output_tokens")
+                reas_tok = usage.get("reasoning_output_tokens") or usage.get("reasoning_tokens")
+
+                if in_tok is not None:
+                    total_in = (total_in or 0) + int(in_tok)
+                if out_tok is not None:
+                    total_out = (total_out or 0) + int(out_tok)
+                if reas_tok is not None:
+                    total_reasoning = (total_reasoning or 0) + int(reas_tok)
+        except Exception:
+            pass
+
+    return total_in, total_out, total_reasoning, turns
 
 
 class CodexAloneAdapter(BaseSUTAdapter):
@@ -32,9 +79,9 @@ class CodexAloneAdapter(BaseSUTAdapter):
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
         error_message = None
-        native_in = 0
-        native_out = 0
-        native_reasoning = 0
+        native_in: Optional[int] = None
+        native_out: Optional[int] = None
+        native_reasoning: Optional[int] = None
         provider_calls = 0
         cli_version = None
 
@@ -72,23 +119,11 @@ class CodexAloneAdapter(BaseSUTAdapter):
                 )
 
                 # Parse JSONL events for token usage
-                for line in res.stdout.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                        if isinstance(event, dict):
-                            ev_type = event.get("type")
-                            if ev_type == "turn.started":
-                                provider_calls += 1
-                            elif ev_type == "turn.completed":
-                                usage = event.get("usage", {})
-                                native_in += usage.get("input_tokens", 0)
-                                native_out += usage.get("output_tokens", 0)
-                                native_reasoning += usage.get("reasoning_output_tokens", 0)
-                    except Exception:
-                        pass
+                p_in, p_out, p_reas, p_turns = parse_codex_jsonl_events(res.stdout or "")
+                native_in = p_in
+                native_out = p_out
+                native_reasoning = p_reas
+                provider_calls = p_turns
 
                 if res.returncode != 0:
                     err_snippet = (res.stderr or res.stdout or "").strip()[:300]
@@ -96,29 +131,19 @@ class CodexAloneAdapter(BaseSUTAdapter):
             except subprocess.TimeoutExpired as exc:
                 error_message = f"Codex CLI timed out after {task.timeout_seconds}s"
                 if exc.stdout:
-                    for line in str(exc.stdout).splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                            if isinstance(event, dict):
-                                ev_type = event.get("type")
-                                if ev_type == "turn.started":
-                                    provider_calls += 1
-                                elif ev_type == "turn.completed":
-                                    usage = event.get("usage", {})
-                                    native_in += usage.get("input_tokens", 0)
-                                    native_out += usage.get("output_tokens", 0)
-                                    native_reasoning += usage.get("reasoning_output_tokens", 0)
-                        except Exception:
-                            pass
+                    stdout_str = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout)
+                    p_in, p_out, p_reas, p_turns = parse_codex_jsonl_events(stdout_str)
+                    native_in = p_in
+                    native_out = p_out
+                    native_reasoning = p_reas
+                    provider_calls = p_turns
             except Exception as e:
                 error_message = f"Codex execution failed: {str(e)}"
         else:
             # Offline mock fallback
             native_in = 1850
             native_out = 410
+            native_reasoning = 120
             provider_calls = 1
 
         duration = max(0.01, time.time() - t0)
@@ -129,7 +154,7 @@ class CodexAloneAdapter(BaseSUTAdapter):
             active_provider_duration_seconds=duration * 0.95,
             native_input_tokens=native_in,
             native_output_tokens=native_out,
-            native_reasoning_tokens=native_reasoning if native_reasoning > 0 else None,
+            native_reasoning_tokens=native_reasoning,
             fusion_controlled_context_tokens=None,
             provider_calls_count=max(1, provider_calls),
             mcp_calls_count=0,

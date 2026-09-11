@@ -45,9 +45,9 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
         error_message = None
-        native_in = 0
-        native_out = 0
-        native_reasoning = 0
+        native_in: Optional[int] = None
+        native_out: Optional[int] = None
+        native_reasoning: Optional[int] = None
         provider_calls = 0
         cli_version = None
         active_provider_duration = None
@@ -94,6 +94,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     "-w", "/workspace",
                     "antigravity-benchmark:1.2.0",
                     "--dangerously-skip-permissions",
+                    "--mode", "accept-edits",
                     "--effort", self.reasoning_effort,
                 ]
                 if self.model_id:
@@ -119,9 +120,13 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     data = json.loads(res.stdout)
                     if isinstance(data, dict):
                         usage = data.get("usage", {})
-                        native_in = usage.get("input_tokens", 0)
-                        native_out = usage.get("output_tokens", 0)
-                        native_reasoning = usage.get("thinking_tokens", 0)
+                        if isinstance(usage, dict):
+                            if "input_tokens" in usage and usage["input_tokens"] is not None:
+                                native_in = int(usage["input_tokens"])
+                            if "output_tokens" in usage and usage["output_tokens"] is not None:
+                                native_out = int(usage["output_tokens"])
+                            if "thinking_tokens" in usage and usage["thinking_tokens"] is not None:
+                                native_reasoning = int(usage["thinking_tokens"])
                         provider_calls = data.get("num_turns", 1)
                         response_text = data.get("response", "") or ""
                 except Exception:
@@ -158,6 +163,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
         else:
             native_in = 1920
             native_out = 430
+            native_reasoning = 150
             provider_calls = 1
 
         duration = max(0.01, time.time() - t0)
@@ -168,7 +174,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
             active_provider_duration_seconds=active_provider_duration if (active_provider_duration is not None) else (duration * 0.95),
             native_input_tokens=native_in,
             native_output_tokens=native_out,
-            native_reasoning_tokens=native_reasoning if native_reasoning > 0 else None,
+            native_reasoning_tokens=native_reasoning,
             fusion_controlled_context_tokens=None,
             provider_calls_count=max(1, provider_calls),
             mcp_calls_count=0,

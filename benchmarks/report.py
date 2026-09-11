@@ -102,12 +102,12 @@ class BenchmarkReporter:
             durations = [r.wall_clock_duration_seconds for r in s_runs]
             med_duration = statistics.median(durations) if durations else 0.0
 
-            in_tokens = [r.native_input_tokens for r in s_runs if r.native_input_tokens]
-            med_in_tokens = statistics.median(in_tokens) if in_tokens else 0
+            in_tokens = [r.native_input_tokens for r in s_runs if r.native_input_tokens is not None]
+            med_in_str = f"{int(statistics.median(in_tokens)):,}" if in_tokens else "N/A"
 
             md.append(
                 f"| **{sut.value.upper()}** | {total} | {passes} | {partials} | {fails} | "
-                f"**{pass_pct:.1f}%** | {med_duration:.2f}s | {int(med_in_tokens):,} |"
+                f"**{pass_pct:.1f}%** | {med_duration:.2f}s | {med_in_str} |"
             )
 
         md.append("")
@@ -141,10 +141,10 @@ class BenchmarkReporter:
             if not s_runs:
                 continue
 
-            in_t = [r.native_input_tokens for r in s_runs]
-            out_t = [r.native_output_tokens for r in s_runs]
-            med_in = statistics.median(in_t) if in_t else 0
-            med_out = statistics.median(out_t) if out_t else 0
+            in_t = [r.native_input_tokens for r in s_runs if r.native_input_tokens is not None]
+            out_t = [r.native_output_tokens for r in s_runs if r.native_output_tokens is not None]
+            med_in_str = f"{int(statistics.median(in_t)):,}" if in_t else "N/A"
+            med_out_str = f"{int(statistics.median(out_t)):,}" if out_t else "N/A"
 
             ctx_vals = [r.fusion_controlled_context_tokens for r in s_runs if r.fusion_controlled_context_tokens is not None]
             med_ctx = f"{int(statistics.median(ctx_vals)):,}" if ctx_vals else "N/A"
@@ -152,7 +152,7 @@ class BenchmarkReporter:
             residuals = [r.provider_managed_overhead_residual for r in s_runs if r.provider_managed_overhead_residual is not None]
             med_res = f"{int(statistics.median(residuals)):,}" if residuals else "N/A"
 
-            md.append(f"| **{sut.value}** | {int(med_in):,} | {int(med_out):,} | {med_ctx} | {med_res} |")
+            md.append(f"| **{sut.value}** | {med_in_str} | {med_out_str} | {med_ctx} | {med_res} |")
 
         md.append("")
         md.append(

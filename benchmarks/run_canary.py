@@ -124,12 +124,14 @@ def run_phase_c_canary():
     hidden_hash = compute_hidden_evaluator_hash(task_04)
     with DisposableBenchmarkEnvironment(task_id="TASK-04", run_id="probe_04") as probe_env:
         baseline_hash = probe_env.baseline_snapshot_hash
+        baseline_tree_hash = probe_env.baseline_tree_hash
     suite_hash = compute_benchmark_suite_hash()
 
     print(f"\n[*] Target Task: TASK-04 (Multi-File Feature: LRUCache integration)")
     print(f"  Task Definition Hash: {task_hash}")
     print(f"  Hidden Evaluator Hash: {hidden_hash}")
     print(f"  Baseline Hash:         {baseline_hash}")
+    print(f"  Baseline Tree Hash:    {baseline_tree_hash}")
     print(f"  Suite Hash:            {suite_hash}")
 
     # 6. Initialize dedicated canary database
@@ -174,7 +176,7 @@ def run_phase_c_canary():
         if sut == SystemUnderTest.CODEX_ALONE:
             cmd_repr = f"codex exec --approve-for-me --model {req_model} -c model_reasoning_effort=\"{req_effort}\" --json -"
         elif sut == SystemUnderTest.ANTIGRAVITY_ALONE:
-            cmd_repr = f"docker run --rm -i -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=* -v <wsl_repo>:/workspace:rw -v <disposable_vol>:/home/agy/.gemini:rw -w /workspace antigravity-benchmark:1.2.0 --dangerously-skip-permissions --effort {req_effort} --model {req_model} --output-format json -p <prompt>"
+            cmd_repr = f"docker run --rm -i -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=* -v <wsl_repo>:/workspace:rw -v <disposable_vol>:/home/agy/.gemini:rw -w /workspace antigravity-benchmark:1.2.0 --dangerously-skip-permissions --mode accept-edits --effort {req_effort} --model {req_model} --output-format json -p <prompt>"
         else:
             cmd_repr = f"Fusion Orchestrated: [Codex Stage: codex exec --ephemeral --skip-git-repo-check -s read-only --json - --model {CODEX_PINNED_MODEL} -c model_reasoning_effort=\"{CODEX_PINNED_EFFORT}\"] | [Antigravity Stage: agy -p <prompt> --output-format json --model {AGY_PINNED_MODEL} --effort {AGY_PINNED_EFFORT}]"
         print(f"  CLI Representation (sanitized): {cmd_repr}")
@@ -192,6 +194,12 @@ def run_phase_c_canary():
                 infra_warnings.append(err)
                 all_healthy = False
 
+            if env.baseline_tree_hash != baseline_tree_hash:
+                err = f"Baseline tree hash mismatch: expected {baseline_tree_hash}, got {env.baseline_tree_hash}"
+                print(f"  [!] {err}")
+                infra_warnings.append(err)
+                all_healthy = False
+
             # Verify no hidden test leak
             if (env.repo_path / "tests" / "_hidden_eval.py").exists():
                 err = "Hidden evaluator leaked into baseline repo"
@@ -204,25 +212,42 @@ def run_phase_c_canary():
             telemetry = adapter.execute(task_04, env.repo_path)
             print(f"  Execution finished in {telemetry.wall_clock_duration_seconds:.2f}s. Active provider time: {telemetry.active_provider_duration_seconds:.2f}s")
 
-            # Capture and freeze candidate state
+            # 1. Capture and freeze authoritative candidate state BEFORE hidden evaluator is materialized
             files_touched, git_diff, candidate_tree_hash = env.freeze_sut_candidate_state()
-            print(f"  Candidate state frozen. Touched files ({len(files_touched)}): {files_touched}")
+            req_present = [p for p in task_04.required_paths if (env.repo_path / p).is_file()]
+            req_missing = [p for p in task_04.required_paths if not (env.repo_path / p).is_file()]
+            print(f"  Authoritative candidate frozen. Tree: {candidate_tree_hash} | Touched files ({len(files_touched)}): {files_touched}")
+            print(f"  Required files present: {req_present} | Missing: {req_missing}")
 
-            # DEV functional evaluation
-            print("  Running DEV functional and regression evaluation...")
+            # 2. DEV functional & regression evaluation on authoritative frozen candidate
+            print("  Running DEV functional, hidden, and regression evaluation...")
             scoring = evaluator.evaluate_task(
                 task=task_04,
                 repo_path=env.repo_path,
                 files_touched=files_touched,
+                baseline_tree_hash=env.baseline_tree_hash,
+                candidate_tree_hash=candidate_tree_hash,
             )
-            print(f"  DEV Test Passed: {scoring.task_tests_passed} | Regressions: {scoring.regressions_count} | Hidden: {scoring.hidden_tests_passed} | Scope Violated: {scoring.scope_violated}")
+            print(f"  Visible Tests Passed: {scoring.task_tests_passed} | Hidden Passed: {scoring.hidden_tests_passed} | Regressions: {scoring.regressions_count} | Scope Violated: {scoring.scope_violated}")
+            if scoring.scope_violation_reasons:
+                print(f"  Scope Violation Reasons: {scoring.scope_violation_reasons}")
 
-            # Verify hidden test was unlinked
+            # 3. Verify hidden test was unlinked
             if (env.repo_path / "tests" / "_hidden_eval.py").exists():
                 err = "Hidden evaluator remained in workspace after evaluation"
                 print(f"  [!] {err}")
                 infra_warnings.append(err)
                 all_healthy = False
+
+            # 4. Prove hidden evaluation operated strictly against frozen candidate tree
+            _, _, post_eval_tree_hash = env.freeze_sut_candidate_state()
+            if post_eval_tree_hash != candidate_tree_hash:
+                err = f"Post-evaluation tree hash mismatch! Expected {candidate_tree_hash}, got {post_eval_tree_hash}"
+                print(f"  [!] {err}")
+                infra_warnings.append(err)
+                all_healthy = False
+            else:
+                print(f"  Candidate Tree Provenance Proven: Post-eval tree matches frozen candidate ({candidate_tree_hash})")
 
         end_utc = datetime.now(timezone.utc).isoformat()
         wall_time = time.time() - t_start
@@ -258,6 +283,7 @@ def run_phase_c_canary():
             task_definition_hash=task_hash,
             hidden_evaluator_hash=hidden_hash,
             baseline_snapshot_hash=baseline_hash,
+            baseline_tree_hash=baseline_tree_hash,
             task_id=task_04.task_id,
             category=task_04.category.value,
             system_under_test=sut,
@@ -287,11 +313,13 @@ def run_phase_c_canary():
             files_touched=files_touched,
             unintended_files=scoring.unintended_files,
             scope_violated=scoring.scope_violated,
+            scope_violation_reasons=scoring.scope_violation_reasons,
             git_diff=git_diff,
             sut_candidate_tree_hash=candidate_tree_hash,
             sut_tree_hash=candidate_tree_hash,
             sut_git_diff=git_diff,
             sut_touched_files=files_touched,
+            candidate_required_files_present=req_present,
             native_input_tokens=telemetry.native_input_tokens,
             native_output_tokens=telemetry.native_output_tokens,
             native_reasoning_tokens=telemetry.native_reasoning_tokens,
@@ -334,22 +362,31 @@ def run_phase_c_canary():
         canary_reports.append({
             "sut": sut.value,
             "run_id": run_id,
+            "baseline_tree_hash": env.baseline_tree_hash,
+            "candidate_tree_hash": candidate_tree_hash,
+            "exact_candidate_diff": git_diff,
+            "touched_files": files_touched,
+            "required_files_present": req_present,
+            "required_files_missing": req_missing,
+            "scope_violation_reasons": scoring.scope_violation_reasons,
+            "visible_result": "PASS" if scoring.task_tests_passed else "FAIL",
+            "hidden_result": "PASS" if scoring.hidden_tests_passed else "FAIL",
+            "regression_result": "PASS" if scoring.regressions_passed else "FAIL",
+            "overall_score": scoring.score.value,
             "requested_model_id": req_model,
-            "effort": req_effort,
+            "requested_effort": req_effort,
             "cli_command_representation": cmd_repr,
             "routing_strategy": initial_routing_strategy or "N/A",
             "provider_stages": getattr(telemetry, "provider_stages", ["direct"]),
             "provider_calls": telemetry.provider_calls_count,
             "execution_status": run_status.value,
-            "dev_functional_result": "PASS" if scoring.task_tests_passed and scoring.regressions_count == 0 else "FAIL",
-            "strict_scope_result": "VIOLATED" if scoring.scope_violated else "CLEAN",
-            "touched_files": files_touched,
-            "input_tokens": telemetry.native_input_tokens or 0,
-            "output_tokens": telemetry.native_output_tokens or 0,
-            "reasoning_tokens": telemetry.native_reasoning_tokens or 0,
+            "input_tokens": telemetry.native_input_tokens if telemetry.native_input_tokens is not None else "NULL",
+            "output_tokens": telemetry.native_output_tokens if telemetry.native_output_tokens is not None else "NULL",
+            "reasoning_tokens": telemetry.native_reasoning_tokens if telemetry.native_reasoning_tokens is not None else "NULL",
             "active_provider_time": f"{telemetry.active_provider_duration_seconds:.2f}s",
             "harness_container_overhead": f"{container_overhead:.2f}s" if container_overhead is not None else "0.00s",
             "wall_time": f"{telemetry.wall_clock_duration_seconds:.2f}s",
+            "tree_integrity_proven": (post_eval_tree_hash == candidate_tree_hash),
             "infra_warnings": infra_warnings,
         })
 

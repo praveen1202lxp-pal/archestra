@@ -126,6 +126,7 @@ class ScoringResult:
     scope_valid: bool = True
     files_touched: List[str] = field(default_factory=list)
     scope_violated: bool = False
+    scope_violation_reasons: List[str] = field(default_factory=list)
     unintended_files: List[str] = field(default_factory=list)
     verification_exit_code: int = 0
     verification_output: str = ""
@@ -153,6 +154,7 @@ class BenchmarkRunRecord:
     task_definition_hash: str = ""
     hidden_evaluator_hash: str = ""
     baseline_snapshot_hash: str = ""
+    baseline_tree_hash: Optional[str] = None
     task_id: str = ""
     category: str = ""
     system_under_test: SystemUnderTest = SystemUnderTest.FUSION
@@ -189,13 +191,15 @@ class BenchmarkRunRecord:
     files_touched: List[str] = field(default_factory=list)
     unintended_files: List[str] = field(default_factory=list)
     scope_violated: bool = False
+    scope_violation_reasons: List[str] = field(default_factory=list)
     git_diff: str = ""
     sut_tree_hash: Optional[str] = None
 
-    # Candidate Snapshot Fields (Phase B.1)
+    # Candidate Snapshot Fields (Phase B.1 / Phase C)
     sut_candidate_tree_hash: Optional[str] = None
     sut_git_diff: Optional[str] = None
     sut_touched_files: List[str] = field(default_factory=list)
+    candidate_required_files_present: List[str] = field(default_factory=list)
 
     # Objective Cross-Model Review Value (Fusion)
     reviewer_verdict: Optional[str] = None
@@ -246,6 +250,18 @@ class BenchmarkRunRecord:
             self.sut_touched_files = list(self.files_touched)
         elif not self.files_touched and self.sut_touched_files:
             self.files_touched = list(self.sut_touched_files)
+
+    @property
+    def candidate_tree_hash(self) -> Optional[str]:
+        return self.sut_candidate_tree_hash or self.sut_tree_hash
+
+    @property
+    def candidate_git_diff(self) -> str:
+        return self.sut_git_diff or self.git_diff or ""
+
+    @property
+    def candidate_touched_files(self) -> List[str]:
+        return self.sut_touched_files or self.files_touched or []
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

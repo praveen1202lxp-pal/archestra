@@ -65,6 +65,7 @@ class DisposableBenchmarkEnvironment:
         self.temp_dir: Optional[tempfile.TemporaryDirectory] = None
         self.repo_path: Optional[Path] = None
         self.baseline_commit_hash: str = ""
+        self.baseline_tree_hash: str = ""
         self.baseline_snapshot_hash: str = ""
 
     def __enter__(self) -> "DisposableBenchmarkEnvironment":
@@ -120,7 +121,7 @@ class DisposableBenchmarkEnvironment:
             capture_output=True,
         )
 
-        # 4. Record baseline commit hash
+        # 4. Record baseline commit and tree hashes
         rev = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=str(self.repo_path),
@@ -129,6 +130,15 @@ class DisposableBenchmarkEnvironment:
             text=True,
         )
         self.baseline_commit_hash = rev.stdout.strip()
+
+        tree_rev = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(self.repo_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.baseline_tree_hash = tree_rev.stdout.strip()
         self.baseline_snapshot_hash = compute_baseline_snapshot_hash(self.repo_path)
         return self.repo_path
 

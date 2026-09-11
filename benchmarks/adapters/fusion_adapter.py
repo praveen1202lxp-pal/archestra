@@ -126,6 +126,18 @@ class FusionSUTAdapter(BaseSUTAdapter):
                             dest_file = repo_path / rel
                             dest_file.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(src_file, dest_file)
+
+                    # Also propagate any file deletions made in the worktree
+                    for cur_file in list(repo_path.rglob("*")):
+                        if cur_file.is_file():
+                            rel = cur_file.relative_to(repo_path)
+                            rel_str = str(rel).replace("\\", "/")
+                            if rel_str.startswith(".git") or rel_str.startswith(".fusion_"):
+                                continue
+                            src_in_worktree = ws.worktree_path / rel
+                            if not src_in_worktree.exists():
+                                cur_file.unlink()
+
                 try:
                     ws.teardown(delete_branch=True)
                 except Exception:

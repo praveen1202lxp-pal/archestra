@@ -97,8 +97,8 @@ class BenchmarkStorage:
                     repair_patch TEXT,
                     
                     fusion_controlled_context_tokens INTEGER,
-                    native_input_tokens INTEGER NOT NULL DEFAULT 0,
-                    native_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    native_input_tokens INTEGER,
+                    native_output_tokens INTEGER,
                     native_reasoning_tokens INTEGER,
                     provider_managed_overhead_residual INTEGER,
                     provider_calls_count INTEGER NOT NULL DEFAULT 0,
@@ -114,7 +114,10 @@ class BenchmarkStorage:
                     scope_violated INTEGER NOT NULL DEFAULT 0,
                     native_cache_read_tokens INTEGER,
                     native_cache_write_tokens INTEGER,
-                    container_overhead_seconds REAL
+                    container_overhead_seconds REAL,
+                    baseline_tree_hash TEXT,
+                    candidate_required_files_present_json TEXT NOT NULL DEFAULT '[]',
+                    scope_violation_reasons_json TEXT NOT NULL DEFAULT '[]'
                 )
                 """
             )
@@ -143,6 +146,9 @@ class BenchmarkStorage:
                 ("native_cache_read_tokens", "INTEGER"),
                 ("native_cache_write_tokens", "INTEGER"),
                 ("container_overhead_seconds", "REAL"),
+                ("baseline_tree_hash", "TEXT"),
+                ("candidate_required_files_present_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("scope_violation_reasons_json", "TEXT NOT NULL DEFAULT '[]'"),
             ]
             for col, col_def in migrations:
                 if col not in existing_cols:
@@ -182,7 +188,8 @@ class BenchmarkStorage:
                     recovery_events, policy_denials, error_message,
                     benchmark_harness_commit, initial_routing_strategy, initial_routing_snapshot_hash,
                     scope_violated, native_cache_read_tokens, native_cache_write_tokens,
-                    container_overhead_seconds
+                    container_overhead_seconds, baseline_tree_hash,
+                    candidate_required_files_present_json, scope_violation_reasons_json
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -190,7 +197,8 @@ class BenchmarkStorage:
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?
                 )
                 """,
                 (
@@ -262,6 +270,9 @@ class BenchmarkStorage:
                     record.native_cache_read_tokens,
                     record.native_cache_write_tokens,
                     record.container_overhead_seconds,
+                    record.baseline_tree_hash,
+                    json.dumps(record.candidate_required_files_present),
+                    json.dumps(record.scope_violation_reasons),
                 ),
             )
             conn.commit()
@@ -399,9 +410,12 @@ class BenchmarkStorage:
                     initial_routing_strategy=r["initial_routing_strategy"] if "initial_routing_strategy" in r_keys else None,
                     initial_routing_snapshot_hash=r["initial_routing_snapshot_hash"] if "initial_routing_snapshot_hash" in r_keys else None,
                     scope_violated=bool(r["scope_violated"]) if "scope_violated" in r_keys else False,
+                    scope_violation_reasons=json.loads(r["scope_violation_reasons_json"]) if "scope_violation_reasons_json" in r_keys and r["scope_violation_reasons_json"] else [],
                     native_cache_read_tokens=r["native_cache_read_tokens"] if "native_cache_read_tokens" in r_keys else None,
                     native_cache_write_tokens=r["native_cache_write_tokens"] if "native_cache_write_tokens" in r_keys else None,
                     container_overhead_seconds=r["container_overhead_seconds"] if "container_overhead_seconds" in r_keys else None,
+                    baseline_tree_hash=r["baseline_tree_hash"] if "baseline_tree_hash" in r_keys else None,
+                    candidate_required_files_present=json.loads(r["candidate_required_files_present_json"]) if "candidate_required_files_present_json" in r_keys and r["candidate_required_files_present_json"] else [],
                 )
                 records.append(record)
             return records

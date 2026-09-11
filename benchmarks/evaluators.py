@@ -175,6 +175,8 @@ class BenchmarkEvaluator:
         repo_path: Path,
         files_touched: List[str],
         timeout: float = 90.0,
+        baseline_tree_hash: Optional[str] = None,
+        candidate_tree_hash: Optional[str] = None,
     ) -> ScoringResult:
         """Run complete post-exit evaluation sequence."""
         failure_reasons = []
@@ -195,14 +197,32 @@ class BenchmarkEvaluator:
             allowed_new_test_paths=task.allowed_new_test_paths,
             allowed_source_paths=task.allowed_source_paths,
         )
-        if forbidden_touched:
-            failure_reasons.append(f"Modified forbidden paths: {forbidden_touched}")
-        if protected_mutations:
-            failure_reasons.append(f"Modified protected test/source paths: {protected_mutations}")
-        if unintended_files:
-            failure_reasons.append(f"Modified unintended paths: {unintended_files}")
+
+        scope_violation_reasons = []
         if missing_required:
-            failure_reasons.append(f"Missing required path modifications: {missing_required}")
+            msg = f"Missing required path modifications: {sorted(missing_required)}"
+            scope_violation_reasons.append(msg)
+            failure_reasons.append(msg)
+        if forbidden_touched:
+            msg = f"Modified forbidden paths: {sorted(forbidden_touched)}"
+            scope_violation_reasons.append(msg)
+            failure_reasons.append(msg)
+        if protected_mutations:
+            msg = f"Modified protected test/source paths: {sorted(protected_mutations)}"
+            scope_violation_reasons.append(msg)
+            failure_reasons.append(msg)
+        if unintended_files:
+            msg = f"Modified unintended paths: {sorted(unintended_files)}"
+            scope_violation_reasons.append(msg)
+            failure_reasons.append(msg)
+
+        # Check for required files missing on disk in candidate tree
+        missing_on_disk = [p for p in task.required_paths if not (repo_path / p).is_file()]
+        if missing_on_disk:
+            msg = f"Required files missing from candidate filesystem: {sorted(missing_on_disk)}"
+            scope_violation_reasons.append(msg)
+            failure_reasons.append(msg)
+            scope_violated = True
 
         # 3. Visible task tests (if defined)
         task_tests_passed = True
@@ -238,6 +258,20 @@ class BenchmarkEvaluator:
         else:
             failure_reasons.append(f"Hidden evaluator missing: {task.hidden_evaluator_module}")
 
+        # Baseline Invariant Check:
+        # If candidate tree is identical to the baseline tree, an edit task must not
+        # report a hidden functional PASS.
+        if (
+            baseline_tree_hash is not None
+            and candidate_tree_hash is not None
+            and candidate_tree_hash == baseline_tree_hash
+        ):
+            if hidden_tests_passed:
+                hidden_tests_passed = False
+                failure_reasons.append(
+                    "Candidate tree is identical to baseline tree; hidden functional PASS rejected by baseline discrimination invariant"
+                )
+
         # 5. Full Pre-existing Regression Suite
         regressions_count = 0
         regressions_passed = True
@@ -258,6 +292,7 @@ class BenchmarkEvaluator:
             and not protected_mutations
             and not unintended_files
             and not missing_required
+            and not missing_on_disk
         ):
             score = BenchmarkScore.PASS
         # FAIL: Syntax error, touched forbidden paths, protected test mutations, missing required when hidden tests failed, or both hidden and visible failed
@@ -266,12 +301,13 @@ class BenchmarkEvaluator:
             or bool(forbidden_touched)
             or bool(protected_mutations)
             or (not hidden_tests_passed and bool(missing_required))
+            or (not hidden_tests_passed and bool(missing_on_disk))
             or (not hidden_tests_passed and not task_tests_passed)
         ):
             score = BenchmarkScore.FAIL
         # PARTIAL: Core task passes but has non-catastrophic scope violation or minor regressions
         elif (hidden_tests_passed and (unintended_files or not regressions_passed)) or (
-            task_tests_passed and not hidden_tests_passed and not forbidden_touched and not protected_mutations and not missing_required
+            task_tests_passed and not hidden_tests_passed and not forbidden_touched and not protected_mutations and not missing_required and not missing_on_disk
         ):
             score = BenchmarkScore.PARTIAL
         else:
@@ -289,6 +325,7 @@ class BenchmarkEvaluator:
             scope_valid=not scope_violated,
             files_touched=meaningful_files,
             scope_violated=scope_violated,
+            scope_violation_reasons=scope_violation_reasons,
             unintended_files=unintended_files,
             verification_exit_code=0 if score == BenchmarkScore.PASS else 1,
             verification_output=verification_output,
