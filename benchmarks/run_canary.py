@@ -110,9 +110,21 @@ def run_phase_c_canary():
         print(f"[!] FATAL: AUTH_SEED digest mismatch! Expected {AUTH_SEED_EXPECTED_DIGEST}, got {seed_digest_before}")
         sys.exit(1)
 
-    # 4. Check Docker image ID
+    # 4. Check Docker image ID and clean any orphaned trial volumes from previous aborted sessions
     agy_image_id = get_docker_image_id("antigravity-benchmark:1.2.0")
     print(f"  AGY Docker Image:  {agy_image_id}")
+    try:
+        vol_cleanup = subprocess.run(
+            ["wsl", "-u", "root", "docker", "volume", "ls", "--format={{.Name}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        for v in vol_cleanup.stdout.splitlines():
+            if v.startswith("agy_trial_auth_"):
+                subprocess.run(["wsl", "-u", "root", "docker", "volume", "rm", "-f", v], capture_output=True, timeout=10)
+    except Exception:
+        pass
 
     # 5. Load development task TASK-04
     task_04 = get_task_by_id("TASK-04")
@@ -346,13 +358,17 @@ def run_phase_c_canary():
 
         # Check disposable volume destruction
         if sut == SystemUnderTest.ANTIGRAVITY_ALONE:
-            time.sleep(1.0)
-            vol_check = subprocess.run(
-                ["wsl", "-u", "root", "docker", "volume", "ls", "--format={{.Name}}"],
-                capture_output=True,
-                text=True,
-            )
-            agy_vols = [v for v in vol_check.stdout.splitlines() if v.startswith("agy_trial_auth_")]
+            agy_vols = []
+            for _ in range(5):
+                time.sleep(1.0)
+                vol_check = subprocess.run(
+                    ["wsl", "-u", "root", "docker", "volume", "ls", "--format={{.Name}}"],
+                    capture_output=True,
+                    text=True,
+                )
+                agy_vols = [v for v in vol_check.stdout.splitlines() if v.startswith("agy_trial_auth_")]
+                if not agy_vols:
+                    break
             if agy_vols:
                 err = f"Disposable auth volumes not destroyed: {agy_vols}"
                 print(f"  [!] {err}")

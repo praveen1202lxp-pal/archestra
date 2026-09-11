@@ -153,6 +153,100 @@ class BenchmarkStorage:
             for col, col_def in migrations:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE benchmark_runs ADD COLUMN {col} {col_def}")
+
+            # If native_input_tokens still has NOT NULL constraint from an older schema, migrate table
+            col_info = {row[1]: row for row in conn.execute("PRAGMA table_info(benchmark_runs);").fetchall()}
+            if col_info.get("native_input_tokens") and col_info["native_input_tokens"][3] == 1:
+                cols = [row[1] for row in conn.execute("PRAGMA table_info(benchmark_runs);").fetchall()]
+                cols_str = ", ".join(cols)
+                conn.execute("ALTER TABLE benchmark_runs RENAME TO benchmark_runs_old;")
+                conn.execute(
+                    """
+                    CREATE TABLE benchmark_runs (
+                        run_id TEXT PRIMARY KEY,
+                        benchmark_suite_version TEXT NOT NULL,
+                        benchmark_suite_hash TEXT NOT NULL,
+                        task_definition_hash TEXT NOT NULL,
+                        hidden_evaluator_hash TEXT NOT NULL,
+                        baseline_snapshot_hash TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        system_under_test TEXT NOT NULL,
+                        repetition_index INTEGER NOT NULL DEFAULT 0,
+                        run_status TEXT NOT NULL DEFAULT 'COMPLETED',
+                        validity_disposition TEXT NOT NULL DEFAULT 'VALID',
+                        invalidation_reasons_json TEXT NOT NULL DEFAULT '[]',
+                        execution_mode TEXT NOT NULL DEFAULT 'MOCK',
+                        experiment_phase TEXT NOT NULL DEFAULT 'PHASE_B_PILOT',
+                        start_time TEXT NOT NULL,
+                        end_time TEXT NOT NULL,
+                        wall_clock_duration_seconds REAL NOT NULL DEFAULT 0.0,
+                        active_provider_duration_seconds REAL NOT NULL DEFAULT 0.0,
+                        os_platform TEXT NOT NULL,
+                        python_version TEXT NOT NULL,
+                        provider_model_id TEXT,
+                        cli_version TEXT,
+                        reasoning_effort TEXT,
+                        fusion_config_hash TEXT,
+
+                        score TEXT NOT NULL,
+                        verification_passed INTEGER NOT NULL DEFAULT 0,
+                        hidden_tests_passed INTEGER NOT NULL DEFAULT 0,
+                        regressions_count INTEGER NOT NULL DEFAULT 0,
+                        files_touched_json TEXT NOT NULL DEFAULT '[]',
+                        unintended_files_json TEXT NOT NULL DEFAULT '[]',
+                        git_diff TEXT,
+                        sut_tree_hash TEXT,
+                        sut_candidate_tree_hash TEXT,
+                        sut_git_diff TEXT,
+                        sut_touched_files_json TEXT NOT NULL DEFAULT '[]',
+                        verification_duration_seconds REAL,
+                        provider_stages_json TEXT NOT NULL DEFAULT '[]',
+
+                        reviewer_verdict TEXT,
+                        reviewer_found_defect INTEGER NOT NULL DEFAULT 0,
+                        reviewer_found_valid_defect INTEGER NOT NULL DEFAULT 0,
+                        pre_review_criteria_failed_json TEXT NOT NULL DEFAULT '[]',
+                        reviewer_mapped_defect_criteria_json TEXT NOT NULL DEFAULT '[]',
+                        defect_in_test_passing_patch INTEGER NOT NULL DEFAULT 0,
+                        repair_rounds INTEGER NOT NULL DEFAULT 0,
+                        repair_successful INTEGER NOT NULL DEFAULT 0,
+                        human_promotion_disposition TEXT,
+                        pre_review_patch TEXT,
+                        pre_review_test_passed INTEGER,
+                        reviewer_findings TEXT,
+                        repair_patch TEXT,
+
+                        fusion_controlled_context_tokens INTEGER,
+                        native_input_tokens INTEGER,
+                        native_output_tokens INTEGER,
+                        native_reasoning_tokens INTEGER,
+                        provider_managed_overhead_residual INTEGER,
+                        provider_calls_count INTEGER NOT NULL DEFAULT 0,
+                        mcp_calls_count INTEGER NOT NULL DEFAULT 0,
+
+                        recovery_events INTEGER NOT NULL DEFAULT 0,
+                        policy_denials INTEGER NOT NULL DEFAULT 0,
+                        error_message TEXT,
+
+                        benchmark_harness_commit TEXT,
+                        initial_routing_strategy TEXT,
+                        initial_routing_snapshot_hash TEXT,
+                        scope_violated INTEGER NOT NULL DEFAULT 0,
+                        native_cache_read_tokens INTEGER,
+                        native_cache_write_tokens INTEGER,
+                        container_overhead_seconds REAL,
+                        baseline_tree_hash TEXT,
+                        candidate_required_files_present_json TEXT NOT NULL DEFAULT '[]',
+                        scope_violation_reasons_json TEXT NOT NULL DEFAULT '[]'
+                    )
+                    """
+                )
+                conn.execute(f"INSERT INTO benchmark_runs ({cols_str}) SELECT {cols_str} FROM benchmark_runs_old;")
+                conn.execute("DROP TABLE benchmark_runs_old;")
+                # Clean up legacy zeroes for runs where tokens were unavailable
+                conn.execute("UPDATE benchmark_runs SET native_input_tokens = NULL, native_output_tokens = NULL WHERE (native_input_tokens = 0 OR native_output_tokens = 0) AND error_message IS NOT NULL;")
+
             conn.commit()
 
     def record_run(self, record: BenchmarkRunRecord) -> None:
