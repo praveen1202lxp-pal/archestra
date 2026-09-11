@@ -61,7 +61,9 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
 
         if self.is_live:
             cli_version = "1.2.0 (linux-docker)"
-            trial_vol = f"agy_trial_auth_{uuid.uuid4().hex[:12]}"
+            run_suffix = uuid.uuid4().hex[:12]
+            trial_vol = f"agy_trial_auth_{run_suffix}"
+            container_name = f"agy_container_{run_suffix}"
             wsl_repo = _to_wsl_path(repo_path)
             try:
                 # 1. Create fresh disposable auth volume cloned from immutable AUTH_SEED
@@ -86,6 +88,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                 # 2. Run approved antigravity-benchmark:1.2.0 container
                 cmd = [
                     "wsl", "-u", "root", "docker", "run", "--rm", "-i",
+                    "--name", container_name,
                     "-e", "GIT_CONFIG_COUNT=1",
                     "-e", "GIT_CONFIG_KEY_0=safe.directory",
                     "-e", "GIT_CONFIG_VALUE_0=*",
@@ -149,7 +152,14 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
             except Exception as e:
                 error_message = f"AGY Container execution failed: {str(e)}"
             finally:
-                # 3. Always destroy the disposable auth volume (retry while container unmounts)
+                # 3. Always force terminate container if still running (e.g. after TimeoutExpired)
+                subprocess.run(
+                    ["wsl", "-u", "root", "docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                )
+                # 4. Always destroy the disposable auth volume
                 for _ in range(10):
                     rm_res = subprocess.run(
                         ["wsl", "-u", "root", "docker", "volume", "rm", "-f", trial_vol],
@@ -159,7 +169,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     )
                     if rm_res.returncode == 0:
                         break
-                    time.sleep(1.0)
+                    time.sleep(0.5)
         else:
             native_in = 1920
             native_out = 430
