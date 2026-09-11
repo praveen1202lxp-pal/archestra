@@ -1,0 +1,16 @@
+{
+  "product_commit": "118b19f2037db89efe966f486a2fcfd6e5b455dd",
+  "benchmark_harness_commit": "fc671210b84af5a52934bcccf669a96db777269e",
+  "suite_version": "1.1.0",
+  "suite_hash": "1615867979751f3fe805115c65126c9b8083e538bc3764103c80e70cb1a8c6d0",
+  "codex_exact_model_id": "gpt-5.6-sol",
+  "codex_reasoning_effort": "medium",
+  "codex_cli_version": "codex-cli 0.153.4",
+  "antigravity_exact_model_id": "gemini-3.8-flash-high",
+  "antigravity_effort": "high",
+  "antigravity_cli_version": "1.2.0",
+  "antigravity_docker_image_id": "sha256:4978f049172106777084c23b249eb170ffc266603dcc9d7410e146263da32061",
+  "auth_seed_content_digest": "7faefcc101341123da84bb46e9223fb71021f502d899e3ca0d4fc281362bbb80",
+  "fusion_routing_snapshot_identity_hash": "4ad58f2641066b1b6da7f9145ee1c1aae9afa5e3d56aa48c49e0fb435df32102",
+  "execution_classification": "CANARY"
+}
