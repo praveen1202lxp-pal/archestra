@@ -29,11 +29,18 @@ def _to_wsl_path(path: Path) -> str:
 class AntigravityAloneAdapter(BaseSUTAdapter):
     """Executes benchmark tasks using standalone Antigravity CLI directly."""
 
-    def __init__(self, cli_path: Optional[str] = None, is_live: bool = False, reasoning_effort: str = "medium"):
+    def __init__(
+        self,
+        cli_path: Optional[str] = None,
+        is_live: bool = False,
+        reasoning_effort: str = "medium",
+        model_id: Optional[str] = None,
+    ):
         super().__init__(sut=SystemUnderTest.ANTIGRAVITY_ALONE)
         self.cli_path = cli_path or AntigravityCLIProvider()._resolve_executable()
         self.is_live = is_live
         self.reasoning_effort = reasoning_effort
+        self.model_id = model_id
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
@@ -91,6 +98,8 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     "--output-format", "json",
                     "-p", task.prompt,
                 ]
+                if self.model_id:
+                    cmd.extend(["--model", self.model_id])
                 t_active_0 = time.time()
                 res = subprocess.run(
                     cmd,

@@ -189,17 +189,24 @@ class CheckpointManager:
         # 1. Reset tracked files to the verified checkpoint commit
         self._run_git(["reset", "--hard", checkpoint_sha], cwd=worktree)
 
-        # 2. Specifically remove known task-created files if still present
+        # 2. Specifically remove task-created files if they were NOT tracked in checkpoint_sha
         if created_files:
             for rel_f in created_files:
-                target_file = (worktree / rel_f).resolve()
-                if str(target_file).startswith(str(worktree)) and target_file.is_file():
-                    try:
-                        target_file.unlink()
-                    except Exception:
-                        pass
+                norm_rel = rel_f.replace("\\", "/").strip("./")
+                is_tracked = self._run_git(
+                    ["ls-tree", "--name-only", checkpoint_sha, "--", norm_rel],
+                    cwd=worktree,
+                    check=False,
+                ).strip()
+                if not is_tracked:
+                    target_file = (worktree / norm_rel).resolve()
+                    if str(target_file).startswith(str(worktree)) and target_file.is_file():
+                        try:
+                            target_file.unlink()
+                        except Exception:
+                            pass
 
-        # 3. Selectively remove unverified/untracked task files inside worktree
+        # 3. Selectively remove unverified/untracked task files inside worktree (preserving .fusion)
         status_raw = self._run_git(["status", "--porcelain", "--untracked-files=all"], cwd=worktree)
         for line in status_raw.splitlines():
             line = line.strip()

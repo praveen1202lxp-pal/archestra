@@ -23,18 +23,28 @@ class FusionSUTAdapter(BaseSUTAdapter):
         config: Optional[FusionConfig] = None,
         providers: Optional[Dict[str, Any]] = None,
         is_live: bool = False,
+        codex_model_id: Optional[str] = None,
+        agy_model_id: Optional[str] = None,
     ):
         super().__init__(sut=SystemUnderTest.FUSION)
         self.config = config
         self.providers = providers
         self.is_live = is_live
+        self.codex_model_id = codex_model_id
+        self.agy_model_id = agy_model_id
 
         if self.is_live and not self.providers:
             from fusion_agent.providers.codex_cli import CodexCLIProvider
             from fusion_agent.providers.antigravity_cli import AntigravityCLIProvider
+            codex_cfg = {"reasoning_effort": "medium"}
+            if self.codex_model_id:
+                codex_cfg["model"] = self.codex_model_id
+            agy_cfg = {"effort": "medium"}
+            if self.agy_model_id:
+                agy_cfg["model"] = self.agy_model_id
             self.providers = {
-                "codex": CodexCLIProvider(config={"reasoning_effort": "medium"}),
-                "antigravity": AntigravityCLIProvider(config={"effort": "medium"}),
+                "codex": CodexCLIProvider(config=codex_cfg),
+                "antigravity": AntigravityCLIProvider(config=agy_cfg),
             }
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
@@ -43,12 +53,16 @@ class FusionSUTAdapter(BaseSUTAdapter):
         temp_state_dir = tempfile.TemporaryDirectory(prefix="fusion_bench_state_", ignore_cleanup_errors=True)
         state_dir_path = Path(temp_state_dir.name).resolve()
 
-        # Build workspace config with EXTERNAL storage_dir
+        verification_cmd = (
+            task.visible_test_command
+            if hasattr(task, "visible_test_command") and task.visible_test_command
+            else "pytest"
+        )
         cfg = self.config or FusionConfig(
             project_name=f"Bench_{task.task_id}",
             project_root=str(repo_path),
             storage_dir=str(state_dir_path),
-            verification_command="pytest",
+            verification_command=verification_cmd,
             optimization_mode=OptimizationMode.BEST_QUALITY,
         )
         cfg.project_root = str(repo_path)
@@ -115,19 +129,14 @@ class FusionSUTAdapter(BaseSUTAdapter):
                 except Exception:
                     pass
 
-            # Fallback: if structured file edits exist in deliberation output, ensure written
-            if hasattr(result, "deliberation") and result.deliberation:
-                text_sources = [result.deliberation.synthesized_output]
-                if hasattr(result.deliberation, "proposals"):
-                    text_sources.extend([p.content for p in result.deliberation.proposals])
-                for text_source in text_sources:
-                    if text_source:
-                        extracted = WorkspaceEditor.extract_file_edits(text_source)
-                        for rel_p, content in extracted:
-                            dest = repo_path / rel_p
-                            if not dest.exists() or dest.read_text(encoding="utf-8", errors="replace").strip() != content.strip():
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                dest.write_text(content, encoding="utf-8")
+            # Fallback: only if no workspace_session was present, apply synthesized output
+            elif hasattr(result, "deliberation") and result.deliberation and result.deliberation.synthesized_output:
+                extracted = WorkspaceEditor.extract_file_edits(result.deliberation.synthesized_output)
+                for rel_p, content in extracted:
+                    dest = repo_path / rel_p
+                    if not dest.exists() or dest.read_text(encoding="utf-8", errors="replace").strip() != content.strip():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_text(content, encoding="utf-8")
 
         except Exception as exc:
             error_message = str(exc)
@@ -213,6 +222,12 @@ class FusionSUTAdapter(BaseSUTAdapter):
             res_fusion_ctx = None
             res_provider_calls = 0
             res_active_dur = duration * 0.85
+
+        try:
+            db.close()
+            temp_state_dir.cleanup()
+        except Exception:
+            pass
 
         return AdapterRunTelemetry(
             system_under_test=SystemUnderTest.FUSION,

@@ -22,6 +22,15 @@ class ReviewRisk(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class ExecutionIntent(str, Enum):
+    """Primary operational intent derived from task and context."""
+    ANSWER_ONLY = "ANSWER_ONLY"
+    DESIGN_ANALYSIS = "DESIGN_ANALYSIS"
+    INVESTIGATION = "INVESTIGATION"
+    CODE_EDIT = "CODE_EDIT"
+    MULTI_STEP_CODE_EDIT = "MULTI_STEP_CODE_EDIT"
+
+
 @dataclass
 class TaskAssessment:
     """Normalized deterministic signals extracted from user task."""
@@ -36,6 +45,7 @@ class TaskAssessment:
     security_sensitive: bool
     second_model_benefit: bool
     rationale: str
+    execution_intent: ExecutionIntent = ExecutionIntent.ANSWER_ONLY
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize assessment to dictionary."""
@@ -44,4 +54,5 @@ class TaskAssessment:
         data["complexity"] = self.complexity.value
         data["estimated_scope"] = self.estimated_scope.value
         data["review_risk"] = self.review_risk.value
+        data["execution_intent"] = self.execution_intent.value
         return data

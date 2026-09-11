@@ -58,10 +58,10 @@ def test_orchestrator_context_continuity():
     orchestrator = FusionOrchestrator(config=config, database=db, providers={"solo": agent})
 
     # Run Task 1
-    orchestrator.run_task("Task 1: Add user authentication module")
+    orchestrator.run_task("Task 1: Design user authentication module")
 
     # Run Task 2
-    orchestrator.run_task("Task 2: Add password reset module")
+    orchestrator.run_task("Task 2: Design password reset module")
 
     # Check that Task 2 received Task 1 in recent context
     context = orchestrator.state_manager.build_context_snapshot("continuitytest")

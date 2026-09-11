@@ -45,6 +45,8 @@ from fusion_agent.workspace.checkpoint import (
     UnexpectedFilesError,
 )
 from fusion_agent.workspace.editor import WorkspaceEditor
+from fusion_agent.workspace.scope_contract import ScopeContract
+from fusion_agent.workspace.evidence_validator import AffirmativeEvidenceValidator
 
 from fusion_agent.workspace.session import DirtyWorkingTreeError, WorkspaceSession, WorkspaceState
 from fusion_agent.workspace.verifier import VerificationResult, WorkspaceVerifier
@@ -362,6 +364,12 @@ class FusionOrchestrator:
         ctx_tokens = code_context.metrics.get("fusion_context_tokens", 0)
         emit("status", {"message": f"Constructed bounded CodeContext ({len(selected_names)} files: {', '.join(selected_names) if selected_names else 'None'}, ~{ctx_tokens} tokens)."})
 
+        # Derive ScopeContract for change scope governance
+        scope_contract = ScopeContract.derive(
+            task_prompt=f"{task.title}\n{task.description}",
+            code_context=code_context,
+        )
+
         emit("status", {"message": f"{impl.name} is formulating structured code modifications..."})
         task_text = task.description if task.description == task.title or task.description.startswith(task.title) else f"{task.title}\n{task.description}"
         patch_prompt = (
@@ -446,8 +454,19 @@ class FusionOrchestrator:
             "output_tokens": prop_resp.output_tokens,
         })
 
-        # 3. Apply edits strictly via ExecutionBroker
-        modified_files = WorkspaceEditor.apply_edits(prop_resp.content, broker)
+        # 3. Apply edits strictly via ExecutionBroker with ScopeContract validation
+        rejected_files: List[Tuple[str, str]] = []
+        modified_files = WorkspaceEditor.apply_edits(
+            prop_resp.content,
+            broker,
+            scope_contract=scope_contract,
+            task_prompt=task_text,
+            rejected_files=rejected_files,
+        )
+        if rejected_files:
+            for rf, r_reason in rejected_files:
+                emit("status", {"message": f"Scope Contract rejected '{rf}': {r_reason}"})
+
         if modified_files:
             emit("status", {"message": f"Applied modifications to {len(modified_files)} file(s): {', '.join(modified_files)}"})
         else:
@@ -469,6 +488,76 @@ class FusionOrchestrator:
 
         # 5. Extract unified diff
         diff = verifier.get_diff(session)
+
+        # 5b. No-Op Completion Guard: bounded retry if implementation was required but diff is empty
+        if not diff or not diff.strip():
+            worktree_path = getattr(session, "worktree_path", None) or Path(self.config.project_root).resolve()
+            pre_evidence = AffirmativeEvidenceValidator.validate_no_change_evidence(
+                task=task,
+                repo_path=Path(worktree_path),
+                verification_result=verif_result,
+                response_text=prop_resp.content,
+            )
+            if not pre_evidence.is_satisfied:
+                can_retry, _ = budget.can_call_provider()
+                if can_retry:
+                    emit("status", {"message": "No-Op Guard: Implementation task produced empty diff without affirmative evidence. Initiating bounded retry with corrective instruction..."})
+                retry_prompt = (
+                    f"{patch_prompt}\n\n"
+                    "CRITICAL NOTICE: Your previous response did not produce any repository file modifications. "
+                    "This task requires repository code modifications. "
+                    "You must output the exact file modifications using the required file format:\n"
+                    "### File: relative/path/to/file.ext\n"
+                    "```language\n"
+                    "full file content here\n"
+                    "```"
+                )
+                t_retry_start = time.perf_counter()
+                retry_resp, code_context, retry_metrics = self._invoke_provider_stage_with_tools(
+                    provider=impl,
+                    prompt=retry_prompt,
+                    code_context=code_context,
+                    task_id=task.id,
+                    stage_name="Implementation Retry",
+                    db_stage="step_implementation_retry",
+                    budget=budget,
+                    emit=emit,
+                    role="implementer",
+                )
+                t_retry = (time.perf_counter() - t_retry_start) * 1000.0
+                stage_metrics.extend(retry_metrics)
+                proposals.append(
+                    Proposal(
+                        agent_name=impl.name,
+                        summary="Implementation retry patch",
+                        content=retry_resp.content,
+                        duration_ms=retry_resp.duration_ms or t_retry,
+                        input_tokens=retry_resp.input_tokens,
+                        output_tokens=retry_resp.output_tokens,
+                    )
+                )
+                retry_modified = WorkspaceEditor.apply_edits(
+                    retry_resp.content,
+                    broker,
+                    scope_contract=scope_contract,
+                    task_prompt=task_text,
+                    rejected_files=rejected_files,
+                )
+                if retry_modified:
+                    modified_files.extend(retry_modified)
+                    emit("status", {"message": f"Applied retry modifications to {len(retry_modified)} file(s): {', '.join(retry_modified)}"})
+                    verif_result = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
+                    self.state_manager.record_verification(
+                        task_id=task.id,
+                        verification_type=VerificationType.STEP,
+                        command=verif_result.command or (self.config.verification_command or ""),
+                        exit_code=verif_result.exit_code,
+                        passed=verif_result.passed,
+                        duration_seconds=verif_result.duration_seconds,
+                        stdout=verif_result.stdout,
+                        stderr=verif_result.stderr,
+                    )
+                    diff = verifier.get_diff(session)
 
         # 6. Peer review diff (Round 1)
         review_result = None
@@ -671,7 +760,13 @@ class FusionOrchestrator:
                 "output_tokens": repair_resp.output_tokens,
             })
 
-            repaired_files = WorkspaceEditor.apply_edits(repair_resp.content, broker)
+            repaired_files = WorkspaceEditor.apply_edits(
+                repair_resp.content,
+                broker,
+                scope_contract=scope_contract,
+                task_prompt=task_text,
+                rejected_files=rejected_files,
+            )
             if repaired_files:
                 emit("status", {"message": f"Applied repairs to {len(repaired_files)} file(s): {', '.join(repaired_files)}"})
                 for rf in repaired_files:
@@ -900,6 +995,13 @@ class FusionOrchestrator:
             self.state_manager.update_task_stage(task.id, "plan_generation")
             emit("status", {"message": f"Execution plan established: '{plan.title}' ({len(plan.steps)} steps)."})
 
+        # Derive ScopeContract for multi-step execution
+        scope_contract = ScopeContract.derive(
+            task_prompt=f"{task.title}\n{task.description}",
+            code_context=plan_code_context,
+            plan_steps=plan.steps if plan else None,
+        )
+
         # 4. Step Execution Loop
         current_verified_sha = last_verified_sha or session.base_commit
         stage_metrics: List[Dict[str, Any]] = []
@@ -1018,8 +1120,18 @@ class FusionOrchestrator:
                 )
             )
 
-            # Apply edits strictly via ExecutionBroker
-            step_modified_files = WorkspaceEditor.apply_edits(step_resp.content, broker)
+            # Apply edits strictly via ExecutionBroker with ScopeContract
+            step_rejected: List[Tuple[str, str]] = []
+            step_modified_files = WorkspaceEditor.apply_edits(
+                step_resp.content,
+                broker,
+                scope_contract=scope_contract,
+                task_prompt=f"{task.title}\n{task.description}",
+                rejected_files=step_rejected,
+            )
+            if step_rejected:
+                for rf, r_reason in step_rejected:
+                    emit("status", {"message": f"Scope Contract rejected '{rf}': {r_reason}"})
             for mf in step_modified_files:
                 if mf not in all_modified_files:
                     all_modified_files.append(mf)
@@ -1174,7 +1286,12 @@ class FusionOrchestrator:
                     duration_ms=rep_resp.duration_ms or t_dur,
                     status="success",
                 )
-                repaired = WorkspaceEditor.apply_edits(rep_resp.content, broker)
+                repaired = WorkspaceEditor.apply_edits(
+                    rep_resp.content,
+                    broker,
+                    scope_contract=scope_contract,
+                    task_prompt=f"{task.title}\n{task.description}",
+                )
                 for rf in repaired:
                     if rf not in step_modified_files:
                         step_modified_files.append(rf)
@@ -1317,7 +1434,7 @@ class FusionOrchestrator:
             )
 
         # 6. Extract Unified Diff against original base commit
-        diff = verifier.get_diff(session)
+        diff = verifier.get_diff(session, base_commit=session.base_commit)
 
         # 7. Final Peer Review & Bounded Final Repair
         review_result = None
@@ -1428,7 +1545,12 @@ class FusionOrchestrator:
                     duration_ms=rep_resp.duration_ms or t_dur,
                     status="success",
                 )
-                WorkspaceEditor.apply_edits(rep_resp.content, broker)
+                WorkspaceEditor.apply_edits(
+                    rep_resp.content,
+                    broker,
+                    scope_contract=scope_contract,
+                    task_prompt=f"{task.title}\n{task.description}",
+                )
                 final_verif = verifier.run_tests(session, test_command=self.config.verification_command, broker=broker)
                 self.state_manager.record_verification(
                     task_id=task.id,
@@ -1441,7 +1563,7 @@ class FusionOrchestrator:
                     stdout=final_verif.stdout,
                     stderr=final_verif.stderr,
                 )
-                diff = verifier.get_diff(session)
+                diff = verifier.get_diff(session, base_commit=session.base_commit)
 
                 if budget.can_call_provider()[0]:
                     self.state_manager.update_task_stage(task.id, "final_rereview")
@@ -1846,21 +1968,83 @@ class FusionOrchestrator:
                     agent_source="Fusion Agent Orchestrator",
                 )
 
-            # 7. Update Task Status
-            task.status = TaskStatus.COMPLETED
-            self.state_manager.update_task_status(
-                task.id,
-                TaskStatus.COMPLETED,
-                verification_passed=(verification_result.passed if verification_result else True),
-                repair_rounds=getattr(deliberation, "rounds_executed", 1) - 1 if deliberation else 0,
+            # 7. No-Op Completion Guard & Final Status Evaluation
+            implementation_required = (
+                routing.task_assessment.implementation_required
+                if routing.task_assessment
+                else False
             )
-            emit("status", {"message": "Task completed successfully."})
+            has_diff = bool(diff and diff.strip())
+
+            if implementation_required and not has_diff:
+                repo_root = Path(self.config.project_root).resolve()
+                if workspace_session and hasattr(workspace_session, "worktree_path") and workspace_session.worktree_path:
+                    wt_path = Path(workspace_session.worktree_path).resolve()
+                    if wt_path.exists():
+                        repo_root = wt_path
+
+                full_resp_text = (
+                    (deliberation.synthesized_output if deliberation else "")
+                    + " "
+                    + (deliberation.proposals[-1].content if (deliberation and deliberation.proposals) else "")
+                )
+
+                evidence_res = AffirmativeEvidenceValidator.validate_no_change_evidence(
+                    task=task,
+                    repo_path=repo_root,
+                    verification_result=verification_result,
+                    response_text=full_resp_text,
+                )
+
+                if evidence_res.is_satisfied:
+                    task.status = TaskStatus.COMPLETED
+                    final_answer = f"NO_CHANGE_REQUIRED: Repository verified to already satisfy task requirements with zero edits ({evidence_res.reason})."
+                    emit("status", {"message": final_answer})
+                    self.state_manager.update_task_status(
+                        task.id,
+                        TaskStatus.COMPLETED,
+                        verification_passed=True,
+                    )
+                else:
+                    task.status = TaskStatus.FAILED
+                    fail_msg = f"NO_IMPLEMENTATION_PRODUCED: Task required code modification but produced an empty diff ({evidence_res.reason})."
+                    emit("status", {"message": f"Failure: {fail_msg}"})
+                    self.state_manager.update_task_status(
+                        task.id,
+                        TaskStatus.FAILED,
+                        verification_passed=False,
+                    )
+                    return OrchestratorResult(
+                        task=task,
+                        routing=routing,
+                        deliberation=deliberation or DeliberationResult(
+                            strategy_used="FAILED",
+                            synthesized_output=fail_msg,
+                            participating_providers=[primary_agent.name],
+                        ),
+                        final_answer=fail_msg,
+                        context=context,
+                        workspace_session=workspace_session,
+                        verification_result=verification_result,
+                        diff="",
+                        review_result=review_result,
+                    )
+            else:
+                task.status = TaskStatus.COMPLETED
+                self.state_manager.update_task_status(
+                    task.id,
+                    TaskStatus.COMPLETED,
+                    verification_passed=(verification_result.passed if verification_result else True),
+                    repair_rounds=getattr(deliberation, "rounds_executed", 1) - 1 if deliberation else 0,
+                )
+                emit("status", {"message": "Task completed successfully."})
+                final_answer = deliberation.synthesized_output if deliberation else ""
 
             return OrchestratorResult(
                 task=task,
                 routing=routing,
                 deliberation=deliberation,
-                final_answer=deliberation.synthesized_output,
+                final_answer=final_answer,
                 context=context,
                 workspace_session=workspace_session,
                 verification_result=verification_result,

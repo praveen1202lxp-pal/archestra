@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from fusion_agent.config.schema import OptimizationMode
-from fusion_agent.models.assessment import ReviewRisk, ScopeEstimate, TaskAssessment
+from fusion_agent.models.assessment import (
+    ExecutionIntent,
+    ReviewRisk,
+    ScopeEstimate,
+    TaskAssessment,
+)
 from fusion_agent.models.strategy import StrategyType
 from fusion_agent.models.task import Complexity, TaskType
 from fusion_agent.providers.base import AgentProvider
@@ -39,8 +44,8 @@ class TaskRouter:
         r"\b(plan\s+out|blueprint|structur(e|ing))\b",
     ]
     CODE_PATTERNS = [
-        r"\b(implement(ing|ation)?|creat(e|ing)|add(ing)?|writ(e|ing)|build(ing)?|refactor(ing)?|updat(e|ing)|edit(ing)?|modify(ing)?)\b",
-        r"\b(functions?|class(es)?|methods?|modules?|endpoints?|features?|patch(es)?)\b",
+        r"\b(implement(ing|ation)?|creat(e|ing)|add(ing)?|writ(e|ing)|build(ing)?|refactor(ing)?|updat(e|ing)|edit(ing)?|modify(ing)?|fix(es|ing|ed)?|repair(ing|s|ed)?|resolv(e|ing|es|ed)?|solv(e|ing|es|ed)?|migrat(e|ing|ion)?)\b",
+        r"\b(functions?|class(es)?|methods?|modules?|endpoints?|features?|patch(es)?|tests?|handlers?|routes?|services?)\b",
     ]
     REFACTOR_PATTERNS = [
         r"\b(refactor(ing)?|restructur(e|ing)|reorganiz(e|ing)|renam(e|ing)|clean\s*up|extract|modulariz(e|ing))\b",
@@ -59,8 +64,28 @@ class TaskRouter:
         r"\b(and\s+expose\s+a\s+cli|and\s+add\s+a\s+cli|and\s+create\s+a\s+cli|and\s+.*?\btests?)\b",
     ]
 
+    # Action-verb regexes for operational execution intent
+    EDIT_VERB_PATTERNS = (
+        r"\b(fix(es|ed|ing)?|implement(s|ed|ing|ation)?|creat(e|es|ed|ing)|add(s|ed|ing)?|"
+        r"writ(e|es|rote|ing)|build(s|ing|t)?|refactor(s|ed|ing)?|updat(e|es|ed|ing)|"
+        r"edit(s|ed|ing)?|modify(ing|ies|ied)?|repair(s|ed|ing)?|migrat(e|es|ed|ing|ion)?|"
+        r"resolv(e|es|ed|ing)?|solv(e|es|ed|ing)?|clean\s*up|patch(es|ed|ing)?)\b"
+    )
+    INVESTIGATION_VERB_PATTERNS = (
+        r"\b(investigat(e|es|ed|ing|ion)?|diagnos(e|es|ed|ing|is)?|troubleshoot(ing|s)?|"
+        r"find\s+(why|root\s*cause)|why\s+does|why\s+is|inspect(ing|ion)?)\b"
+    )
+    DESIGN_VERB_PATTERNS = (
+        r"\b(architect(ure|ural)?|design(s|ed|ing)?|propos(e|es|ed|al|ing)?|rfc|"
+        r"system\s+design|tradeoffs?|blueprint|spec(ification)?)\b"
+    )
+    QUERY_VERB_PATTERNS = (
+        r"\b(what\s+is|explain|how\s+to|show|list|describe|help|status|where\s+is)\b"
+    )
+    CODE_PATH_PATTERN = r"\b[a-zA-Z0-9_\-./\\]+\.(py|js|ts|jsx|tsx|go|rs|cpp|c|h|java|rb|php|html|css|sql|sh)\b"
+
     def assess_task(self, title_or_prompt: str) -> TaskAssessment:
-        """Perform deterministic V1 TaskAssessment on task prompt."""
+        """Perform deterministic TaskAssessment on task prompt deriving ExecutionIntent."""
         text = title_or_prompt.lower()
 
         debugging = any(re.search(p, text) for p in self.BUG_PATTERNS)
@@ -72,75 +97,122 @@ class TaskRouter:
         multi_file = any(re.search(p, text) for p in self.MULTI_FILE_PATTERNS)
         multi_component = any(re.search(p, text) for p in self.MULTI_COMPONENT_PATTERNS)
 
-        # 1. Determine TaskType
-        if debugging:
-            task_type = TaskType.BUG_INVESTIGATION
-        elif code:
-            task_type = TaskType.CODE_MODIFICATION
-        elif arch:
-            task_type = TaskType.ARCHITECTURE_DESIGN
-        elif refactor:
-            task_type = TaskType.CRITICAL_REFACTOR
+        # Code paths mentioned in prompt
+        code_paths = re.findall(self.CODE_PATH_PATTERN, text)
+        is_multi_file = multi_file or multi_component or len(code_paths) >= 2
+
+        has_edit_verbs = bool(re.search(self.EDIT_VERB_PATTERNS, text))
+        has_query_verbs = bool(re.search(self.QUERY_VERB_PATTERNS, text))
+        has_investigate_verbs = bool(re.search(self.INVESTIGATION_VERB_PATTERNS, text))
+        has_design_verbs = bool(re.search(self.DESIGN_VERB_PATTERNS, text))
+
+        # 1. Determine ExecutionIntent and implementation requirement
+        if has_edit_verbs:
+            if is_multi_file:
+                execution_intent = ExecutionIntent.MULTI_STEP_CODE_EDIT
+            else:
+                execution_intent = ExecutionIntent.CODE_EDIT
+            implementation_required = True
+        elif has_design_verbs and not code_paths:
+            execution_intent = ExecutionIntent.DESIGN_ANALYSIS
+            implementation_required = False
+        elif has_investigate_verbs and not code_paths and not has_edit_verbs:
+            execution_intent = ExecutionIntent.INVESTIGATION
+            implementation_required = False
+        elif has_query_verbs and not code_paths and not has_edit_verbs:
+            execution_intent = ExecutionIntent.ANSWER_ONLY
+            implementation_required = False
+        elif code_paths or code or refactor:
+            execution_intent = ExecutionIntent.MULTI_STEP_CODE_EDIT if is_multi_file else ExecutionIntent.CODE_EDIT
+            implementation_required = True
         elif simple:
+            execution_intent = ExecutionIntent.ANSWER_ONLY
+            implementation_required = False
+        else:
+            execution_intent = ExecutionIntent.ANSWER_ONLY
+            implementation_required = False
+
+        # 2. Determine TaskType
+        if execution_intent in (ExecutionIntent.CODE_EDIT, ExecutionIntent.MULTI_STEP_CODE_EDIT):
+            if debugging:
+                task_type = TaskType.BUG_INVESTIGATION
+            elif refactor:
+                task_type = TaskType.CRITICAL_REFACTOR
+            else:
+                task_type = TaskType.CODE_MODIFICATION
+        elif execution_intent == ExecutionIntent.INVESTIGATION:
+            task_type = TaskType.BUG_INVESTIGATION
+        elif execution_intent == ExecutionIntent.DESIGN_ANALYSIS:
+            task_type = TaskType.ARCHITECTURE_DESIGN
+        elif execution_intent == ExecutionIntent.ANSWER_ONLY:
             task_type = TaskType.SIMPLE_QUERY
         else:
             task_type = TaskType.GENERAL
 
-        # 2. Determine Complexity
+        # 3. Determine Complexity
         if security or (debugging and arch):
             complexity = Complexity.CRITICAL
-        elif debugging or arch or multi_component:
+        elif execution_intent == ExecutionIntent.MULTI_STEP_CODE_EDIT or (debugging and not has_edit_verbs) or arch or multi_component:
             complexity = Complexity.HIGH
-        elif code or refactor:
+        elif implementation_required or code or refactor:
             complexity = Complexity.MEDIUM
         elif simple:
             complexity = Complexity.LOW
         else:
             complexity = Complexity.MEDIUM
 
-        # 3. Determine Estimated Scope
-        if multi_file or multi_component:
+        # 4. Determine Estimated Scope
+        if is_multi_file or execution_intent == ExecutionIntent.MULTI_STEP_CODE_EDIT:
             scope = ScopeEstimate.MULTI_FILE
-        elif task_type in (TaskType.CODE_MODIFICATION, TaskType.CRITICAL_REFACTOR):
-            scope = ScopeEstimate.SINGLE_FILE
-        elif task_type == TaskType.ARCHITECTURE_DESIGN:
+        elif execution_intent == ExecutionIntent.DESIGN_ANALYSIS or task_type == TaskType.ARCHITECTURE_DESIGN:
             scope = ScopeEstimate.REPO_WIDE
+        elif implementation_required:
+            scope = ScopeEstimate.SINGLE_FILE
         else:
             scope = ScopeEstimate.SINGLE_FILE
 
-
-        # 4. Determine Review Risk
+        # 5. Determine Review Risk
         if security:
             risk = ReviewRisk.CRITICAL
-        elif complexity in (Complexity.HIGH, Complexity.CRITICAL):
+        elif complexity in (Complexity.HIGH, Complexity.CRITICAL) or scope in (ScopeEstimate.MULTI_FILE, ScopeEstimate.REPO_WIDE):
             risk = ReviewRisk.HIGH
-        elif task_type in (TaskType.CODE_MODIFICATION, TaskType.CRITICAL_REFACTOR):
+        elif arch or (debugging and not has_edit_verbs) or is_multi_file or any(w in text for w in ["refactor", "migrate", "redesign"]):
+            risk = ReviewRisk.MEDIUM
+        elif complexity == Complexity.LOW:
+            risk = ReviewRisk.LOW
+        elif implementation_required and scope == ScopeEstimate.SINGLE_FILE and len(code_paths) == 1 and not arch and not security and any(w in text for w in ["fix", "repair", "correct", "typo", "minor", "off-by-one"]):
+            risk = ReviewRisk.LOW
+        elif implementation_required:
             risk = ReviewRisk.MEDIUM
         else:
             risk = ReviewRisk.LOW
 
-        # 5. Expected Files Count
-        if scope == ScopeEstimate.REPO_WIDE:
+        # 6. Expected Files Count
+        if len(code_paths) > 0:
+            expected_files = len(code_paths)
+        elif scope == ScopeEstimate.REPO_WIDE:
             expected_files = 5
         elif scope == ScopeEstimate.MULTI_FILE:
             expected_files = 3
-        elif code or refactor:
+        elif implementation_required:
             expected_files = 1
         else:
             expected_files = 0
 
-        # 6. Second Model Benefit heuristic
-        if complexity == Complexity.LOW or task_type == TaskType.SIMPLE_QUERY:
+        # 7. Second Model Benefit heuristic
+        if complexity == Complexity.LOW or execution_intent == ExecutionIntent.ANSWER_ONLY:
             second_model_benefit = False
-        elif security or complexity in (Complexity.HIGH, Complexity.CRITICAL) or task_type == TaskType.BUG_INVESTIGATION:
+        elif security or complexity in (Complexity.HIGH, Complexity.CRITICAL) or execution_intent == ExecutionIntent.INVESTIGATION:
             second_model_benefit = True
-        elif (code or refactor) and risk in (ReviewRisk.MEDIUM, ReviewRisk.HIGH, ReviewRisk.CRITICAL):
+        elif implementation_required and risk in (ReviewRisk.MEDIUM, ReviewRisk.HIGH, ReviewRisk.CRITICAL):
             second_model_benefit = True
         else:
             second_model_benefit = False
 
         rationale = (
-            f"Assessed as {task_type.value} ({complexity.value} complexity, {scope.value} scope, {risk.value} risk). "
+            f"Assessed as {execution_intent.value} / {task_type.value} "
+            f"({complexity.value} complexity, {scope.value} scope, {risk.value} risk). "
+            f"Implementation required: {implementation_required}. "
             f"Second model benefit: {second_model_benefit}."
         )
 
@@ -150,12 +222,13 @@ class TaskRouter:
             estimated_scope=scope,
             architecture_reasoning_required=arch,
             debugging_required=debugging,
-            implementation_required=(code or refactor),
+            implementation_required=implementation_required,
             review_risk=risk,
             expected_files_count=expected_files,
             security_sensitive=security,
             second_model_benefit=second_model_benefit,
             rationale=rationale,
+            execution_intent=execution_intent,
         )
 
     def classify_task(self, title_or_prompt: str) -> Tuple[TaskType, Complexity]:
@@ -320,37 +393,38 @@ class TaskRouter:
                 scoring_breakdown=scoring_breakdown,
             )
 
-        # 3. Base strategy selection by task type, complexity, and assessment
-        if (
-            allow_multi_step_planning
-            and assessment.implementation_required
-            and (
-                assessment.estimated_scope in (ScopeEstimate.MULTI_FILE, ScopeEstimate.REPO_WIDE)
-                or (assessment.complexity in (Complexity.HIGH, Complexity.CRITICAL) and assessment.expected_files_count >= 2)
-            )
-        ):
-            base_strategy = StrategyType.CHECKPOINTED_PLAN
-            rationale = "Multi-component task requires checkpointed multi-step execution in an isolated workspace."
+        # 3. Base strategy selection by task assessment and execution intent
+        if assessment.implementation_required:
+            # INVARIANT: Tasks requiring code changes MUST execute via an implementation-capable strategy!
+            if (
+                allow_multi_step_planning
+                and (
+                    assessment.estimated_scope in (ScopeEstimate.MULTI_FILE, ScopeEstimate.REPO_WIDE)
+                    or assessment.execution_intent == ExecutionIntent.MULTI_STEP_CODE_EDIT
+                    or (assessment.complexity in (Complexity.HIGH, Complexity.CRITICAL) and assessment.expected_files_count >= 2)
+                )
+            ):
+                base_strategy = StrategyType.CHECKPOINTED_PLAN
+                rationale = "Multi-component code task requires checkpointed multi-step execution in an isolated workspace."
+            else:
+                base_strategy = StrategyType.AUTONOMOUS_EDIT
+                rationale = "Code modification executes in an isolated workspace with test verification and peer diff review."
 
-        elif task_type == TaskType.SIMPLE_QUERY or complexity == Complexity.LOW:
+        elif assessment.execution_intent == ExecutionIntent.ANSWER_ONLY or task_type == TaskType.SIMPLE_QUERY or complexity == Complexity.LOW:
             base_strategy = StrategyType.DIRECT
             rationale = "Simple task with low complexity; single agent execution is optimal."
 
-        elif task_type == TaskType.BUG_INVESTIGATION:
+        elif assessment.execution_intent == ExecutionIntent.INVESTIGATION or task_type == TaskType.BUG_INVESTIGATION:
             base_strategy = StrategyType.INDEPENDENT_INVESTIGATION
             rationale = "Bug/concurrency investigation benefits from independent hypotheses from both agents."
 
-        elif task_type == TaskType.ARCHITECTURE_DESIGN or complexity in (Complexity.HIGH, Complexity.CRITICAL):
+        elif assessment.execution_intent == ExecutionIntent.DESIGN_ANALYSIS or task_type == TaskType.ARCHITECTURE_DESIGN:
             base_strategy = StrategyType.PROPOSE_CRITIQUE_REFINE
             rationale = "High-complexity design benefits from cross-agent proposal and critique."
 
-        elif task_type in (TaskType.CODE_MODIFICATION, TaskType.CRITICAL_REFACTOR) or assessment.implementation_required:
-            base_strategy = StrategyType.AUTONOMOUS_EDIT
-            rationale = "Code modification executes in an isolated workspace with test verification and peer diff review."
-
         else:
             base_strategy = StrategyType.EXECUTE_AND_REVIEW
-            rationale = "General task executed by primary agent and reviewed by secondary agent."
+            rationale = "General non-code task executed by primary agent and reviewed by secondary agent."
 
         # 4. Optimization mode adjustments
         if optimization_mode == OptimizationMode.FASTEST:
@@ -404,8 +478,15 @@ class TaskRouter:
                 reviewer = peer_candidates[0] if peer_candidates else None
                 implementer = ranked_implementers[0]
 
-        primary = lead if base_strategy == StrategyType.CHECKPOINTED_PLAN else (implementer if base_strategy == StrategyType.AUTONOMOUS_EDIT else lead)
-        secondary = reviewer
+        if base_strategy == StrategyType.CHECKPOINTED_PLAN:
+            primary = lead
+            secondary = implementer if implementer != lead else reviewer
+        elif base_strategy == StrategyType.AUTONOMOUS_EDIT:
+            primary = implementer
+            secondary = reviewer
+        else:
+            primary = lead
+            secondary = reviewer
 
         # If strategy was autonomous edit and single provider or FASTEST mode turned off reviewer
         if base_strategy in (StrategyType.AUTONOMOUS_EDIT, StrategyType.CHECKPOINTED_PLAN) and secondary is None and len(provider_names) > 1 and not assessment.second_model_benefit:

@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -49,6 +50,7 @@ class ExecutionBroker:
         "LC_ALL",
         "PYTHONIOENCODING",
         "PYTHONUTF8",
+        "PYTHONPATH",
         "VIRTUAL_ENV",
     }
 
@@ -126,6 +128,14 @@ class ExecutionBroker:
                 raise PermissionError("Access denied: Direct modification of .git repository metadata is prohibited.")
 
         return resolved_real
+
+    def file_exists(self, path: Union[str, Path]) -> bool:
+        """Check if file exists within contained worktree."""
+        try:
+            target = self.resolve_path(path)
+            return target.is_file()
+        except Exception:
+            return False
 
     def read_file(self, path: Union[str, Path]) -> str:
         """Read content from a contained file."""

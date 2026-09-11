@@ -1,5 +1,11 @@
 """Domain models for tasks, strategies, and deliberation."""
 
+from fusion_agent.models.assessment import (
+    ExecutionIntent,
+    ReviewRisk,
+    ScopeEstimate,
+    TaskAssessment,
+)
 from fusion_agent.models.task import Task, TaskStatus, TaskType, Complexity
 from fusion_agent.models.strategy import StrategyType
 from fusion_agent.models.deliberation import (
@@ -19,6 +25,10 @@ from fusion_agent.models.context import (
 )
 
 __all__ = [
+    "ExecutionIntent",
+    "TaskAssessment",
+    "ScopeEstimate",
+    "ReviewRisk",
     "Task",
     "TaskStatus",
     "TaskType",

@@ -1,6 +1,6 @@
-"""Automated verification pipeline and diff generation within an isolated workspace."""
-
+import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +55,13 @@ class WorkspaceVerifier:
 
         # Resolve command with strict V1 security policy
         cmd = test_command or self.detect_trusted_test_command(session.repo_root)
+
+        # Resolve bare 'pytest' to active python -m pytest
+        if isinstance(cmd, str):
+            if cmd.strip() == "pytest":
+                cmd = f'"{sys.executable}" -m pytest'
+            elif cmd.startswith("pytest "):
+                cmd = f'"{sys.executable}" -m pytest ' + cmd[len("pytest "):]
         if not cmd:
             return VerificationResult(
                 passed=False,
@@ -72,6 +79,9 @@ class WorkspaceVerifier:
 
         exec_broker = broker or ExecutionBroker(session)
         sanitized_env = exec_broker.build_sanitized_env()
+        # Ensure current worktree root is in PYTHONPATH so local package imports succeed
+        curr_pp = sanitized_env.get("PYTHONPATH", "")
+        sanitized_env["PYTHONPATH"] = f".{os.pathsep}{curr_pp}" if curr_pp else "."
 
         start_time = time.perf_counter()
         try:
@@ -108,8 +118,8 @@ class WorkspaceVerifier:
                 command=str(cmd),
             )
 
-    def get_diff(self, session: WorkspaceSession) -> str:
-        """Extract a clean unified diff of all modifications made in the worktree against HEAD."""
+    def get_diff(self, session: WorkspaceSession, base_commit: Optional[str] = None) -> str:
+        """Extract a clean unified diff of all modifications made in the worktree against base_commit or HEAD."""
         worktree_path = str(session.worktree_dir)
         # Mark all untracked files with intent-to-add so they appear in git diff
         subprocess.run(
@@ -118,8 +128,9 @@ class WorkspaceVerifier:
             capture_output=True,
             check=False,
         )
+        target = base_commit or getattr(session, "base_commit", "") or "HEAD"
         proc = subprocess.run(
-            ["git", "diff", "HEAD"],
+            ["git", "diff", target],
             cwd=worktree_path,
             capture_output=True,
             text=True,

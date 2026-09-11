@@ -16,11 +16,18 @@ from fusion_agent.providers.codex_cli import CodexCLIProvider
 class CodexAloneAdapter(BaseSUTAdapter):
     """Executes benchmark tasks using standalone Codex CLI directly."""
 
-    def __init__(self, cli_path: Optional[str] = None, is_live: bool = False, reasoning_effort: str = "medium"):
+    def __init__(
+        self,
+        cli_path: Optional[str] = None,
+        is_live: bool = False,
+        reasoning_effort: str = "medium",
+        model_id: Optional[str] = None,
+    ):
         super().__init__(sut=SystemUnderTest.CODEX_ALONE)
         self.cli_path = cli_path or CodexCLIProvider()._resolve_executable()
         self.is_live = is_live
         self.reasoning_effort = reasoning_effort
+        self.model_id = model_id
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
@@ -49,6 +56,8 @@ class CodexAloneAdapter(BaseSUTAdapter):
                     "--json",
                     "-",
                 ]
+                if self.model_id:
+                    cmd.extend(["--model", self.model_id])
                 res = subprocess.run(
                     cmd,
                     input=task.prompt,
