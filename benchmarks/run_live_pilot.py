@@ -102,7 +102,7 @@ def run_pilot():
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=60,
     )
     agy_docker_healthy = (proc_agy_dock.returncode == 0 and "1.2.0" in proc_agy_dock.stdout)
 
