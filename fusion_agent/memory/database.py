@@ -117,6 +117,7 @@ class Database:
                 "execution_config_snapshot TEXT",
                 "repo_fingerprint TEXT",
                 "base_commit TEXT",
+                "scope_expansions_json TEXT",
             ):
                 try:
                     conn.execute(f"ALTER TABLE tasks ADD COLUMN {col};")
@@ -187,6 +188,19 @@ class Database:
                         FOREIGN KEY(task_id) REFERENCES tasks(id)
                     );
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS scope_expansions (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        file_path TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        decision TEXT NOT NULL DEFAULT 'approved',
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY(task_id) REFERENCES tasks(id)
+                    );
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_scope_expansions_task ON scope_expansions(task_id);")
             except sqlite3.OperationalError:
                 pass
 

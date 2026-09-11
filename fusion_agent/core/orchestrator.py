@@ -368,6 +368,8 @@ class FusionOrchestrator:
         scope_contract = ScopeContract.derive(
             task_prompt=f"{task.title}\n{task.description}",
             code_context=code_context,
+            state_manager=self.state_manager,
+            task_id=task.id,
         )
 
         emit("status", {"message": f"{impl.name} is formulating structured code modifications..."})
@@ -1000,6 +1002,8 @@ class FusionOrchestrator:
             task_prompt=f"{task.title}\n{task.description}",
             code_context=plan_code_context,
             plan_steps=plan.steps if plan else None,
+            state_manager=self.state_manager,
+            task_id=task.id,
         )
 
         # 4. Step Execution Loop

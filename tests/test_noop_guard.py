@@ -287,3 +287,55 @@ def test_edit_task_retry_still_empty_fails_closed(tmp_path):
         assert "NO_IMPLEMENTATION_PRODUCED" in result.final_answer
 
     db.close()
+
+
+def test_persuasive_prose_empty_patch_unrelated_tests_fails_closed_as_no_implementation(tmp_path):
+    """An autonomous model's persuasive prose assertion ('already implemented') with an empty patch
+    and only unrelated/general tests passing must NOT authorize NO_CHANGE_REQUIRED.
+    It MUST fail closed with NO_IMPLEMENTATION_PRODUCED.
+    """
+    db = Database(":memory:")
+    config = FusionConfig.default_mock_config(project_name="PersuasiveProseNegativeTest")
+    config.project_root = str(tmp_path)
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    target_file = src_dir / "service.py"
+    target_file.write_text("# service stub without metrics\n", encoding="utf-8")
+
+    # Persuasive model prose claiming everything is already implemented and verified
+    persuasive_prose = (
+        "I thoroughly inspected the repository and verified that the requested feature is already implemented "
+        "and fully operational in the codebase. All requirements are already satisfied and no change is required."
+    )
+    agent_1 = MockProvider(name="coder", default_response=persuasive_prose)
+    agent_2 = MockProvider(name="reviewer", default_response="[APPROVED]\nConcur, already implemented.")
+
+    orchestrator = FusionOrchestrator(
+        config=config,
+        database=db,
+        providers={"coder": agent_1, "reviewer": agent_2},
+    )
+
+    # Only unrelated test passed
+    unrelated_verif = VerificationResult(
+        passed=True,
+        exit_code=0,
+        stdout="tests/test_unrelated.py::test_basic PASSED\n1 passed",
+        stderr="",
+        duration_seconds=0.05,
+        command="pytest tests/test_unrelated.py",
+    )
+
+    with patch("fusion_agent.workspace.session.WorkspaceSession.prepare"), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.run_tests", return_value=unrelated_verif), \
+         patch("fusion_agent.workspace.verifier.WorkspaceVerifier.get_diff", return_value=""):
+
+        result = orchestrator.run_task("Implement def compute_metrics in src/service.py")
+
+        # MUST fail closed with NO_IMPLEMENTATION_PRODUCED, not NO_CHANGE_REQUIRED
+        assert result.task.status == TaskStatus.FAILED
+        assert "NO_CHANGE_REQUIRED" not in result.final_answer
+        assert "NO_IMPLEMENTATION_PRODUCED" in result.final_answer
+
+    db.close()

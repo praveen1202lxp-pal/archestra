@@ -159,6 +159,8 @@ class ProjectStateManager:
         execution_config_snapshot: Optional[str] = None,
         repo_fingerprint: Optional[str] = None,
         base_commit: Optional[str] = None,
+        scope_expansions_json: Optional[str] = None,
+        **kwargs: Any,
     ) -> None:
         """Update task status and optional completion timestamp, metrics, and recovery attributes."""
         conn = self.db.connect()
@@ -198,6 +200,9 @@ class ProjectStateManager:
         if base_commit is not None:
             updates.append("base_commit = ?")
             params.append(base_commit)
+        if kwargs.get("scope_expansions_json") is not None:
+            updates.append("scope_expansions_json = ?")
+            params.append(kwargs["scope_expansions_json"])
             
         params.append(task_id)
         sql = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?;"
@@ -232,9 +237,70 @@ class ProjectStateManager:
             execution_config_snapshot=row["execution_config_snapshot"] if "execution_config_snapshot" in row_keys else None,
             repo_fingerprint=row["repo_fingerprint"] if "repo_fingerprint" in row_keys else None,
             base_commit=row["base_commit"] if "base_commit" in row_keys else None,
+            scope_expansions_json=row["scope_expansions_json"] if "scope_expansions_json" in row_keys else None,
             created_at=row["created_at"],
             completed_at=row["completed_at"],
         )
+
+    def record_scope_expansion(
+        self,
+        task_id: str,
+        file_path: str,
+        category: str,
+        reason: str,
+        decision: str = "approved",
+    ) -> None:
+        """Record an approved or audited scope expansion decision in durable memory."""
+        conn = self.db.connect()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        exp_id = f"scope_exp_{uuid.uuid4().hex[:12]}"
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO scope_expansions (id, task_id, file_path, category, reason, decision, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (exp_id, task_id, file_path, category, reason, decision, now_iso),
+            )
+            # Update tasks.scope_expansions_json for atomic task-level restore
+            row = conn.execute("SELECT scope_expansions_json FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+            curr_map = {}
+            if row and "scope_expansions_json" in row.keys() and row["scope_expansions_json"]:
+                try:
+                    curr_map = json.loads(row["scope_expansions_json"])
+                except Exception:
+                    curr_map = {}
+            if decision == "approved":
+                curr_map[file_path] = reason
+            conn.execute(
+                "UPDATE tasks SET scope_expansions_json = ? WHERE id = ?;",
+                (json.dumps(curr_map), task_id),
+            )
+
+    def get_scope_expansions_for_task(self, task_id: str) -> Dict[str, str]:
+        """Fetch all approved scope expansion decisions for a task."""
+        conn = self.db.connect()
+        # Prefer direct query from scope_expansions table
+        try:
+            rows = conn.execute(
+                "SELECT file_path, reason FROM scope_expansions WHERE task_id = ? AND decision = 'approved' ORDER BY created_at ASC;",
+                (task_id,),
+            ).fetchall()
+            result = {row["file_path"]: row["reason"] for row in rows}
+            if result:
+                return result
+        except sqlite3.OperationalError:
+            pass
+
+        # Fallback to tasks.scope_expansions_json if present
+        try:
+            task_row = conn.execute("SELECT scope_expansions_json FROM tasks WHERE id = ?;", (task_id,)).fetchone()
+            if task_row and "scope_expansions_json" in task_row.keys() and task_row["scope_expansions_json"]:
+                return json.loads(task_row["scope_expansions_json"])
+        except Exception:
+            pass
+
+        return {}
 
     def update_task_promotion(self, task_id: str, disposition: Any) -> None:
         """Update promotion disposition on a task."""

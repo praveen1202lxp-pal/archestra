@@ -25,6 +25,8 @@ class ScopeContract:
     new_files_allowed: bool = True
     new_test_files_allowed: bool = True
     scope_expansion_reasons: Dict[str, str] = field(default_factory=dict)
+    state_manager: Optional[Any] = None
+    task_id: Optional[str] = None
 
     # Patterns for files that should be rejected unless explicitly requested in task
     DISALLOWED_DOC_EXTENSIONS: Set[str] = field(default_factory=lambda: {
@@ -45,8 +47,10 @@ class ScopeContract:
         task_prompt: str,
         code_context: Optional[Any] = None,
         plan_steps: Optional[List[Any]] = None,
+        state_manager: Optional[Any] = None,
+        task_id: Optional[str] = None,
     ) -> "ScopeContract":
-        """Derive an initial change scope contract from task wording, context, and conventions."""
+        """Derive an initial change scope contract from task wording, context, conventions, and durable state."""
         expected: List[str] = []
         allowed_related: List[str] = []
 
@@ -114,11 +118,25 @@ class ScopeContract:
                     if clean_sc not in expected and clean_sc not in allowed_related:
                         allowed_related.append(clean_sc)
 
+        # 5. Restore durable scope expansions from state_manager if task_id provided
+        reconstructed_reasons: Dict[str, str] = {}
+        if state_manager and task_id:
+            try:
+                reconstructed_reasons = state_manager.get_scope_expansions_for_task(task_id) or {}
+                for exp_file in reconstructed_reasons:
+                    if exp_file not in expected:
+                        expected.append(exp_file)
+            except Exception:
+                pass
+
         return cls(
             expected_files=expected,
             allowed_related_files=allowed_related,
             new_files_allowed=True,
             new_test_files_allowed=True,
+            scope_expansion_reasons=reconstructed_reasons,
+            state_manager=state_manager,
+            task_id=task_id,
         )
 
     def classify_expansion_request(
@@ -205,9 +223,8 @@ class ScopeContract:
             )
 
             if proves_api_change and matches_related:
-                self.scope_expansion_reasons[norm_path] = f"Approved test update for API/interface change: {reason}"
-                if norm_path not in self.expected_files:
-                    self.expected_files.append(norm_path)
+                appr_reason = f"Approved test update for API/interface change: {reason}"
+                self._record_approval(norm_path, appr_reason, cat)
                 return True, f"Scope expansion approved: verified API/interface change necessitates updating '{norm_path}'."
             else:
                 return False, f"Scope expansion denied for existing test file '{norm_path}': test modification requires verified API/interface change necessity."
@@ -223,9 +240,8 @@ class ScopeContract:
             is_cosmetic_or_churn = any(kw in reason_lower for kw in ["format", "cleanup", "bump version", "tidy", "reorder"])
 
             if proves_necessity and not is_cosmetic_or_churn:
-                self.scope_expansion_reasons[norm_path] = f"Approved dependency/config addition: {reason}"
-                if norm_path not in self.expected_files:
-                    self.expected_files.append(norm_path)
+                appr_reason = f"Approved dependency/config addition: {reason}"
+                self._record_approval(norm_path, appr_reason, cat)
                 return True, f"Scope expansion approved for dependency file '{norm_path}': verified implementation necessity."
             else:
                 return False, f"Scope expansion denied for dependency file '{norm_path}': unverified or opportunistic dependency modification."
@@ -253,9 +269,8 @@ class ScopeContract:
             proves_component_need = any(re.search(p, reason_lower) for p in component_necessity_patterns)
 
             if is_valid_dir and (proves_component_need or is_migration):
-                self.scope_expansion_reasons[norm_path] = f"Approved new implementation component: {reason}"
-                if norm_path not in self.expected_files:
-                    self.expected_files.append(norm_path)
+                appr_reason = f"Approved new implementation component: {reason}"
+                self._record_approval(norm_path, appr_reason, cat)
                 return True, f"Scope expansion approved for new file '{norm_path}': legitimate feature component."
             else:
                 return False, f"Scope expansion denied for file '{norm_path}': unauthorized path or unverified necessity."
@@ -265,14 +280,59 @@ class ScopeContract:
         if cat == ScopeExpansionCategory.DOCUMENTATION:
             doc_requested = any(kw in prompt_lower for kw in ["readme", "document", "doc", "notes", "changelog"])
             if doc_requested:
-                self.scope_expansion_reasons[norm_path] = f"Approved documentation: {reason}"
-                if norm_path not in self.expected_files:
-                    self.expected_files.append(norm_path)
+                appr_reason = f"Approved documentation: {reason}"
+                self._record_approval(norm_path, appr_reason, cat)
                 return True, f"Scope expansion approved for documentation file '{norm_path}'."
             else:
                 return False, f"Scope expansion denied for documentation file '{norm_path}': documentation is not a requested deliverable."
 
         return False, f"Scope expansion denied for '{norm_path}': unauthorized scope expansion request."
+
+    def _record_approval(self, norm_path: str, reason: str, category: ScopeExpansionCategory) -> None:
+        """Record approved expansion in-memory and persist to state_manager if available."""
+        self.scope_expansion_reasons[norm_path] = reason
+        if norm_path not in self.expected_files:
+            self.expected_files.append(norm_path)
+        if self.state_manager and self.task_id:
+            try:
+                cat_val = category.value if hasattr(category, "value") else str(category)
+                self.state_manager.record_scope_expansion(
+                    task_id=self.task_id,
+                    file_path=norm_path,
+                    category=cat_val,
+                    reason=reason,
+                    decision="approved",
+                )
+            except Exception:
+                pass
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize contract configuration and decisions."""
+        return {
+            "expected_files": list(self.expected_files),
+            "allowed_related_files": list(self.allowed_related_files),
+            "new_files_allowed": self.new_files_allowed,
+            "new_test_files_allowed": self.new_test_files_allowed,
+            "scope_expansion_reasons": dict(self.scope_expansion_reasons),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        state_manager: Optional[Any] = None,
+        task_id: Optional[str] = None,
+    ) -> "ScopeContract":
+        """Deserialize contract from dictionary."""
+        return cls(
+            expected_files=list(data.get("expected_files", [])),
+            allowed_related_files=list(data.get("allowed_related_files", [])),
+            new_files_allowed=data.get("new_files_allowed", True),
+            new_test_files_allowed=data.get("new_test_files_allowed", True),
+            scope_expansion_reasons=dict(data.get("scope_expansion_reasons", {})),
+            state_manager=state_manager,
+            task_id=task_id,
+        )
 
     def validate_file(
         self,

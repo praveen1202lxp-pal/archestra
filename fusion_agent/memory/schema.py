@@ -43,10 +43,23 @@ CREATE TABLE IF NOT EXISTS tasks (
     execution_config_snapshot TEXT,
     repo_fingerprint TEXT,
     base_commit TEXT,
+    scope_expansions_json TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id)
 );
+
+CREATE TABLE IF NOT EXISTS scope_expansions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    category TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decision TEXT NOT NULL DEFAULT 'approved',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_scope_expansions_task ON scope_expansions(task_id);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id TEXT PRIMARY KEY,

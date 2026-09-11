@@ -1,7 +1,10 @@
 """Unit tests for Planned Change Scope Contract (Milestone 11 Phase C-DEV)."""
 
+from fusion_agent.memory.database import Database
+from fusion_agent.memory.project_state import ProjectStateManager
 from fusion_agent.models.context import CodeContext, SelectedFile
 from fusion_agent.models.plan import PlanStep
+from fusion_agent.models.task import TaskStatus
 from fusion_agent.workspace.scope_contract import ScopeContract, ScopeExpansionCategory
 
 
@@ -224,3 +227,88 @@ def test_scope_contract_expansion_migration_component_for_multi_file_feature_app
     # Subsequent validation confirms authorization
     v_allowed, _ = contract.validate_file("migrations/0003_add_tenants_table.py", is_new_file=True, task_prompt=prompt)
     assert v_allowed is True
+
+
+def test_scope_contract_decision_durability_across_interruption_and_resume(tmp_path):
+    """Simulate generic scenario:
+    task begins
+    -> initial scope excludes an existing test/config/additional implementation file
+    -> Fusion validates and approves a justified expansion
+    -> decision + justification recorded in durable task state
+    -> interruption/crash boundary
+    -> task state restored/resumed
+    -> the same approved expansion and reason are available
+    -> policy cannot silently widen or forget the expansion.
+    """
+    db = Database(":memory:")
+    state_mgr = ProjectStateManager(db)
+    project = state_mgr.get_or_create_project(project_id="proj_scope", name="ScopeDurabilityProj", root_path=str(tmp_path))
+    task = state_mgr.create_task(
+        project_id=project["id"],
+        title="Refactor Client in src/client.py",
+        description="Refactor Client in src/client.py with new mandatory parameter",
+    )
+    prompt = f"{task.title}\n{task.description}"
+
+    # 1. Initial derivation excludes unrequested test modification
+    contract_initial = ScopeContract.derive(task_prompt=prompt, state_manager=state_mgr, task_id=task.id)
+    assert "src/client.py" in contract_initial.expected_files
+    # Existing test file is excluded without explicit justification
+    allowed, _ = contract_initial.validate_file("tests/test_client.py", is_new_file=False, task_prompt=prompt)
+    assert allowed is False
+
+    # 2. Fusion validates and approves justified expansion
+    justification = "API signature changed: Client constructor now requires mandatory timeout parameter"
+    expanded, exp_reason = contract_initial.request_scope_expansion(
+        rel_path="tests/test_client.py",
+        reason=justification,
+        is_new_file=False,
+        task_prompt=prompt,
+    )
+    assert expanded is True
+    assert "tests/test_client.py" in contract_initial.scope_expansion_reasons
+    assert "tests/test_client.py" in contract_initial.expected_files
+
+    # 3. Interruption/crash boundary: process state cleared, task marked interrupted
+    state_mgr.update_task_status(task.id, TaskStatus.INTERRUPTED, interruption_reason="SIGINT_RECEIVED")
+    del contract_initial  # simulate process memory destruction
+
+    # 4. Resume boundary: task state restored, ScopeContract reconstructed
+    task_resumed = state_mgr.get_task(task.id)
+    assert task_resumed is not None
+    contract_resumed = ScopeContract.derive(
+        task_prompt=prompt,
+        state_manager=state_mgr,
+        task_id=task_resumed.id,
+    )
+
+    # 5. Verify durability: approved expansion and reason survived
+    assert "tests/test_client.py" in contract_resumed.scope_expansion_reasons
+    assert justification in contract_resumed.scope_expansion_reasons["tests/test_client.py"]
+    assert "tests/test_client.py" in contract_resumed.expected_files
+
+    # Policy accepts the approved file
+    v_allowed, v_reason = contract_resumed.validate_file(
+        "tests/test_client.py",
+        is_new_file=False,
+        task_prompt=prompt,
+    )
+    assert v_allowed is True
+    assert "authorized via scope expansion" in v_reason
+
+    # Policy CANNOT silently widen: unrelated unapproved files remain strictly denied
+    unapproved_test_allowed, _ = contract_resumed.validate_file(
+        "tests/test_unrelated.py",
+        is_new_file=False,
+        task_prompt=prompt,
+    )
+    assert unapproved_test_allowed is False
+
+    unapproved_dep_allowed, _ = contract_resumed.validate_file(
+        "requirements.txt",
+        is_new_file=False,
+        task_prompt=prompt,
+    )
+    assert unapproved_dep_allowed is False
+
+    db.close()

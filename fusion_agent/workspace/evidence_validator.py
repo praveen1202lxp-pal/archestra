@@ -201,11 +201,22 @@ class AffirmativeEvidenceValidator:
                     stdout_has_targeted_test = True
                     break
 
-        if verif_passed and (is_trusted_targeted_cmd or not is_generic or stdout_has_targeted_test):
+        # Check if the command itself specifically references target files or requested symbols
+        target_stems = [Path(tf).stem.lower() for tf in target_files]
+        cmd_lower = verif_cmd.lower()
+        cmd_references_target = False
+        if target_stems:
+            cmd_references_target = any(stem in cmd_lower for stem in target_stems if len(stem) >= 3)
+        if not cmd_references_target and requested_symbols:
+            cmd_references_target = any(sname.lower() in cmd_lower for _, sname in requested_symbols if len(sname) >= 3)
+
+        is_targeted_cmd = (not is_generic) and cmd_references_target
+
+        if verif_passed and (is_trusted_targeted_cmd or is_targeted_cmd or stdout_has_targeted_test):
             # Targeted test affirmatively passed
             evidence_desc = (
                 f"Targeted test verification passed: command='{verif_cmd}'"
-                if not is_generic
+                if (is_trusted_targeted_cmd or is_targeted_cmd)
                 else f"Targeted tests matching requirement executed and passed in stdout"
             )
             return AffirmativeEvidenceResult(
@@ -225,13 +236,13 @@ class AffirmativeEvidenceValidator:
                 evidence_type="direct_inspection",
             )
 
-        # 6. Fallback: Generic test success alone is insufficient
-        if verif_passed and is_generic:
+        # 6. Fallback: Generic or unrelated test success alone is insufficient
+        if verif_passed:
             return AffirmativeEvidenceResult(
                 is_satisfied=False,
                 reason=(
-                    "Generic project test suite passed, but no targeted reproduction or request-specific "
-                    "evidence was provided proving the requested behavior is already satisfied."
+                    f"Test command passed ('{verif_cmd}'), but it is generic or unrelated to the requested behavior. "
+                    "Autonomous model prose assertions cannot authorize NO_CHANGE_REQUIRED without targeted deterministic evidence."
                 ),
                 evidence_type="none",
             )

@@ -67,5 +67,6 @@ class Task:
     execution_config_snapshot: Optional[str] = None
     repo_fingerprint: Optional[str] = None
     base_commit: Optional[str] = None
+    scope_expansions_json: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     completed_at: Optional[str] = None
