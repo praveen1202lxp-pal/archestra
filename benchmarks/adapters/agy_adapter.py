@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,17 @@ from benchmarks.adapters.base import AdapterRunTelemetry, BaseSUTAdapter
 from benchmarks.schema import BenchmarkTask, SystemUnderTest
 from fusion_agent.providers.antigravity_cli import AntigravityCLIProvider
 from fusion_agent.workspace.editor import WorkspaceEditor
+
+
+def _to_wsl_path(path: Path) -> str:
+    """Convert Windows path to WSL /mnt/<drive>/... path."""
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    posix_path = resolved.as_posix()
+    # Strip drive prefix e.g. "C:"
+    if ":" in posix_path:
+        posix_path = posix_path.split(":", 1)[1]
+    return f"/mnt/{drive}{posix_path}"
 
 
 class AntigravityAloneAdapter(BaseSUTAdapter):
@@ -31,6 +43,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
         native_reasoning = 0
         provider_calls = 0
         cli_version = None
+        active_provider_duration = None
 
         if self.cli_path:
             try:
@@ -39,25 +52,56 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
             except Exception:
                 cli_version = "agy-cli"
 
-        if self.is_live and self.cli_path:
+        if self.is_live:
+            cli_version = "1.2.0 (linux-docker)"
+            trial_vol = f"agy_trial_auth_{uuid.uuid4().hex[:12]}"
+            wsl_repo = _to_wsl_path(repo_path)
             try:
+                # 1. Create fresh disposable auth volume cloned from immutable AUTH_SEED
+                subprocess.run(
+                    ["wsl", "-u", "root", "docker", "volume", "create", trial_vol],
+                    check=True,
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    [
+                        "wsl", "-u", "root", "docker", "run", "--rm", "-i",
+                        "-v", "antigravity_benchmark_auth:/from:ro",
+                        "-v", f"{trial_vol}:/to:rw",
+                        "python:3.11-slim", "cp", "-a", "/from/.", "/to/",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                )
+
+                # 2. Run approved antigravity-benchmark:1.2.0 container
                 cmd = [
-                    self.cli_path,
-                    "--add-dir", str(repo_path),
-                    "-p", task.prompt,
-                    "--effort", self.reasoning_effort,
+                    "wsl", "-u", "root", "docker", "run", "--rm", "-i",
+                    "-e", "GIT_CONFIG_COUNT=1",
+                    "-e", "GIT_CONFIG_KEY_0=safe.directory",
+                    "-e", "GIT_CONFIG_VALUE_0=*",
+                    "-v", f"{wsl_repo}:/workspace:rw",
+                    "-v", f"{trial_vol}:/home/agy/.gemini:rw",
+                    "-w", "/workspace",
+                    "antigravity-benchmark:1.2.0",
                     "--dangerously-skip-permissions",
+                    "--effort", self.reasoning_effort,
                     "--output-format", "json",
+                    "-p", task.prompt,
                 ]
+                t_active_0 = time.time()
                 res = subprocess.run(
                     cmd,
-                    cwd=str(repo_path),
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     timeout=task.timeout_seconds,
                 )
+                active_provider_duration = max(0.01, time.time() - t_active_0)
 
                 response_text = ""
                 try:
@@ -83,11 +127,21 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
 
                 if res.returncode != 0:
                     err_snippet = (res.stderr or res.stdout or "").strip()[:300]
-                    error_message = f"AGY CLI exited with code {res.returncode}: {err_snippet}"
+                    error_message = f"AGY Container exited with code {res.returncode}: {err_snippet}"
             except subprocess.TimeoutExpired:
-                error_message = f"AGY CLI timed out after {task.timeout_seconds}s"
+                error_message = f"AGY Container timed out after {task.timeout_seconds}s"
             except Exception as e:
-                error_message = f"AGY execution failed: {str(e)}"
+                error_message = f"AGY Container execution failed: {str(e)}"
+            finally:
+                # 3. Always destroy the disposable auth volume
+                try:
+                    subprocess.run(
+                        ["wsl", "-u", "root", "docker", "volume", "rm", "-f", trial_vol],
+                        capture_output=True,
+                        stdin=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
         else:
             native_in = 1920
             native_out = 430
@@ -98,7 +152,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
         return AdapterRunTelemetry(
             system_under_test=SystemUnderTest.ANTIGRAVITY_ALONE,
             wall_clock_duration_seconds=duration,
-            active_provider_duration_seconds=duration * 0.95,
+            active_provider_duration_seconds=active_provider_duration if (active_provider_duration is not None) else (duration * 0.95),
             native_input_tokens=native_in,
             native_output_tokens=native_out,
             native_reasoning_tokens=native_reasoning if native_reasoning > 0 else None,

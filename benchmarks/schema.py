@@ -52,6 +52,7 @@ class ValidityDisposition(str, Enum):
     VALID = "VALID"
     INVALIDATED_METHODOLOGY = "INVALIDATED_METHODOLOGY"
     INVALIDATED_INFRASTRUCTURE = "INVALIDATED_INFRASTRUCTURE"
+    INVALIDATED_PROTOCOL_PROVENANCE = "INVALIDATED_PROTOCOL_PROVENANCE"
 
 
 @dataclass
@@ -175,6 +176,10 @@ class BenchmarkRunRecord:
     cli_version: Optional[str] = None
     reasoning_effort: Optional[str] = None
     fusion_config_hash: Optional[str] = None
+    benchmark_harness_commit: Optional[str] = None
+    initial_routing_strategy: Optional[str] = None
+    initial_routing_snapshot_hash: Optional[str] = None
+    container_overhead_seconds: Optional[float] = None
     
     # Outcome & Scoring
     score: BenchmarkScore = BenchmarkScore.FAIL
@@ -183,6 +188,7 @@ class BenchmarkRunRecord:
     regressions_count: int = 0
     files_touched: List[str] = field(default_factory=list)
     unintended_files: List[str] = field(default_factory=list)
+    scope_violated: bool = False
     git_diff: str = ""
     sut_tree_hash: Optional[str] = None
 
@@ -211,6 +217,8 @@ class BenchmarkRunRecord:
     native_input_tokens: Optional[int] = None
     native_output_tokens: Optional[int] = None
     native_reasoning_tokens: Optional[int] = None
+    native_cache_read_tokens: Optional[int] = None
+    native_cache_write_tokens: Optional[int] = None
     provider_managed_overhead_residual: Optional[int] = None
     provider_calls_count: int = 0
     provider_stages: List[str] = field(default_factory=list)

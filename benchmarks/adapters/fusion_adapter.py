@@ -33,14 +33,14 @@ class FusionSUTAdapter(BaseSUTAdapter):
             from fusion_agent.providers.codex_cli import CodexCLIProvider
             from fusion_agent.providers.antigravity_cli import AntigravityCLIProvider
             self.providers = {
-                "codex": CodexCLIProvider(config={"model": "openai/gpt-5", "reasoning_effort": "medium"}),
-                "antigravity": AntigravityCLIProvider(config={"model": "gemini-2.5-pro", "effort": "medium"}),
+                "codex": CodexCLIProvider(config={"reasoning_effort": "medium"}),
+                "antigravity": AntigravityCLIProvider(config={"effort": "medium"}),
             }
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
 
-        temp_state_dir = tempfile.TemporaryDirectory(prefix="fusion_bench_state_")
+        temp_state_dir = tempfile.TemporaryDirectory(prefix="fusion_bench_state_", ignore_cleanup_errors=True)
         state_dir_path = Path(temp_state_dir.name).resolve()
 
         # Build workspace config with EXTERNAL storage_dir
@@ -133,7 +133,7 @@ class FusionSUTAdapter(BaseSUTAdapter):
             error_message = str(exc)
 
         # Remove any lingering Fusion internal bookkeeping inside repo_path as defense-in-depth
-        for junk in [repo_path / ".fusion_state", repo_path / ".fusion_worktrees"]:
+        for junk in [repo_path / ".fusion_state", repo_path / ".fusion_worktrees", repo_path / ".fusion"]:
             if junk.exists():
                 shutil.rmtree(junk, ignore_errors=True)
 

@@ -43,8 +43,9 @@ class CodexAloneAdapter(BaseSUTAdapter):
                 cmd = [
                     self.cli_path,
                     "exec",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "-c", f'model_reasoning_effort="{self.reasoning_effort}"',
+                    "--approve-for-me",
+                    "-c",
+                    f'model_reasoning_effort="{self.reasoning_effort}"',
                     "--json",
                     "-",
                 ]

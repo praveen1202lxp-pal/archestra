@@ -106,7 +106,15 @@ class BenchmarkStorage:
                     
                     recovery_events INTEGER NOT NULL DEFAULT 0,
                     policy_denials INTEGER NOT NULL DEFAULT 0,
-                    error_message TEXT
+                    error_message TEXT,
+
+                    benchmark_harness_commit TEXT,
+                    initial_routing_strategy TEXT,
+                    initial_routing_snapshot_hash TEXT,
+                    scope_violated INTEGER NOT NULL DEFAULT 0,
+                    native_cache_read_tokens INTEGER,
+                    native_cache_write_tokens INTEGER,
+                    container_overhead_seconds REAL
                 )
                 """
             )
@@ -128,6 +136,13 @@ class BenchmarkStorage:
                 ("pre_review_test_passed", "INTEGER"),
                 ("reviewer_findings", "TEXT"),
                 ("repair_patch", "TEXT"),
+                ("benchmark_harness_commit", "TEXT"),
+                ("initial_routing_strategy", "TEXT"),
+                ("initial_routing_snapshot_hash", "TEXT"),
+                ("scope_violated", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_cache_read_tokens", "INTEGER"),
+                ("native_cache_write_tokens", "INTEGER"),
+                ("container_overhead_seconds", "REAL"),
             ]
             for col, col_def in migrations:
                 if col not in existing_cols:
@@ -164,7 +179,10 @@ class BenchmarkStorage:
                     reviewer_findings, repair_patch, fusion_controlled_context_tokens,
                     native_input_tokens, native_output_tokens, native_reasoning_tokens,
                     provider_managed_overhead_residual, provider_calls_count, mcp_calls_count,
-                    recovery_events, policy_denials, error_message
+                    recovery_events, policy_denials, error_message,
+                    benchmark_harness_commit, initial_routing_strategy, initial_routing_snapshot_hash,
+                    scope_violated, native_cache_read_tokens, native_cache_write_tokens,
+                    container_overhead_seconds
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -172,7 +190,7 @@ class BenchmarkStorage:
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -237,6 +255,13 @@ class BenchmarkStorage:
                     record.recovery_events,
                     record.policy_denials,
                     record.error_message,
+                    record.benchmark_harness_commit,
+                    record.initial_routing_strategy,
+                    record.initial_routing_snapshot_hash,
+                    1 if record.scope_violated else 0,
+                    record.native_cache_read_tokens,
+                    record.native_cache_write_tokens,
+                    record.container_overhead_seconds,
                 ),
             )
             conn.commit()
@@ -370,6 +395,13 @@ class BenchmarkStorage:
                     recovery_events=r["recovery_events"],
                     policy_denials=r["policy_denials"],
                     error_message=r["error_message"],
+                    benchmark_harness_commit=r["benchmark_harness_commit"] if "benchmark_harness_commit" in r_keys else None,
+                    initial_routing_strategy=r["initial_routing_strategy"] if "initial_routing_strategy" in r_keys else None,
+                    initial_routing_snapshot_hash=r["initial_routing_snapshot_hash"] if "initial_routing_snapshot_hash" in r_keys else None,
+                    scope_violated=bool(r["scope_violated"]) if "scope_violated" in r_keys else False,
+                    native_cache_read_tokens=r["native_cache_read_tokens"] if "native_cache_read_tokens" in r_keys else None,
+                    native_cache_write_tokens=r["native_cache_write_tokens"] if "native_cache_write_tokens" in r_keys else None,
+                    container_overhead_seconds=r["container_overhead_seconds"] if "container_overhead_seconds" in r_keys else None,
                 )
                 records.append(record)
             return records

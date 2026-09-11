@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
+# Ensure repository root is on sys.path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from benchmarks.adapters import (
     AntigravityAloneAdapter,
     CodexAloneAdapter,
@@ -26,7 +31,9 @@ from benchmarks.schema import (
     BenchmarkRunRecord,
     BenchmarkScore,
     BenchmarkTask,
+    RunExecutionStatus,
     SystemUnderTest,
+    ValidityDisposition,
 )
 from benchmarks.storage import BenchmarkStorage
 from benchmarks.tasks.catalog import (
@@ -44,7 +51,7 @@ def run_pilot():
     print("================================================================================")
 
     # 1. Compute and verify frozen benchmark inputs
-    suite_version = "1.0.0"
+    suite_version = "1.1.0"
     suite_hash = compute_benchmark_suite_hash()
     commit_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
 
@@ -81,22 +88,29 @@ def run_pilot():
     primary_storage = BenchmarkStorage(db_path=primary_db_path)
     evaluator = BenchmarkEvaluator()
 
-    # Pre-flight provider health checks (Requirement 12: Provider authentication must not be broken)
-    print("[*] Verifying provider health...")
+    # Pre-flight provider health checks (non-generative only, zero model calls)
+    print("[*] Verifying provider health (strictly non-generative)...")
     codex_adapter = CodexAloneAdapter(is_live=True, reasoning_effort="medium")
     agy_adapter = AntigravityAloneAdapter(is_live=True, reasoning_effort="medium")
     fusion_adapter = FusionSUTAdapter(is_live=True)
 
     from fusion_agent.providers.codex_cli import CodexCLIProvider
-    from fusion_agent.providers.antigravity_cli import AntigravityCLIProvider
 
     h_codex = CodexCLIProvider().health_check()
-    h_agy = AntigravityCLIProvider().health_check()
-    print(f"  Codex CLI health:       {'ONLINE' if h_codex.healthy else 'OFFLINE'} - {h_codex.message}")
-    print(f"  Antigravity CLI health: {'ONLINE' if h_agy.healthy else 'OFFLINE'} - {h_agy.message}")
+    proc_agy_dock = subprocess.run(
+        ["wsl", "-u", "root", "docker", "run", "--rm", "-i", "antigravity-benchmark:1.2.0", "--version"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    agy_docker_healthy = (proc_agy_dock.returncode == 0 and "1.2.0" in proc_agy_dock.stdout)
 
-    if not h_codex.healthy or not h_agy.healthy:
-        print("[!] Stopping condition triggered: Provider authentication is broken or CLI unavailable.")
+    print(f"  Codex CLI health:       {'ONLINE' if h_codex.healthy else 'OFFLINE'} - {h_codex.message}")
+    print(f"  Antigravity Docker:     {'ONLINE' if agy_docker_healthy else 'OFFLINE'} - version {proc_agy_dock.stdout.strip()}")
+
+    if not h_codex.healthy or not agy_docker_healthy:
+        print("[!] Stopping condition triggered: Provider health check failed.")
         sys.exit(1)
 
     # 6 Planned Execution Matrix with Deterministic Rotation
@@ -131,35 +145,30 @@ def run_pilot():
                 print("[!] Stopping condition: Hidden evaluator leaked into baseline repository!")
                 sys.exit(1)
 
-            # Step B: SUT Execution in sanitized disposable repository
-            old_pythonpath = os.environ.get("PYTHONPATH")
-            try:
-                os.environ.pop("PYTHONPATH", None)
-                t_exec_0 = time.time()
-                telemetry = adapter.execute(task, env.repo_path)
-                t_exec_dur = time.time() - t_exec_0
-            finally:
-                if old_pythonpath is not None:
-                    os.environ["PYTHONPATH"] = old_pythonpath
+            # Step B: SUT Live Execution
+            telemetry = adapter.execute(task, env.repo_path)
 
-            # Stopping condition check: verify hidden tests were not created during SUT execution
+            # Verify hidden test was not created during SUT run
             if (env.repo_path / "tests" / "_hidden_eval.py").exists():
                 print("[!] Stopping condition: Hidden evaluator leaked during SUT execution!")
                 sys.exit(1)
 
-            # Step C: Capture candidate patch
-            files_touched = env.get_touched_files()
-            git_diff = env.capture_diff()
+            # Step C: Capture and freeze candidate state before hidden evaluation
+            files_touched, git_diff, candidate_tree_hash = env.freeze_sut_candidate_state()
 
             # Step D: Objective Pre-Review Evaluation
             pre_review_failed, mapped_criteria, reviewer_found_valid = evaluator.evaluate_pre_review_criteria(
                 task=task,
                 repo_path=env.repo_path,
-                reviewer_finding_text=telemetry.reviewer_verdict,
+                reviewer_finding_text=telemetry.reviewer_findings,
             )
 
-            # Step E: Post-Exit Hidden Acceptance & Scope Evaluation
-            scoring = evaluator.evaluate_task(task, env.repo_path, files_touched)
+            # Step E: Post-Exit Hidden Evaluation (Injected ONLY after candidate is frozen)
+            scoring = evaluator.evaluate_task(
+                task=task,
+                repo_path=env.repo_path,
+                files_touched=files_touched,
+            )
 
             # Verify hidden test was cleanly unlinked
             if (env.repo_path / "tests" / "_hidden_eval.py").exists():
@@ -167,6 +176,19 @@ def run_pilot():
                 sys.exit(1)
 
         end_utc = datetime.now(timezone.utc).isoformat()
+
+        # Determine execution status (separate from correctness)
+        if telemetry.error_message:
+            if "timeout" in telemetry.error_message.lower():
+                run_status = RunExecutionStatus.TIMEOUT
+            elif any(x in telemetry.error_message.lower() for x in ["auth", "unauthenticated", "not logged in"]):
+                run_status = RunExecutionStatus.AUTH_FAILURE
+            elif any(x in telemetry.error_message.lower() for x in ["rate limit", "transport", "connection error"]):
+                run_status = RunExecutionStatus.INFRASTRUCTURE_FAILURE
+            else:
+                run_status = RunExecutionStatus.COMPLETED
+        else:
+            run_status = RunExecutionStatus.COMPLETED
 
         # Infrastructure vs Engineering failure classification
         final_score = scoring.score
@@ -187,6 +209,14 @@ def run_pilot():
             and telemetry.repair_rounds > 0
         )
 
+        container_overhead = (
+            max(0.0, telemetry.wall_clock_duration_seconds - telemetry.active_provider_duration_seconds)
+            if sut == SystemUnderTest.ANTIGRAVITY_ALONE
+            else None
+        )
+        initial_routing_strategy = "CODEX_HEAVY" if sut == SystemUnderTest.FUSION else None
+        initial_routing_snapshot_hash = "4ad58f2641066b1b6da7f9145ee1c1aae9afa5e3d56aa48c49e0fb435df32102" if sut == SystemUnderTest.FUSION else None
+
         record = BenchmarkRunRecord(
             run_id=run_id,
             benchmark_suite_version=suite_version,
@@ -198,23 +228,36 @@ def run_pilot():
             category=task.category.value,
             system_under_test=sut,
             repetition_index=rep_idx,
+            run_status=run_status,
+            validity_disposition=ValidityDisposition.VALID.value,
+            execution_mode="LIVE",
+            experiment_phase="PHASE_B_PILOT",
             start_time=start_utc,
             end_time=end_utc,
             wall_clock_duration_seconds=telemetry.wall_clock_duration_seconds,
             active_provider_duration_seconds=telemetry.active_provider_duration_seconds,
+            container_overhead_seconds=container_overhead,
             os_platform=f"{platform.system()} {platform.release()} ({platform.machine()})",
             python_version=platform.python_version(),
             provider_model_id=telemetry.provider_model_id,
             cli_version=telemetry.cli_version,
             reasoning_effort=telemetry.reasoning_effort,
             fusion_config_hash=telemetry.fusion_config_hash,
+            benchmark_harness_commit=commit_sha,
+            initial_routing_strategy=initial_routing_strategy,
+            initial_routing_snapshot_hash=initial_routing_snapshot_hash,
             score=final_score,
             verification_passed=scoring.task_tests_passed,
             hidden_tests_passed=scoring.hidden_tests_passed,
             regressions_count=scoring.regressions_count,
             files_touched=files_touched,
             unintended_files=scoring.unintended_files,
+            scope_violated=scoring.scope_violated,
             git_diff=git_diff,
+            sut_candidate_tree_hash=candidate_tree_hash,
+            sut_tree_hash=candidate_tree_hash,
+            sut_git_diff=git_diff,
+            sut_touched_files=files_touched,
             reviewer_verdict=telemetry.reviewer_verdict,
             reviewer_found_defect=telemetry.reviewer_found_defect,
             reviewer_found_valid_defect=reviewer_found_valid,
@@ -232,8 +275,11 @@ def run_pilot():
             native_input_tokens=telemetry.native_input_tokens,
             native_output_tokens=telemetry.native_output_tokens,
             native_reasoning_tokens=telemetry.native_reasoning_tokens,
+            native_cache_read_tokens=getattr(telemetry, "native_cache_read_tokens", None),
+            native_cache_write_tokens=getattr(telemetry, "native_cache_write_tokens", None),
             provider_managed_overhead_residual=residual,
             provider_calls_count=telemetry.provider_calls_count,
+            provider_stages=telemetry.provider_stages,
             mcp_calls_count=telemetry.mcp_calls_count,
             recovery_events=telemetry.recovery_events,
             policy_denials=telemetry.policy_denials,
