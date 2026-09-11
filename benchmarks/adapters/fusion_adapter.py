@@ -23,25 +23,27 @@ class FusionSUTAdapter(BaseSUTAdapter):
         config: Optional[FusionConfig] = None,
         providers: Optional[Dict[str, Any]] = None,
         is_live: bool = False,
-        codex_model_id: Optional[str] = None,
-        agy_model_id: Optional[str] = None,
+        codex_model_id: Optional[str] = "gpt-5.6-sol",
+        agy_model_id: Optional[str] = "gemini-3.8-flash-high",
     ):
         super().__init__(sut=SystemUnderTest.FUSION)
         self.config = config
         self.providers = providers
         self.is_live = is_live
-        self.codex_model_id = codex_model_id
-        self.agy_model_id = agy_model_id
+        self.codex_model_id = codex_model_id or "gpt-5.6-sol"
+        self.agy_model_id = agy_model_id or "gemini-3.8-flash-high"
 
         if self.is_live and not self.providers:
             from fusion_agent.providers.codex_cli import CodexCLIProvider
             from fusion_agent.providers.antigravity_cli import AntigravityCLIProvider
-            codex_cfg = {"reasoning_effort": "medium"}
-            if self.codex_model_id:
-                codex_cfg["model"] = self.codex_model_id
-            agy_cfg = {"effort": "medium"}
-            if self.agy_model_id:
-                agy_cfg["model"] = self.agy_model_id
+            codex_cfg = {
+                "model": self.codex_model_id,
+                "reasoning_effort": "medium",
+            }
+            agy_cfg = {
+                "model": self.agy_model_id,
+                "flags": ["--effort", "high"],
+            }
             self.providers = {
                 "codex": CodexCLIProvider(config=codex_cfg),
                 "antigravity": AntigravityCLIProvider(config=agy_cfg),
@@ -241,9 +243,9 @@ class FusionSUTAdapter(BaseSUTAdapter):
             provider_calls_count=res_provider_calls,
             provider_stages=provider_stages,
             mcp_calls_count=1 if task.mcp_context else 0,
-            provider_model_id="fusion-orchestrated(codex+agy)",
+            provider_model_id=f"fusion-orchestrated({self.codex_model_id}+{self.agy_model_id})",
             cli_version="0.11.0",
-            reasoning_effort="medium",
+            reasoning_effort=f"codex:medium,agy:high",
             fusion_config_hash="fusion-m11",
             reviewer_verdict=reviewer_verdict or "APPROVED",
             reviewer_found_defect=reviewer_found_defect,

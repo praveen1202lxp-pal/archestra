@@ -33,14 +33,14 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
         self,
         cli_path: Optional[str] = None,
         is_live: bool = False,
-        reasoning_effort: str = "medium",
-        model_id: Optional[str] = None,
+        reasoning_effort: str = "high",
+        model_id: Optional[str] = "gemini-3.8-flash-high",
     ):
         super().__init__(sut=SystemUnderTest.ANTIGRAVITY_ALONE)
         self.cli_path = cli_path or AntigravityCLIProvider()._resolve_executable()
         self.is_live = is_live
-        self.reasoning_effort = reasoning_effort
-        self.model_id = model_id
+        self.reasoning_effort = reasoning_effort or "high"
+        self.model_id = model_id or "gemini-3.8-flash-high"
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
@@ -95,11 +95,13 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     "antigravity-benchmark:1.2.0",
                     "--dangerously-skip-permissions",
                     "--effort", self.reasoning_effort,
-                    "--output-format", "json",
-                    "-p", task.prompt,
                 ]
                 if self.model_id:
                     cmd.extend(["--model", self.model_id])
+                cmd.extend([
+                    "--output-format", "json",
+                    "-p", task.prompt,
+                ])
                 t_active_0 = time.time()
                 res = subprocess.run(
                     cmd,
@@ -142,15 +144,17 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
             except Exception as e:
                 error_message = f"AGY Container execution failed: {str(e)}"
             finally:
-                # 3. Always destroy the disposable auth volume
-                try:
-                    subprocess.run(
+                # 3. Always destroy the disposable auth volume (retry while container unmounts)
+                for _ in range(10):
+                    rm_res = subprocess.run(
                         ["wsl", "-u", "root", "docker", "volume", "rm", "-f", trial_vol],
                         capture_output=True,
+                        text=True,
                         stdin=subprocess.DEVNULL,
                     )
-                except Exception:
-                    pass
+                    if rm_res.returncode == 0:
+                        break
+                    time.sleep(1.0)
         else:
             native_in = 1920
             native_out = 430
@@ -168,9 +172,9 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
             fusion_controlled_context_tokens=None,
             provider_calls_count=max(1, provider_calls),
             mcp_calls_count=0,
-            provider_model_id="gemini-2.5-pro",
+            provider_model_id=self.model_id or "gemini-3.8-flash-high",
             cli_version=cli_version,
-            reasoning_effort=self.reasoning_effort,
+            reasoning_effort=self.reasoning_effort or "high",
             fusion_config_hash=None,
             reviewer_verdict=None,
             reviewer_found_defect=False,

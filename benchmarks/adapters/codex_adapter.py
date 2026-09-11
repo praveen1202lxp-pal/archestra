@@ -21,13 +21,13 @@ class CodexAloneAdapter(BaseSUTAdapter):
         cli_path: Optional[str] = None,
         is_live: bool = False,
         reasoning_effort: str = "medium",
-        model_id: Optional[str] = None,
+        model_id: Optional[str] = "gpt-5.6-sol",
     ):
         super().__init__(sut=SystemUnderTest.CODEX_ALONE)
         self.cli_path = cli_path or CodexCLIProvider()._resolve_executable()
         self.is_live = is_live
-        self.reasoning_effort = reasoning_effort
-        self.model_id = model_id
+        self.reasoning_effort = reasoning_effort or "medium"
+        self.model_id = model_id or "gpt-5.6-sol"
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
@@ -51,13 +51,15 @@ class CodexAloneAdapter(BaseSUTAdapter):
                     self.cli_path,
                     "exec",
                     "--approve-for-me",
-                    "-c",
-                    f'model_reasoning_effort="{self.reasoning_effort}"',
-                    "--json",
-                    "-",
                 ]
                 if self.model_id:
                     cmd.extend(["--model", self.model_id])
+                if self.reasoning_effort:
+                    cmd.extend(["-c", f'model_reasoning_effort="{self.reasoning_effort}"'])
+                cmd.extend([
+                    "--json",
+                    "-",
+                ])
                 res = subprocess.run(
                     cmd,
                     input=task.prompt,
@@ -91,8 +93,26 @@ class CodexAloneAdapter(BaseSUTAdapter):
                 if res.returncode != 0:
                     err_snippet = (res.stderr or res.stdout or "").strip()[:300]
                     error_message = f"Codex CLI exited with code {res.returncode}: {err_snippet}"
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 error_message = f"Codex CLI timed out after {task.timeout_seconds}s"
+                if exc.stdout:
+                    for line in str(exc.stdout).splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                            if isinstance(event, dict):
+                                ev_type = event.get("type")
+                                if ev_type == "turn.started":
+                                    provider_calls += 1
+                                elif ev_type == "turn.completed":
+                                    usage = event.get("usage", {})
+                                    native_in += usage.get("input_tokens", 0)
+                                    native_out += usage.get("output_tokens", 0)
+                                    native_reasoning += usage.get("reasoning_output_tokens", 0)
+                        except Exception:
+                            pass
             except Exception as e:
                 error_message = f"Codex execution failed: {str(e)}"
         else:
@@ -113,9 +133,9 @@ class CodexAloneAdapter(BaseSUTAdapter):
             fusion_controlled_context_tokens=None,
             provider_calls_count=max(1, provider_calls),
             mcp_calls_count=0,
-            provider_model_id="openai/gpt-5" if "gpt" in (cli_version or "").lower() else "codex-native",
+            provider_model_id=self.model_id or "gpt-5.6-sol",
             cli_version=cli_version,
-            reasoning_effort=self.reasoning_effort,
+            reasoning_effort=self.reasoning_effort or "medium",
             fusion_config_hash=None,
             reviewer_verdict=None,
             reviewer_found_defect=False,
