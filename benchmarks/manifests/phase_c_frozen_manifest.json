@@ -1,6 +1,6 @@
 {
   "product_commit": "118b19f2037db89efe966f486a2fcfd6e5b455dd",
-  "benchmark_harness_commit": "fc671210b84af5a52934bcccf669a96db777269e",
+  "benchmark_harness_commit": "004697179e4f653dc18f0b66919d18a6c35a1dcf",
   "suite_version": "1.1.0",
   "suite_hash": "1615867979751f3fe805115c65126c9b8083e538bc3764103c80e70cb1a8c6d0",
   "codex_exact_model_id": "gpt-5.6-sol",
