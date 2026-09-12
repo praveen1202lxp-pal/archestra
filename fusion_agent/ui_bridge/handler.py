@@ -22,6 +22,7 @@ from fusion_agent.memory.project_state import ProjectStateManager
 from fusion_agent.models.deliberation import ReviewStatus
 from fusion_agent.models.task import PromotionDisposition, TaskStatus
 from fusion_agent.providers.registry import ProviderRegistry
+from fusion_agent.repository.ignore import IgnoreManager
 from fusion_agent.ui_bridge.protocol import (
     BridgeEvent,
     BridgeRequest,
@@ -557,51 +558,80 @@ class UIBridgeHandler:
         if not target_dir.exists() or not target_dir.is_dir():
             return BridgeResponse(id=req_id, success=False, error={"code": UIErrorCode.FILE_NOT_FOUND.value, "message": f"Not a directory: {subpath}"})
 
-        ignored_names = {
-            ".git",
-            "__pycache__",
-            ".pytest_cache",
-            ".venv",
-            "node_modules",
-            ".gemini",
-        }
+        ignore_mgr = IgnoreManager(self.project_root)
+        storage_dir = self.config.storage_dir if self.config else ".fusion"
 
         recursive = params.get("recursive", True)
         entries = []
 
         if recursive:
-            for item in sorted(target_dir.rglob("*"), key=lambda x: (not x.is_dir(), str(x).lower())):
-                rel_parts = item.relative_to(self.project_root).parts
-                if any(p in ignored_names for p in rel_parts):
-                    continue
-                if any(p.startswith(".fusion") and p != ".fusion" for p in rel_parts):
-                    continue
-                if item.name.endswith((".db", ".db-wal", ".db-shm", ".pyc")):
-                    continue
+            for root, dirs, files in os.walk(target_dir):
+                root_path = Path(root)
 
-                rel_path = str(item.relative_to(self.project_root)).replace("\\", "/")
-                entries.append({
-                    "name": item.name,
-                    "path": rel_path,
-                    "is_dir": item.is_dir(),
-                    "size": item.stat().st_size if item.is_file() else None,
-                })
+                # Filter subdirectories in-place so os.walk prunes ignored subtrees (.git, .fusion, node_modules, etc.)
+                kept_dirs = []
+                for d in dirs:
+                    d_path = root_path / d
+                    try:
+                        rel_dir = d_path.relative_to(self.project_root)
+                    except ValueError:
+                        continue
+                    if not ignore_mgr.should_ignore_explorer(rel_dir, storage_dir=storage_dir):
+                        kept_dirs.append(d)
+                dirs[:] = kept_dirs
+
+                # Add visible directories (except target_dir itself)
+                if root_path != target_dir:
+                    try:
+                        rel_root = root_path.relative_to(self.project_root)
+                        rel_str = str(rel_root).replace("\\", "/")
+                        entries.append({
+                            "name": root_path.name,
+                            "path": rel_str,
+                            "is_dir": True,
+                            "size": None,
+                        })
+                    except ValueError:
+                        pass
+
+                # Add visible files
+                for f in files:
+                    f_path = root_path / f
+                    try:
+                        rel_file = f_path.relative_to(self.project_root)
+                    except ValueError:
+                        continue
+                    if ignore_mgr.should_ignore_explorer(rel_file, storage_dir=storage_dir):
+                        continue
+                    rel_str = str(rel_file).replace("\\", "/")
+                    try:
+                        sz = f_path.stat().st_size
+                    except OSError:
+                        sz = None
+                    entries.append({
+                        "name": f,
+                        "path": rel_str,
+                        "is_dir": False,
+                        "size": sz,
+                    })
+
+            entries.sort(key=lambda x: (not x["is_dir"], x["path"].lower()))
         else:
-            for item in sorted(target_dir.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-                if item.name in ignored_names:
+            for item in target_dir.iterdir():
+                try:
+                    rel_item = item.relative_to(self.project_root)
+                except ValueError:
                     continue
-                if item.name.startswith(".fusion") and item.name != ".fusion":
+                if ignore_mgr.should_ignore_explorer(rel_item, storage_dir=storage_dir):
                     continue
-                if item.name.endswith((".db", ".db-wal", ".db-shm", ".pyc")):
-                    continue
-
-                rel_path = str(item.relative_to(self.project_root)).replace("\\", "/")
+                rel_str = str(rel_item).replace("\\", "/")
                 entries.append({
                     "name": item.name,
-                    "path": rel_path,
+                    "path": rel_str,
                     "is_dir": item.is_dir(),
                     "size": item.stat().st_size if item.is_file() else None,
                 })
+            entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
 
         return BridgeResponse(id=req_id, success=True, data={"files": entries, "subpath": subpath})
 
@@ -613,9 +643,15 @@ class UIBridgeHandler:
             return BridgeResponse(id=req_id, success=False, error={"code": UIErrorCode.FILE_NOT_FOUND.value, "message": f"File not found: {filepath}"})
 
         try:
+            rel_path = target.relative_to(self.project_root)
+            ignore_mgr = IgnoreManager(self.project_root)
+            storage_dir = self.config.storage_dir if self.config else ".fusion"
+            if ignore_mgr.should_ignore_explorer(rel_path, storage_dir=storage_dir):
+                return BridgeResponse(id=req_id, success=False, error={"code": UIErrorCode.PATH_TRAVERSAL_DENIED.value, "message": f"Access denied to internal or protected file: {filepath}"})
+
             content = target.read_text(encoding="utf-8", errors="replace")
-            rel_path = str(target.relative_to(self.project_root)).replace("\\", "/")
-            return BridgeResponse(id=req_id, success=True, data={"filepath": rel_path, "content": content})
+            rel_path_str = str(rel_path).replace("\\", "/")
+            return BridgeResponse(id=req_id, success=True, data={"filepath": rel_path_str, "content": content})
         except Exception as exc:
             return BridgeResponse(id=req_id, success=False, error={"code": UIErrorCode.INTERNAL_ERROR.value, "message": str(exc)})
 
@@ -624,10 +660,19 @@ class UIBridgeHandler:
         content = params.get("content", "")
         target = self._safe_resolve(filepath)
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        rel_path = str(target.relative_to(self.project_root)).replace("\\", "/")
-        return BridgeResponse(id=req_id, success=True, data={"filepath": rel_path, "bytes_written": len(content)})
+        try:
+            rel_path = target.relative_to(self.project_root)
+            ignore_mgr = IgnoreManager(self.project_root)
+            storage_dir = self.config.storage_dir if self.config else ".fusion"
+            if ignore_mgr.should_ignore_explorer(rel_path, storage_dir=storage_dir):
+                return BridgeResponse(id=req_id, success=False, error={"code": UIErrorCode.PATH_TRAVERSAL_DENIED.value, "message": f"Access denied to internal or protected file: {filepath}"})
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            rel_path_str = str(rel_path).replace("\\", "/")
+            return BridgeResponse(id=req_id, success=True, data={"filepath": rel_path_str, "bytes_written": len(content)})
+        except Exception as exc:
+            return BridgeResponse(id=req_id, success=False, error={"code": UIErrorCode.INTERNAL_ERROR.value, "message": str(exc)})
 
     def _cmd_get_test_results(self, req_id: Optional[str], params: Dict[str, Any]) -> BridgeResponse:
         if self.active_result and self.active_result.verification_result:

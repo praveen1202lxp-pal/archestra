@@ -120,3 +120,50 @@ def test_ignore_manager_gitignore_and_fusionignore(tmp_path):
     # Non-ignored file
     assert not mgr.should_ignore("fusion_agent/core/orchestrator.py")
     assert not mgr.should_ignore("tests/test_editor.py")
+
+
+def test_ignore_manager_explorer_filtering(tmp_path):
+    """Verify should_ignore_explorer hides Fusion internals, tool dirs, and secrets while preserving user code."""
+    mgr = IgnoreManager(tmp_path)
+
+    # Fusion runtime internals must be ignored
+    assert mgr.should_ignore_explorer(".fusion")
+    assert mgr.should_ignore_explorer(".fusion/locks")
+    assert mgr.should_ignore_explorer(".fusion/worktrees")
+    assert mgr.should_ignore_explorer(".fusion/fusion.db")
+    assert mgr.should_ignore_explorer(".fusion/fusion.db-wal")
+    assert mgr.should_ignore_explorer(".fusion/fusion.db-shm")
+    assert mgr.should_ignore_explorer(".fusion/config.json")
+    assert mgr.should_ignore_explorer("task-99.lock")
+    assert mgr.should_ignore_explorer(".fusion/locks/task-99.lock")
+
+    # Tool and cache directories must be ignored
+    assert mgr.should_ignore_explorer(".git")
+    assert mgr.should_ignore_explorer(".git/config")
+    assert mgr.should_ignore_explorer("node_modules")
+    assert mgr.should_ignore_explorer("node_modules/express/index.js")
+    assert mgr.should_ignore_explorer(".angular")
+    assert mgr.should_ignore_explorer(".angular/cache")
+    assert mgr.should_ignore_explorer("__pycache__")
+    assert mgr.should_ignore_explorer("src/__pycache__/mod.cpython-312.pyc")
+    assert mgr.should_ignore_explorer(".cache")
+    assert mgr.should_ignore_explorer(".temp")
+    assert mgr.should_ignore_explorer(".tmp")
+    assert mgr.should_ignore_explorer(".pytest_cache")
+    assert mgr.should_ignore_explorer("data.sqlite3")
+    assert mgr.should_ignore_explorer("app.db")
+
+    # Sensitive files must be ignored
+    assert mgr.should_ignore_explorer(".env")
+    assert mgr.should_ignore_explorer("keys/server.key")
+
+    # Legitimate user source directories sharing generic names MUST NOT be ignored
+    assert not mgr.should_ignore_explorer("src/locks")
+    assert not mgr.should_ignore_explorer("src/locks/mutex.py")
+    assert not mgr.should_ignore_explorer("src/cache")
+    assert not mgr.should_ignore_explorer("src/cache/lru.py")
+    assert not mgr.should_ignore_explorer("src/temp")
+    assert not mgr.should_ignore_explorer("src/temp/helper.py")
+    assert not mgr.should_ignore_explorer("src/app.py")
+    assert not mgr.should_ignore_explorer("README.md")
+    assert not mgr.should_ignore_explorer("package.json")

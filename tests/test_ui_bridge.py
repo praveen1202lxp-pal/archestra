@@ -127,7 +127,36 @@ def test_path_traversal_prevention(temp_project):
 
 
 def test_safe_file_listing(temp_project):
-    """Verify LIST_FILES excludes internal/secret files (.git, .fusion/*.db, etc.)."""
+    """Verify LIST_FILES excludes internal/secret files (.fusion, .git, locks, worktrees, etc.) while preserving legitimate user files."""
+    fusion_dir = temp_project / ".fusion"
+    (fusion_dir / "locks").mkdir(parents=True, exist_ok=True)
+    (fusion_dir / "locks" / "task-123.lock").write_text("lock", encoding="utf-8")
+    (fusion_dir / "worktrees").mkdir(parents=True, exist_ok=True)
+    (fusion_dir / "worktrees" / "task-123").mkdir(parents=True, exist_ok=True)
+    (fusion_dir / "worktrees" / "task-123" / "temp.py").write_text("# wt", encoding="utf-8")
+    (fusion_dir / "fusion.db-wal").write_text("", encoding="utf-8")
+    (fusion_dir / "fusion.db-shm").write_text("", encoding="utf-8")
+
+    # Tool and VCS directories
+    (temp_project / ".git" / "objects").mkdir(parents=True, exist_ok=True)
+    (temp_project / ".git" / "config").write_text("[core]", encoding="utf-8")
+    (temp_project / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
+    (temp_project / ".angular" / "cache").mkdir(parents=True, exist_ok=True)
+    (temp_project / "__pycache__").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "__pycache__").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"pyc")
+    (temp_project / ".cache").mkdir(parents=True, exist_ok=True)
+    (temp_project / ".temp").mkdir(parents=True, exist_ok=True)
+    (temp_project / ".env").write_text("SECRET=123", encoding="utf-8")
+
+    # Legitimate user source directories sharing generic names
+    (temp_project / "src" / "locks").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "locks" / "mutex.py").write_text("class Mutex:\n    pass\n", encoding="utf-8")
+    (temp_project / "src" / "cache").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "cache" / "lru.py").write_text("class LRU:\n    pass\n", encoding="utf-8")
+    (temp_project / "src" / "temp").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "temp" / "util.py").write_text("def util():\n    pass\n", encoding="utf-8")
+
     handler = UIBridgeHandler(project_root=str(temp_project))
 
     req = BridgeRequest(id="3", command=UICommand.LIST_FILES.value, params={"subpath": ""})
@@ -136,14 +165,56 @@ def test_safe_file_listing(temp_project):
     assert resp.success is True
     files = resp.data["files"]
     names = [f["name"] for f in files]
+    paths = [f["path"] for f in files]
 
+    # Excluded Fusion runtime internals
+    assert ".fusion" not in names
+    assert ".git" not in names
+    assert "node_modules" not in names
+    assert ".angular" not in names
+    assert "__pycache__" not in names
+    assert ".cache" not in names
+    assert ".temp" not in names
+    assert ".env" not in names
+
+    for p in paths:
+        assert not p.startswith(".fusion"), f"Internal .fusion path exposed: {p}"
+        assert not p.startswith(".git"), f"Internal .git path exposed: {p}"
+        assert not p.startswith("node_modules"), f"node_modules exposed: {p}"
+        assert not p.startswith(".angular"), f".angular exposed: {p}"
+        assert "__pycache__" not in p, f"__pycache__ exposed: {p}"
+        assert not p.endswith((".db", ".db-wal", ".db-shm", ".pyc")), f"Runtime file exposed: {p}"
+        assert not p.endswith(".lock"), f"Lock file exposed: {p}"
+
+    # Verify no top-level or fusion locks/worktrees leaked
+    assert not any(f["name"] == "worktrees" for f in files)
+    # The only 'locks' directory visible must be the user's src/locks
+    for f in files:
+        if f["name"] == "locks":
+            assert f["path"] == "src/locks"
+
+    # Included legitimate user files & directories
     assert "src" in names
     assert "tests" in names
-    assert ".git" not in names
-    # Internal DB files must not be exposed
-    for f in names:
-        assert not f.endswith(".db")
-        assert not f.endswith(".db-wal")
+    assert "src/app.py" in paths
+    assert "src/locks/mutex.py" in paths
+    assert "src/cache/lru.py" in paths
+    assert "src/temp/util.py" in paths
+    assert any(f["path"] == "src/locks" and f["is_dir"] for f in files)
+    assert any(f["path"] == "src/cache" and f["is_dir"] for f in files)
+    assert any(f["path"] == "src/temp" and f["is_dir"] for f in files)
+
+    # Verify READ_FILE blocks access to hidden runtime internals
+    req_denied = BridgeRequest(id="r_bad", command=UICommand.READ_FILE.value, params={"filepath": ".fusion/fusion.db"})
+    resp_denied = handler.handle_request(req_denied)
+    assert resp_denied.success is False
+    assert resp_denied.error["code"] == UIErrorCode.PATH_TRAVERSAL_DENIED.value
+
+    # Verify READ_FILE permits access to legitimate user files in src/locks
+    req_ok = BridgeRequest(id="r_ok", command=UICommand.READ_FILE.value, params={"filepath": "src/locks/mutex.py"})
+    resp_ok = handler.handle_request(req_ok)
+    assert resp_ok.success is True
+    assert "class Mutex" in resp_ok.data["content"]
 
 
 def test_file_read_and_write(temp_project):
