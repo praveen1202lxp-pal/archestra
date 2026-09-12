@@ -49,3 +49,6 @@ htmlcov/
 
 # Benchmark Results & Telemetry
 benchmarks/results/
+
+# Scratch directory
+scratch/

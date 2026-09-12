@@ -7,6 +7,10 @@ describe('StateService', () => {
   let bridgeService: BridgeService;
 
   beforeEach(() => {
+    spyOn(window, 'fetch').and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: {} })))
+    );
+
     TestBed.configureTestingModule({
       providers: [StateService, BridgeService],
     });
@@ -22,6 +26,10 @@ describe('StateService', () => {
   });
 
   it('should open new tab and set as active', async () => {
+    spyOn(bridgeService, 'readFile').and.returnValue(
+      Promise.resolve({ success: true, data: { content: 'def test(): pass' } })
+    );
+
     await service.openFile('src/app.py');
     expect(service.openTabs().length).toBe(1);
     expect(service.activeTab()?.name).toBe('app.py');
@@ -30,12 +38,20 @@ describe('StateService', () => {
   });
 
   it('should mark tab dirty when content changes', async () => {
+    spyOn(bridgeService, 'readFile').and.returnValue(
+      Promise.resolve({ success: true, data: { content: 'def test(): pass' } })
+    );
+
     await service.openFile('src/app.py');
     service.updateActiveTabContent('new modified content');
     expect(service.activeTab()?.isDirty).toBeTrue();
   });
 
   it('should close tab and reset active tab', async () => {
+    spyOn(bridgeService, 'readFile').and.returnValue(
+      Promise.resolve({ success: true, data: { content: 'def test(): pass' } })
+    );
+
     await service.openFile('src/app.py');
     const tabId = service.openTabs()[0].id;
     service.closeTab(tabId);
@@ -44,6 +60,10 @@ describe('StateService', () => {
   });
 
   it('should update task state on submitTask', async () => {
+    spyOn(bridgeService, 'startTask').and.returnValue(
+      Promise.resolve({ success: true, data: { status: 'started' } })
+    );
+
     await service.submitTask('Add feature X');
     expect(service.activeTask().instruction).toBe('Add feature X');
     expect(service.activeTask().timeline.length).toBeGreaterThan(0);

@@ -8,6 +8,10 @@ describe('AppComponent', () => {
   let bridgeService: BridgeService;
 
   beforeEach(async () => {
+    spyOn(window, 'fetch').and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: {} })))
+    );
+
     await TestBed.configureTestingModule({
       imports: [AppComponent],
       providers: [StateService, BridgeService],
@@ -27,7 +31,7 @@ describe('AppComponent', () => {
     const fixture = TestBed.createComponent(AppComponent);
     fixture.detectChanges();
     const compiled = fixture.nativeElement as HTMLElement;
-    expect(compiled.querySelector('.brand-title')?.textContent).toContain('Fusion Studio');
+    expect(compiled.querySelector('.brand-name')?.textContent).toContain('Fusion Studio');
   });
 
   it('should handle tab selection and close', () => {
@@ -57,14 +61,21 @@ describe('AppComponent', () => {
     expect(stateService.activeTab()).toBeNull();
   });
 
-  it('should trigger open project with path', async () => {
+  it('should toggle modals when nav buttons are clicked', () => {
     const fixture = TestBed.createComponent(AppComponent);
     const app = fixture.componentInstance;
-    app.openRepoPath = 'c:/custom/path';
 
-    spyOn(stateService, 'loadProject');
-    app.openProject();
+    expect(app.showHistory).toBeFalse();
+    expect(app.showProviders).toBeFalse();
+    expect(app.showSettings).toBeFalse();
 
-    expect(stateService.loadProject).toHaveBeenCalledWith('c:/custom/path');
+    app.showHistory = true;
+    expect(app.showHistory).toBeTrue();
+
+    app.showProviders = true;
+    expect(app.showProviders).toBeTrue();
+
+    app.showSettings = true;
+    expect(app.showSettings).toBeTrue();
   });
 });

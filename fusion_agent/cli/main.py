@@ -545,6 +545,17 @@ def cmd_mcp(args) -> int:
     return 0
 
 
+def cmd_studio(args) -> int:
+    """Start local-only Python UI server and open browser for Fusion Studio."""
+    from fusion_agent.ui_bridge.http_server import start_studio_server
+    start_studio_server(
+        project_root=args.dir,
+        port=getattr(args, "port", 4200),
+        open_browser=not getattr(args, "no_browser", False),
+    )
+    return 0
+
+
 def cmd_studio_bridge(args) -> int:
     """Start the JSON-RPC stdio UI bridge server for Fusion Studio desktop app."""
     from fusion_agent.ui_bridge.server import UIBridgeServer
@@ -645,6 +656,11 @@ def main():
     # Interactive
     subparsers.add_parser("interactive", parents=[common_parser], help="Start an interactive session")
 
+    # Studio (Local Web UI)
+    p_studio = subparsers.add_parser("studio", parents=[common_parser], help="Start Fusion Studio local web IDE")
+    p_studio.add_argument("--port", type=int, default=4200, help="Port to bind local server (default: 4200)")
+    p_studio.add_argument("--no-browser", action="store_true", help="Do not automatically open browser")
+
     # Studio Bridge
     subparsers.add_parser("studio-bridge", parents=[common_parser], help="Start stdio JSON-RPC UI bridge server for Fusion Studio")
 
@@ -678,6 +694,8 @@ def main():
         return cmd_resume(args)
     elif args.command == "interactive":
         return cmd_interactive(args)
+    elif args.command == "studio":
+        return cmd_studio(args)
     elif args.command == "studio-bridge":
         return cmd_studio_bridge(args)
     elif args.command == "mcp":

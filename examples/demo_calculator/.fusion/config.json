@@ -1,0 +1,64 @@
+{
+  "project_name": "demo_calculator",
+  "project_root": "C:\\Users\\pallu\\Desktop\\archestra\\examples\\demo_calculator",
+  "storage_dir": ".fusion",
+  "optimization_mode": "BALANCED",
+  "agents": {
+    "codex": {
+      "provider_name": "OpenAI Codex CLI",
+      "provider_type": "codex_cli",
+      "model": "gpt-5.6-sol",
+      "base_url": null,
+      "env_api_key": null,
+      "extra_params": {
+        "reasoning_effort": "medium"
+      }
+    },
+    "antigravity": {
+      "provider_name": "Google Antigravity CLI",
+      "provider_type": "antigravity_cli",
+      "model": "gemini-3.8-flash-high",
+      "base_url": null,
+      "env_api_key": null,
+      "extra_params": {
+        "effort": "high"
+      }
+    }
+  },
+  "deliberation": {
+    "max_rounds": 3,
+    "max_repair_rounds": 2,
+    "max_provider_calls": 8,
+    "max_model_calls": 8,
+    "max_feedback_chars": 2000,
+    "timeout_seconds": 180.0,
+    "auto_synthesize": true,
+    "max_total_input_tokens": null,
+    "max_total_output_tokens": null,
+    "max_task_duration_seconds": 300.0,
+    "max_premium_provider_calls": 4,
+    "skip_peer_review_for_low_risk": true,
+    "context_max_files": 5,
+    "context_max_chars_per_file": 8000,
+    "context_total_source_chars": 24000,
+    "context_max_test_output_chars": 2000,
+    "context_max_peer_feedback_chars": 2000,
+    "context_max_architecture_chars": 1000,
+    "context_require_minimal_workspace": false,
+    "max_context_expansion_rounds": 1,
+    "max_expansion_files": 2,
+    "max_plan_steps": 5,
+    "max_plan_amendments": 1,
+    "allow_multi_step_planning": true,
+    "plan_critique_required_for_high_risk": true,
+    "max_mcp_calls_per_task": 10,
+    "max_mcp_calls_per_stage": 3,
+    "max_tool_turns_per_stage": 2,
+    "max_mcp_duration_seconds": 60.0,
+    "max_mcp_result_tokens": 8000,
+    "mcp_max_result_chars_per_call": 8000
+  },
+  "verification_command": "pytest tests/test_calculator.py",
+  "log_level": "INFO",
+  "mcp_servers": {}
+}

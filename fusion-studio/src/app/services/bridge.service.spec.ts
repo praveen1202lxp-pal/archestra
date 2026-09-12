@@ -13,46 +13,52 @@ describe('BridgeService', () => {
     expect(service).toBeTruthy();
   });
 
-  it('should return mock project status in dev fallback mode', async () => {
+  it('should call fetch on getProjectStatus', async () => {
+    spyOn(window, 'fetch').and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: { opened: true } })))
+    );
+
     const res = await service.getProjectStatus();
+    expect(window.fetch).toHaveBeenCalled();
     expect(res.success).toBeTrue();
     expect(res.data.opened).toBeTrue();
-    expect(res.data.version).toBe('0.12.0');
-    expect(res.data.optimization_mode).toBe('BALANCED');
   });
 
-  it('should return mock provider status in dev fallback mode', async () => {
-    const res = await service.getProviderStatus();
+  it('should call fetch on listFiles', async () => {
+    spyOn(window, 'fetch').and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: { files: [{ name: 'src' }] } })))
+    );
+
+    const res = await service.listFiles('src');
+    expect(window.fetch).toHaveBeenCalled();
     expect(res.success).toBeTrue();
-    expect(res.data.providers.length).toBeGreaterThan(0);
-    expect(res.data.providers[0].name).toContain('Codex');
+    expect(res.data.files.length).toBe(1);
   });
 
-  it('should list files in dev fallback mode', async () => {
-    const res = await service.listFiles();
-    expect(res.success).toBeTrue();
-    expect(res.data.files.length).toBeGreaterThan(0);
-    const names = res.data.files.map((f: any) => f.name);
-    expect(names).toContain('src');
-    expect(names).toContain('tests');
-  });
-
-  it('should handle startTask and emit events in dev fallback mode', async () => {
-    const events: any[] = [];
-    service.events$.subscribe((e) => events.push(e));
+  it('should call fetch on startTask', async () => {
+    spyOn(window, 'fetch').and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: { status: 'started' } })))
+    );
 
     const res = await service.startTask('Add input validation');
+    expect(window.fetch).toHaveBeenCalled();
     expect(res.success).toBeTrue();
-    expect(res.data.task_id).toBe('task-demo');
   });
 
-  it('should handle approveTask and rejectTask', async () => {
+  it('should call fetch on approveTask and rejectTask', async () => {
+    const fetchSpy = spyOn(window, 'fetch').and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: { promoted: true } })))
+    );
+
     const approveRes = await service.approveTask('task-1');
     expect(approveRes.success).toBeTrue();
-    expect(approveRes.data.promoted).toBeTrue();
+    expect(fetchSpy).toHaveBeenCalled();
+
+    fetchSpy.and.returnValue(
+      Promise.resolve(new Response(JSON.stringify({ success: true, data: { discarded: true } })))
+    );
 
     const rejectRes = await service.rejectTask('task-1');
     expect(rejectRes.success).toBeTrue();
-    expect(rejectRes.data.discarded).toBeTrue();
   });
 });

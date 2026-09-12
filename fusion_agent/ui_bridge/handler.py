@@ -566,22 +566,42 @@ class UIBridgeHandler:
             ".gemini",
         }
 
+        recursive = params.get("recursive", True)
         entries = []
-        for item in sorted(target_dir.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-            if item.name in ignored_names:
-                continue
-            if item.name.startswith(".fusion") and item.name != ".fusion":
-                continue
-            if item.name.endswith((".db", ".db-wal", ".db-shm", ".pyc")):
-                continue
 
-            rel_path = str(item.relative_to(self.project_root)).replace("\\", "/")
-            entries.append({
-                "name": item.name,
-                "path": rel_path,
-                "is_dir": item.is_dir(),
-                "size": item.stat().st_size if item.is_file() else None,
-            })
+        if recursive:
+            for item in sorted(target_dir.rglob("*"), key=lambda x: (not x.is_dir(), str(x).lower())):
+                rel_parts = item.relative_to(self.project_root).parts
+                if any(p in ignored_names for p in rel_parts):
+                    continue
+                if any(p.startswith(".fusion") and p != ".fusion" for p in rel_parts):
+                    continue
+                if item.name.endswith((".db", ".db-wal", ".db-shm", ".pyc")):
+                    continue
+
+                rel_path = str(item.relative_to(self.project_root)).replace("\\", "/")
+                entries.append({
+                    "name": item.name,
+                    "path": rel_path,
+                    "is_dir": item.is_dir(),
+                    "size": item.stat().st_size if item.is_file() else None,
+                })
+        else:
+            for item in sorted(target_dir.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                if item.name in ignored_names:
+                    continue
+                if item.name.startswith(".fusion") and item.name != ".fusion":
+                    continue
+                if item.name.endswith((".db", ".db-wal", ".db-shm", ".pyc")):
+                    continue
+
+                rel_path = str(item.relative_to(self.project_root)).replace("\\", "/")
+                entries.append({
+                    "name": item.name,
+                    "path": rel_path,
+                    "is_dir": item.is_dir(),
+                    "size": item.stat().st_size if item.is_file() else None,
+                })
 
         return BridgeResponse(id=req_id, success=True, data={"files": entries, "subpath": subpath})
 

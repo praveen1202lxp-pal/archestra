@@ -7,7 +7,6 @@ import { HistoryPanelComponent } from './components/history-panel/history-panel.
 import { MonacoEditorComponent } from './components/monaco-editor/monaco-editor.component';
 import { TaskPanelComponent } from './components/task-panel/task-panel.component';
 import { DiagnosticsDrawerComponent } from './components/diagnostics-drawer/diagnostics-drawer.component';
-import { StatusBarComponent } from './components/status-bar/status-bar.component';
 import { SettingsDialogComponent } from './components/settings-dialog/settings-dialog.component';
 
 @Component({
@@ -21,27 +20,21 @@ import { SettingsDialogComponent } from './components/settings-dialog/settings-d
     MonacoEditorComponent,
     TaskPanelComponent,
     DiagnosticsDrawerComponent,
-    StatusBarComponent,
     SettingsDialogComponent,
   ],
   templateUrl: './app.component.html',
   styleUrls: ['./app.component.css'],
 })
 export class AppComponent implements OnInit {
-  public openRepoPath: string = '';
+  public showHistory: boolean = false;
+  public showProviders: boolean = false;
   public showSettings: boolean = false;
 
   constructor(public state: StateService) {}
 
   ngOnInit(): void {
-    // Attempt to load current working repository by default
+    // Load initial project status from local server
     this.state.loadProject('.');
-  }
-
-  public openProject(): void {
-    if (this.openRepoPath.trim()) {
-      this.state.loadProject(this.openRepoPath.trim());
-    }
   }
 
   public selectTab(tab: any): void {
