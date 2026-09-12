@@ -158,6 +158,8 @@ def test_ignore_manager_explorer_filtering(tmp_path):
     assert mgr.should_ignore_explorer("keys/server.key")
 
     # Legitimate user source directories sharing generic names MUST NOT be ignored
+    assert not mgr.should_ignore_explorer(".fusion-notes")
+    assert not mgr.should_ignore_explorer(".fusion-notes/notes.md")
     assert not mgr.should_ignore_explorer("src/locks")
     assert not mgr.should_ignore_explorer("src/locks/mutex.py")
     assert not mgr.should_ignore_explorer("src/cache")
@@ -167,3 +169,65 @@ def test_ignore_manager_explorer_filtering(tmp_path):
     assert not mgr.should_ignore_explorer("src/app.py")
     assert not mgr.should_ignore_explorer("README.md")
     assert not mgr.should_ignore_explorer("package.json")
+
+
+def test_repository_indexer_pre_m14_ignore_behavior(tmp_path):
+    """Verify that general repository indexing outside Studio is unchanged from the pre-M14 policy."""
+    from fusion_agent.repository.indexer import RepositoryIndexer
+
+    # DEFAULT_IGNORE_DIRS must match the exact 13 pre-M14 entries
+    expected_pre_m14_dirs = {
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".pytest_cache",
+        ".fusion",
+        "node_modules",
+        "dist",
+        "build",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".angular",
+    }
+    assert IgnoreManager.DEFAULT_IGNORE_DIRS == expected_pre_m14_dirs
+
+    mgr = IgnoreManager(tmp_path)
+    # Generic cache/temp dirs are NOT in DEFAULT_IGNORE_DIRS and not ignored unless specified in .gitignore
+    assert not mgr.should_ignore(".cache/item.json")
+    assert not mgr.should_ignore(".temp/test.txt")
+    assert not mgr.should_ignore(".tmp/scratch.txt")
+    assert not mgr.should_ignore(".fusion-notes/notes.md")
+
+    # While Studio explorer DOES ignore obvious runtime cache/temp dirs:
+    assert mgr.should_ignore_explorer(".cache/item.json")
+    assert mgr.should_ignore_explorer(".temp/test.txt")
+    assert mgr.should_ignore_explorer(".tmp/scratch.txt")
+    assert not mgr.should_ignore_explorer(".fusion-notes/notes.md")
+
+    # Built-in indexing ignores .fusion and .git
+    assert mgr.should_ignore(".fusion/fusion.db")
+    assert mgr.should_ignore(".git/config")
+
+    # Test with RepositoryIndexer directly
+    fusion_dir = tmp_path / ".fusion"
+    fusion_dir.mkdir(parents=True, exist_ok=True)
+    (fusion_dir / "fusion.db").write_bytes(b"dummy db")
+
+    fusion_notes_dir = tmp_path / ".fusion-notes"
+    fusion_notes_dir.mkdir(parents=True, exist_ok=True)
+    (fusion_notes_dir / "notes.md").write_text("# Notes", encoding="utf-8")
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "app.py").write_text("print('hello')", encoding="utf-8")
+
+    indexer = RepositoryIndexer()
+    proj_index = indexer.index_project(tmp_path)
+    indexed_paths = list(proj_index.file_tree.keys())
+
+    # Indexer discovers .fusion-notes/notes.md and src/app.py, but not .fusion/fusion.db
+    assert any(".fusion-notes/notes.md" in p for p in indexed_paths)
+    assert any("src/app.py" in p for p in indexed_paths)
+    assert not any(".fusion/fusion.db" in p for p in indexed_paths)

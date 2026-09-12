@@ -149,7 +149,9 @@ def test_safe_file_listing(temp_project):
     (temp_project / ".temp").mkdir(parents=True, exist_ok=True)
     (temp_project / ".env").write_text("SECRET=123", encoding="utf-8")
 
-    # Legitimate user source directories sharing generic names
+    # Legitimate user source directories sharing generic names or starting with .fusion
+    (temp_project / ".fusion-notes").mkdir(parents=True, exist_ok=True)
+    (temp_project / ".fusion-notes" / "notes.md").write_text("# Project Notes\n", encoding="utf-8")
     (temp_project / "src" / "locks").mkdir(parents=True, exist_ok=True)
     (temp_project / "src" / "locks" / "mutex.py").write_text("class Mutex:\n    pass\n", encoding="utf-8")
     (temp_project / "src" / "cache").mkdir(parents=True, exist_ok=True)
@@ -178,8 +180,8 @@ def test_safe_file_listing(temp_project):
     assert ".env" not in names
 
     for p in paths:
-        assert not p.startswith(".fusion"), f"Internal .fusion path exposed: {p}"
-        assert not p.startswith(".git"), f"Internal .git path exposed: {p}"
+        assert p != ".fusion" and not p.startswith(".fusion/"), f"Internal .fusion path exposed: {p}"
+        assert p != ".git" and not p.startswith(".git/"), f"Internal .git path exposed: {p}"
         assert not p.startswith("node_modules"), f"node_modules exposed: {p}"
         assert not p.startswith(".angular"), f".angular exposed: {p}"
         assert "__pycache__" not in p, f"__pycache__ exposed: {p}"
@@ -194,6 +196,8 @@ def test_safe_file_listing(temp_project):
             assert f["path"] == "src/locks"
 
     # Included legitimate user files & directories
+    assert ".fusion-notes" in names
+    assert ".fusion-notes/notes.md" in paths
     assert "src" in names
     assert "tests" in names
     assert "src/app.py" in paths
@@ -209,6 +213,12 @@ def test_safe_file_listing(temp_project):
     resp_denied = handler.handle_request(req_denied)
     assert resp_denied.success is False
     assert resp_denied.error["code"] == UIErrorCode.PATH_TRAVERSAL_DENIED.value
+
+    # Verify READ_FILE permits access to .fusion-notes/notes.md
+    req_fn = BridgeRequest(id="r_fn", command=UICommand.READ_FILE.value, params={"filepath": ".fusion-notes/notes.md"})
+    resp_fn = handler.handle_request(req_fn)
+    assert resp_fn.success is True
+    assert "# Project Notes" in resp_fn.data["content"]
 
     # Verify READ_FILE permits access to legitimate user files in src/locks
     req_ok = BridgeRequest(id="r_ok", command=UICommand.READ_FILE.value, params={"filepath": "src/locks/mutex.py"})

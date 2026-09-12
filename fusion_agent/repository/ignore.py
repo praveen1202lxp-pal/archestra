@@ -152,10 +152,23 @@ class IgnoreManager:
         ".mypy_cache",
         ".ruff_cache",
         ".angular",
+    }
+
+    # Dedicated Studio Explorer ignore directories
+    EXPLORER_IGNORE_DIRS = {
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".angular",
+        "node_modules",
         ".cache",
         ".temp",
         ".tmp",
-        ".gemini",
     }
 
     EXPLORER_RUNTIME_EXTENSIONS = {
@@ -229,49 +242,50 @@ class IgnoreManager:
     ) -> bool:
         """Check whether a relative path should be excluded from Project Explorer and file APIs.
 
-        Hides:
-        - .fusion/ and any internal state (worktrees, locks, SQLite databases, logs)
-        - .git/
-        - Fusion worktrees and locks (including top-level or inside storage_dir, task-*.lock files)
-        - Runtime SQLite DB / WAL / SHM files (.db, .db-wal, .db-shm, .sqlite, .sqlite3)
-        - Cache and temp directories (.cache, .temp, .tmp, .pytest_cache, __pycache__, etc.)
-        - Compiled bytecode (.pyc, .pyo, .pyd)
-        - .angular/
-        - node_modules/
-        - Secret and sensitive credential files
+        Studio file explorer hides:
+        - exact .fusion/ directory and its contents
+        - configured Fusion storage directory and its contents
+        - exact .git/ directory and its contents
+        - Fusion runtime worktrees/locks
+        - runtime SQLite DB / WAL / SHM files (.db, .db-wal, .db-shm, .sqlite, .sqlite3)
+        - __pycache__, .pytest_cache, .mypy_cache, .ruff_cache, .angular, node_modules
+        - obvious runtime cache/temp directories (.cache, .temp, .tmp)
+        - compiled bytecode (.pyc, .pyo, .pyd)
+        - secret and sensitive credential files (via SecretFilter)
+        - custom patterns from .gitignore / .fusionignore
 
-        Preserves legitimate user source directories (e.g. src/cache, src/locks, src/temp).
+        Preserves legitimate user directories and files (e.g. .fusion-notes/, src/locks/mutex.py, src/cache/).
         """
         norm = str(rel_path).replace("\\", "/").strip("/")
         if not norm:
             return False
 
         parts = norm.split("/")
-        name = parts[-1]
-        name_lower = name.lower()
+        filename = parts[-1]
+        name_lower = filename.lower()
 
-        # 1. Check directory components against DEFAULT_IGNORE_DIRS
-        effective_storage = (storage_dir or ".fusion").replace("\\", "/").strip("/").lower()
+        # 1. Exact match on Fusion runtime directory or configured storage directory
+        # Exact matching ensures legitimate directories like '.fusion-notes/' are NOT hidden.
+        effective_storage = (storage_dir or ".fusion").replace("\\", "/").strip("/")
         for part in parts:
-            part_lower = part.lower()
-            if part_lower in self.DEFAULT_IGNORE_DIRS:
+            if part == ".fusion" or (effective_storage and part == effective_storage):
                 return True
-            if part_lower.startswith(".fusion") or part_lower.startswith(".git"):
+            if part == ".git":
                 return True
-            if effective_storage and part_lower == effective_storage:
+            if part.lower() in self.EXPLORER_IGNORE_DIRS:
                 return True
 
-        # 2. Check Fusion worktrees & locks directories
-        # Hide if under storage_dir / .fusion, or if top-level Fusion directory
+        # 2. Check Fusion runtime worktrees and locks
+        # If at root level or under storage directory:
         if len(parts) == 1 and parts[0].lower() in ("worktrees", "locks"):
             return True
-        if any(p.lower().startswith(".fusion") or p.lower() == effective_storage for p in parts[:-1]):
+        if any(p == ".fusion" or (effective_storage and p == effective_storage) for p in parts[:-1]):
             if name_lower in ("worktrees", "locks"):
                 return True
 
         # 3. Check task locks and lock files associated with Fusion
         if name_lower.endswith(".lock"):
-            if name_lower.startswith("task-") or name_lower.startswith(".fusion") or any(p.lower() == "locks" for p in parts):
+            if name_lower.startswith("task-") or name_lower == ".fusion.lock" or any(p.lower() == "locks" for p in parts):
                 return True
 
         # 4. Check runtime database, WAL, SHM, and bytecode extensions
@@ -279,13 +293,7 @@ class IgnoreManager:
             if name_lower.endswith(ext):
                 return True
 
-        # 5. Check dot-prefixed cache and temp directories anywhere in the path (.cache, .tmp, __pycache__, etc.)
-        for part in parts:
-            p_low = part.lower()
-            if p_low.startswith((".", "__")) and any(k in p_low for k in ("cache", "temp", "tmp")):
-                return True
-
-        # 6. Check SecretFilter (credentials, private keys, .env, etc.)
+        # 5. Check SecretFilter (credentials, private keys, .env, etc.)
         is_secret, _ = SecretFilter.is_secret_or_sensitive(norm)
         if is_secret:
             return True
