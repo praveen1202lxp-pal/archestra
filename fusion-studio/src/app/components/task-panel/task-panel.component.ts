@@ -16,6 +16,7 @@ import { StateService } from '../../services/state.service';
           class="prompt-textarea"
           placeholder="What should Fusion build or change in this repository?"
           [(ngModel)]="taskInstruction"
+          (input)="taskInstruction = $any($event.target).value"
           [disabled]="state.activeTask().is_running"
           (keydown.ctrl.enter)="runTask()"
           rows="4"
@@ -25,7 +26,7 @@ import { StateService } from '../../services/state.service';
           <span class="hint-text">Ctrl+Enter to run</span>
           <button
             class="primary-run-btn"
-            [disabled]="state.activeTask().is_running || !taskInstruction.trim()"
+            [disabled]="state.activeTask().is_running"
             (click)="runTask()"
           >
             @if (state.activeTask().is_running) {
@@ -428,8 +429,10 @@ export class TaskPanelComponent implements OnInit {
   ngOnInit(): void {}
 
   public runTask(): void {
-    if (!this.taskInstruction.trim() || this.state.activeTask().is_running) return;
-    this.state.submitTask(this.taskInstruction.trim());
+    const text = this.taskInstruction?.trim() || (document.querySelector('.prompt-textarea') as HTMLTextAreaElement)?.value?.trim() || '';
+    if (!text || this.state.activeTask().is_running) return;
+    this.taskInstruction = text;
+    this.state.submitTask(text);
   }
 
   public approveChanges(): void {
