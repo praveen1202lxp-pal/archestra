@@ -153,21 +153,26 @@ def run_phase_c_canary():
     canary_storage = BenchmarkStorage(db_path=canary_db_path)
     evaluator = BenchmarkEvaluator()
 
+    PHASE_C_WALL_TIMEOUT_SECONDS = 600.0
+
     # Define adapters with pinned model configurations
     codex_adapter = CodexAloneAdapter(
         is_live=True,
         reasoning_effort=CODEX_PINNED_EFFORT,
         model_id=CODEX_PINNED_MODEL,
+        timeout_seconds=PHASE_C_WALL_TIMEOUT_SECONDS,
     )
     agy_adapter = AntigravityAloneAdapter(
         is_live=True,
         reasoning_effort=AGY_PINNED_EFFORT,
         model_id=AGY_PINNED_MODEL,
+        timeout_seconds=PHASE_C_WALL_TIMEOUT_SECONDS,
     )
     fusion_adapter = FusionSUTAdapter(
         is_live=True,
         codex_model_id=CODEX_PINNED_MODEL,
         agy_model_id=AGY_PINNED_MODEL,
+        timeout_seconds=PHASE_C_WALL_TIMEOUT_SECONDS,
     )
 
     planned_canaries = [
@@ -266,12 +271,13 @@ def run_phase_c_canary():
 
         # Execution status
         if telemetry.error_message:
-            if "timeout" in telemetry.error_message.lower():
+            err_lower = telemetry.error_message.lower()
+            if "timed out" in err_lower or "timeout" in err_lower:
                 run_status = RunExecutionStatus.TIMEOUT
-            elif any(x in telemetry.error_message.lower() for x in ["auth", "unauthenticated", "not logged in"]):
+            elif any(x in err_lower for x in ["auth", "unauthenticated", "not logged in"]):
                 run_status = RunExecutionStatus.AUTH_FAILURE
                 all_healthy = False
-            elif any(x in telemetry.error_message.lower() for x in ["rate limit", "transport", "connection"]):
+            elif any(x in err_lower for x in ["rate limit", "transport", "connection"]):
                 run_status = RunExecutionStatus.INFRASTRUCTURE_FAILURE
                 all_healthy = False
             else:

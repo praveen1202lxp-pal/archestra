@@ -69,11 +69,11 @@ class BenchmarkRunner:
             return MockSUTAdapter(sut=sut, solve_tasks=solve_tasks)
 
         if sut == SystemUnderTest.FUSION:
-            return FusionSUTAdapter(is_live=True)
+            return FusionSUTAdapter(is_live=True, timeout_seconds=600.0)
         elif sut == SystemUnderTest.CODEX_ALONE:
-            return CodexAloneAdapter(is_live=True)
+            return CodexAloneAdapter(is_live=True, timeout_seconds=600.0)
         elif sut == SystemUnderTest.ANTIGRAVITY_ALONE:
-            return AntigravityAloneAdapter(is_live=True)
+            return AntigravityAloneAdapter(is_live=True, timeout_seconds=600.0)
         else:
             raise ValueError(f"Unknown SUT: {sut}")
 

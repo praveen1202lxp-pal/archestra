@@ -35,15 +35,18 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
         is_live: bool = False,
         reasoning_effort: str = "high",
         model_id: Optional[str] = "gemini-3.8-flash-high",
+        timeout_seconds: Optional[float] = None,
     ):
         super().__init__(sut=SystemUnderTest.ANTIGRAVITY_ALONE)
         self.cli_path = cli_path or AntigravityCLIProvider()._resolve_executable()
         self.is_live = is_live
         self.reasoning_effort = reasoning_effort or "high"
         self.model_id = model_id or "gemini-3.8-flash-high"
+        self.timeout_seconds = timeout_seconds
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
+        timeout = self.timeout_seconds if self.timeout_seconds is not None else getattr(task, "timeout_seconds", 600.0)
         error_message = None
         native_in: Optional[int] = None
         native_out: Optional[int] = None
@@ -114,7 +117,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=task.timeout_seconds,
+                    timeout=timeout,
                 )
                 active_provider_duration = max(0.01, time.time() - t_active_0)
 
@@ -148,7 +151,7 @@ class AntigravityAloneAdapter(BaseSUTAdapter):
                     err_snippet = (res.stderr or res.stdout or "").strip()[:300]
                     error_message = f"AGY Container exited with code {res.returncode}: {err_snippet}"
             except subprocess.TimeoutExpired:
-                error_message = f"AGY Container timed out after {task.timeout_seconds}s"
+                error_message = f"AGY Container timed out after {timeout}s"
             except Exception as e:
                 error_message = f"AGY Container execution failed: {str(e)}"
             finally:

@@ -69,15 +69,18 @@ class CodexAloneAdapter(BaseSUTAdapter):
         is_live: bool = False,
         reasoning_effort: str = "medium",
         model_id: Optional[str] = "gpt-5.6-sol",
+        timeout_seconds: Optional[float] = None,
     ):
         super().__init__(sut=SystemUnderTest.CODEX_ALONE)
         self.cli_path = cli_path or CodexCLIProvider()._resolve_executable()
         self.is_live = is_live
         self.reasoning_effort = reasoning_effort or "medium"
         self.model_id = model_id or "gpt-5.6-sol"
+        self.timeout_seconds = timeout_seconds
 
     def execute(self, task: BenchmarkTask, repo_path: Path) -> AdapterRunTelemetry:
         t0 = time.time()
+        timeout = self.timeout_seconds if self.timeout_seconds is not None else getattr(task, "timeout_seconds", 600.0)
         error_message = None
         native_in: Optional[int] = None
         native_out: Optional[int] = None
@@ -115,7 +118,7 @@ class CodexAloneAdapter(BaseSUTAdapter):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=task.timeout_seconds,
+                    timeout=timeout,
                 )
 
                 # Parse JSONL events for token usage
@@ -129,7 +132,7 @@ class CodexAloneAdapter(BaseSUTAdapter):
                     err_snippet = (res.stderr or res.stdout or "").strip()[:300]
                     error_message = f"Codex CLI exited with code {res.returncode}: {err_snippet}"
             except subprocess.TimeoutExpired as exc:
-                error_message = f"Codex CLI timed out after {task.timeout_seconds}s"
+                error_message = f"Codex CLI timed out after {timeout}s"
                 if exc.stdout:
                     stdout_str = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout)
                     p_in, p_out, p_reas, p_turns = parse_codex_jsonl_events(stdout_str)

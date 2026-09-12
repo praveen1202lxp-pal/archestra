@@ -25,6 +25,7 @@ class FusionSUTAdapter(BaseSUTAdapter):
         is_live: bool = False,
         codex_model_id: Optional[str] = "gpt-5.6-sol",
         agy_model_id: Optional[str] = "gemini-3.8-flash-high",
+        timeout_seconds: Optional[float] = 600.0,
     ):
         super().__init__(sut=SystemUnderTest.FUSION)
         self.config = config
@@ -32,17 +33,21 @@ class FusionSUTAdapter(BaseSUTAdapter):
         self.is_live = is_live
         self.codex_model_id = codex_model_id or "gpt-5.6-sol"
         self.agy_model_id = agy_model_id or "gemini-3.8-flash-high"
+        self.timeout_seconds = timeout_seconds
 
         if self.is_live and not self.providers:
             from fusion_agent.providers.codex_cli import CodexCLIProvider
             from fusion_agent.providers.antigravity_cli import AntigravityCLIProvider
+            timeout_val = self.timeout_seconds or 600.0
             codex_cfg = {
                 "model": self.codex_model_id,
                 "reasoning_effort": "medium",
+                "timeout_seconds": timeout_val,
             }
             agy_cfg = {
                 "model": self.agy_model_id,
                 "flags": ["--effort", "high"],
+                "timeout_seconds": timeout_val,
             }
             self.providers = {
                 "codex": CodexCLIProvider(config=codex_cfg),
@@ -69,6 +74,10 @@ class FusionSUTAdapter(BaseSUTAdapter):
         )
         cfg.project_root = str(repo_path)
         cfg.storage_dir = str(state_dir_path)
+        timeout = self.timeout_seconds if self.timeout_seconds is not None else getattr(task, "timeout_seconds", 600.0)
+        if hasattr(cfg, "deliberation") and cfg.deliberation:
+            cfg.deliberation.max_task_duration_seconds = timeout
+            cfg.deliberation.timeout_seconds = timeout
 
         db_path = str(state_dir_path / "fusion.db")
         db = Database(db_path)
