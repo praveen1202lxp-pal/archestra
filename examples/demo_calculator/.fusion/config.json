@@ -58,7 +58,7 @@
     "max_mcp_result_tokens": 8000,
     "mcp_max_result_chars_per_call": 8000
   },
-  "verification_command": "pytest tests/test_calculator.py",
+  "verification_command": "pytest examples/demo_calculator/tests/test_calculator.py",
   "log_level": "INFO",
   "mcp_servers": {}
 }
