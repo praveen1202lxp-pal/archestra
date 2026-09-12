@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 320" width="100%" height="100%" style="background-color: #0d1117; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;">
+  <style>
+    .title { fill: #f0f6fc; font-size: 16px; font-weight: 600; }
+    .subtitle { fill: #8b949e; font-size: 12px; }
+    .label { fill: #c9d1d9; font-size: 13px; font-weight: 500; }
+    .val { fill: #ffffff; font-size: 13px; font-weight: 600; }
+    .note { fill: #8b949e; font-size: 11px; font-style: italic; }
+    .grid { stroke: #21262d; stroke-width: 1; }
+  </style>
+
+  <!-- Title & Subtitle -->
+  <text x="30" y="38" class="title">Functional Correctness Rate (Milestone 11 Held-Out Evaluation)</text>
+  <text x="30" y="58" class="subtitle">Evaluated across 21 tasks (7 engineering tasks × 3 repetitions). Full task success.</text>
+
+  <!-- Grid lines -->
+  <line x1="210" y1="80" x2="620" y2="80" class="grid" />
+  <line x1="210" y1="135" x2="620" y2="135" class="grid" />
+  <line x1="210" y1="190" x2="620" y2="190" class="grid" />
+  <line x1="210" y1="245" x2="620" y2="245" class="grid" />
+
+  <!-- Scale ticks (0%, 25%, 50%, 75%, 100%) -->
+  <text x="210" y="262" fill="#8b949e" font-size="11" text-anchor="middle">0%</text>
+  <text x="312.5" y="262" fill="#8b949e" font-size="11" text-anchor="middle">25%</text>
+  <text x="415" y="262" fill="#8b949e" font-size="11" text-anchor="middle">50%</text>
+  <text x="517.5" y="262" fill="#8b949e" font-size="11" text-anchor="middle">75%</text>
+  <text x="620" y="262" fill="#8b949e" font-size="11" text-anchor="middle">100%</text>
+
+  <!-- Bar 1: Fusion Agent -->
+  <text x="200" y="105" class="label" text-anchor="end">Fusion Agent</text>
+  <rect x="210" y="90" width="253.8" height="24" rx="4" fill="#388bfd" />
+  <text x="472" y="107" class="val">61.9% (13/21)</text>
+
+  <!-- Bar 2: OpenAI Codex Alone -->
+  <text x="200" y="150" class="label" text-anchor="end">Codex Alone (gpt-5.6-sol)</text>
+  <rect x="210" y="135" width="292.7" height="24" rx="4" fill="#238636" />
+  <text x="511" y="152" class="val">71.4% (15/21)</text>
+
+  <!-- Bar 3: Google Antigravity Alone -->
+  <text x="200" y="195" class="label" text-anchor="end">Antigravity Alone (gemini-3.8)</text>
+  <rect x="210" y="180" width="292.7" height="24" rx="4" fill="#a371f7" />
+  <text x="511" y="197" class="val">71.4% (15/21)</text>
+
+  <!-- Baseline Footer Note -->
+  <text x="30" y="295" class="note">* Note: Standalone models achieved higher overall functional pass rates. Fusion sequential planning suffered interface drift.</text>
+</svg>

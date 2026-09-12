@@ -1,74 +1,95 @@
 # Fusion Agent
 
-**Provider-agnostic multi-model coding agent orchestrator.**
+**Provider-agnostic AI coding-agent control plane that dynamically orchestrates multiple coding models while owning context, repository edits, verification, review, recovery, budgets, and human approval.**
 
-Fusion Agent enables autonomous AI coding agents powered by different model providers (such as OpenAI Codex CLI and Google Antigravity CLI) to collaborate dynamically while presenting a single, cohesive developer persona to the user.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![CLI](https://img.shields.io/badge/cli-fusion-green.svg)](#cli-reference)
+[![Storage](https://img.shields.io/badge/storage-SQLite%20WAL-orange.svg)](#architecture)
+[![Evaluation](https://img.shields.io/badge/benchmark-Milestone%2011%20Phase%20C-purple.svg)](#evaluation--benchmark-summary-milestone-11)
+
+---
+
+## At a Glance
+
+Fusion Agent solves the fundamental control-plane problem of autonomous coding agents: **how to leverage multiple foundation models (such as OpenAI Codex and Google Antigravity/Gemini) without suffering from runaway token costs, unconstrained filesystem writes, test-suite mutation, or unrecoverable failures.**
+
+```bash
+# 1. Install Fusion Agent in development mode
+pip install -e .
+
+# 2. Verify environment tooling & discover provider CLIs non-destructively
+fusion doctor
+
+# 3. Initialize project metadata and state tracking in your repository
+fusion init
+
+# 4. Execute a coding task with automated verification & peer review
+fusion run "Add input validation to the signup endpoint"
+```
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    Dev(["Developer"]) -->|fusion run task| CLI["Fusion CLI"]
+
+    subgraph ControlPlane ["Fusion Control Plane"]
+        CLI --> Router["Task Assessment & Dynamic Router"]
+        Router -->|Token & Turn Budget| Budget["Budget Controller"]
+        Router -->|Deterministic AST & Call Graphs| Context["Repository Intelligence"]
+
+        subgraph Orchestration ["Deliberation & Roles"]
+            Context --> ProviderLayer["Provider Abstraction Layer"]
+            ProviderLayer -->|Implementation| Codex["OpenAI Codex CLI"]
+            ProviderLayer -->|Critique & Review| Antigravity["Google Antigravity CLI"]
+            ProviderLayer -.->|Optional Tools| MCP["Controlled MCP Gateway"]
+        end
+
+        Codex -->|Structured File Patches| Workspace["Workspace Editor & AST Validator"]
+        Workspace -->|Isolated Branch| Worktree[("Ephemeral Git Worktree")]
+
+        Worktree --> Verifier{"Automated Verification<br/>pytest / test suite"}
+        Verifier -->|Failed| Repair["Targeted Repair Loop<br/>Max 2 Rounds"]
+        Repair --> Codex
+
+        Verifier -->|Passed| PeerReview{"Peer Review<br/>Antigravity / Gemini"}
+        PeerReview -->|Needs Revision| Repair
+
+        PeerReview -->|Approved| PromotionGate{"Human Promotion Gate<br/>Diff Inspection (y/N)"}
+
+        Brain[("SQLite Shared Brain<br/>.fusion/fusion.db")] -.->|Durable Checkpoints| Router
+        Brain -.->|Telemetry & State| PromotionGate
+    end
+
+    PromotionGate -->|Declined / Abort| Discard(["Dismantle Worktree & Discard"])
+    PromotionGate -->|Explicit 'y'| BaseRepo[("Base Project Repository")]
+```
 
 ---
 
 ## Why Fusion Agent?
 
-Standalone single-model coding agents frequently suffer from two common failure modes:
-1. **Unbounded Context Proliferation**: Sending entire repositories and unbounded chat histories into expensive context windows inflates latency, explodes cost, and causes cognitive degradation.
-2. **Scope Creep & Test Mutation**: Standalone models often modify existing unit tests, rewrite unrelated modules, or create unrequested files to make failing builds artificially pass.
+When software teams experiment with raw coding LLMs, they quickly encounter operational limits. Fusion introduces an explicit engineering control plane between the developer's codebase and external foundation models:
 
-Fusion Agent addresses these challenges through:
-- **One Unified Persona, Multiple Specialized Contributors**: You interact with Fusion as a single intelligent peer. Multi-agent planning, implementation, and peer review take place autonomously under the hood.
-- **Strict Scope Discipline & Confinement**: Modifications are bounded to isolated Git worktrees. Protected files and test suites cannot be arbitrarily mutated.
-- **Substantially Reduced Input Context**: 3-tier contextual snapshotting extracts only relevant symbols, dependency graphs, and recent execution state, eliminating massive redundant context dumps.
-- **Automated Peer Review & Repair Loops**: Implementation patches are critiqued and verified by a secondary model before human review.
-- **Mandatory Human-in-the-Loop Gate**: No code is ever promoted to your working branch without passing automated verification, passing peer review, and receiving explicit human confirmation.
-- **Durable Crash Recovery**: Execution state and checkpoints persist in a local SQLite database (`.fusion/fusion.db`), allowing interrupted tasks to be resumed instantly.
+| Capability | Raw Coding Model (Direct Execution) | Fusion Agent (Control Plane) |
+| :--- | :--- | :--- |
+| **Context Ingestion** | Dumps full repository files into prompt; massive token spend. | **3-tier bounded snapshotting** (AST definitions, symbol call graphs, imports); **81.9% token reduction**. |
+| **Filesystem Access** | Writes directly to active working tree; risk of dirty tree pollution. | **Ephemeral Git worktrees** (`git worktree add`); active working branch is never modified during runs. |
+| **Verification Gate** | Model self-declares success based on text generation. | **Automated host test runner** (`pytest`/configured suite) executed inside isolated worktree. |
+| **Quality & Peer Review** | Single model reviews its own output (sycophancy bias). | **Adversarial cross-model peer review** with bounded repair loops (capped at 2 rounds). |
+| **Scope Discipline** | Often mutates existing unit tests to force tests to pass. | **Mathematical scope contract** forbids test mutation or unrequested file creation. |
+| **Recovery & Checkpoints** | Session lost on network disconnect, timeout, or crash. | **Durable SQLite WAL journal**; resume interrupted runs with `fusion resume <task-id>`. |
+| **Promotion Authority** | Autonomous auto-merges or manual copy-pasting. | **Mandatory human confirmation gate** with interactive unified diff inspection (`[y/N]`). |
 
----
-
-## Core Architecture
-
-```
-                               ┌─────────────────────────┐
-                               │   Developer (Terminal)  │
-                               └────────────┬────────────┘
-                                            │ fusion run "<task>"
-                                            ▼
-                               ┌─────────────────────────┐
-                               │       Task Router       │
-                               └────────────┬────────────┘
-                                            │ Classify & Select Strategy
-                                            ▼
-                               ┌─────────────────────────┐
-                               │   Deliberation Engine   │
-                               │  (Multi-Model Planning) │
-                               └────────────┬────────────┘
-                                            │
-                     ┌──────────────────────┴──────────────────────┐
-                     ▼                                             ▼
-          ┌─────────────────────┐                       ┌─────────────────────┐
-          │   Primary Model     │                       │   Secondary Model   │
-          │ (e.g. Codex CLI /   │                       │ (e.g. Antigravity   │
-          │  gpt-5.6-sol)       │                       │  gemini-3.8-flash)  │
-          └──────────┬──────────┘                       └──────────┬──────────┘
-                     │ Code Patch                                  │ Critique & Review
-                     └──────────────────────┬──────────────────────┘
-                                            ▼
-                               ┌─────────────────────────┐
-                               │ Isolated Git Worktree   │  <-- .fusion/worktrees/task-...
-                               │  Automated Verification │  <-- Runs pytest/test command
-                               └────────────┬────────────┘
-                                            │ Tests Pass + Review Approved
-                                            ▼
-                               ┌─────────────────────────┐
-                               │  Human Promotion Gate   │  <-- Inspect Diff [y/N]
-                               └────────────┬────────────┘
-                                            │ 'y' (Promoted)
-                                            ▼
-                               ┌─────────────────────────┐
-                               │ Base Project Repository │
-                               └─────────────────────────┘
-```
+> **Important**: Fusion does not claim to make underlying model weights smarter. Rather, it provides the deterministic scaffolding, state management, and safety boundaries necessary to run autonomous coding tasks reliably.
 
 ---
 
 ## Supported Providers
+
+Fusion interacts with coding models via a pluggable provider interface (`ProviderInterface`), abstracting local CLIs and test doubles:
 
 | Provider | Type | Typical Role | Default Model | Configuration Key |
 | :--- | :--- | :--- | :--- | :--- |
@@ -79,197 +100,59 @@ Fusion Agent addresses these challenges through:
 
 ---
 
-## Installation
+## Installation & Setup
 
 ### Prerequisites
-- Python 3.11 or higher
-- Git 2.0+
-- Optional: OpenAI Codex CLI (`codex`) or Google Antigravity CLI (`agy`) installed and authenticated.
+- **Python**: Version 3.11 or higher
+- **Git**: Version 2.0 or higher
+- **Providers**: OpenAI Codex CLI (`codex`) or Google Antigravity CLI (`agy`) installed on PATH (or configured via environment variables).
 
-### Install from Source
+### Install via Pip
 ```bash
 git clone https://github.com/archestra/archestra.git
 cd archestra
 
 # Create and activate virtual environment
 python -m venv .venv
-# On Windows:
+
+# Windows
 .venv\Scripts\activate
-# On Linux/macOS:
+# Linux / macOS
 source .venv/bin/activate
 
-# Install Fusion Agent in editable development mode
+# Install editable package
 pip install -e .
 ```
 
-Verify installation:
+Verify the installation:
 ```bash
 fusion --version
+# Output: Fusion Agent v0.12.0
 ```
 
 ---
 
-## Quick Start
+## CLI Reference
 
-### 1. Run Pre-flight Diagnostics
-Verify that your Python runtime, Git tooling, and coding CLIs are discovered and ready:
+Fusion provides a clean, predictable command-line interface:
 
-```bash
-fusion doctor
-```
-
-Example Output:
-```
-Fusion Doctor
-
-  ✓ Fusion Version         Fusion Agent v0.12.0
-  ✓ Python Runtime         Python 3.12.10 (CPython)
-  ✓ Git Tooling            git version 2.45.1 at C:\Program Files\Git\cmd\git.EXE
-  ✓ Repository State       Git repository detected (clean)
-  ✓ Storage & SQLite       State directory writable at .fusion (SQLite operational)
-  ✓ Configuration          Valid config at .fusion/config.json
-  ✓ Codex CLI              Codex CLI 0.153.4 online and ready (Logged in)
-  ✓ Antigravity CLI        Antigravity CLI 1.2.2 online and ready
-  ✓ Docker / Container     Host CLI execution mode
-
-Summary: 8 passed, 0 warnings, 0 errors
-✓ System is ready to run Fusion Agent.
-```
-
-### 2. Initialize Fusion in Your Project
-Navigate to your repository and initialize Fusion:
-
-```bash
-cd /path/to/my-project
-fusion init
-```
-
-This sets up:
-- `.fusion/config.json`: Project-specific settings and model configurations.
-- `.fusion/fusion.db`: Persistent shared state ledger.
-- Automatically updates `.gitignore` to prevent runtime state from being committed.
-
-### 3. Check Provider Readiness
-```bash
-fusion providers
-```
-
-### 4. Give Fusion a Coding Task
-```bash
-fusion run "Add input validation to the user registration endpoint"
-```
-
-Fusion will:
-1. Route the task and select the optimal deliberation strategy.
-2. Spin up an isolated Git worktree branch (`fusion/task-...`).
-3. Generate the proposed solution using the primary model.
-4. Conduct automated peer review with the secondary model.
-5. Execute the project's test suite inside the isolated worktree.
-6. Present the unified diff and verification results for your explicit confirmation:
-   ```
-   Apply verified changes? [y/N]:
-   ```
-
----
-
-## Command Reference
-
-| Command | Description | Example |
-| :--- | :--- | :--- |
-| `fusion --help` | Display CLI help and available commands | `fusion --help` |
-| `fusion --version` | Display canonical application version | `fusion --version` |
-| `fusion doctor` | Non-destructive diagnostic check of environment and providers | `fusion doctor --verbose` |
-| `fusion init` | Initialize Fusion Agent in the current directory | `fusion init --name "MyApp"` |
-| `fusion providers` | List configured providers and inspect connectivity/latency | `fusion providers` |
-| `fusion status` | Show project summary, active mode, and recent task memory | `fusion status` |
-| `fusion config` | Inspect active hierarchical configuration with secrets masked | `fusion config --validate` |
-| `fusion run "<task>"` | Execute an autonomous task through multi-model orchestration | `fusion run "Fix bug in auth" --debug` |
-| `fusion resume <task-id>` | Resume an interrupted or crashed task from its last checkpoint | `fusion resume task-84a12b` |
-| `fusion interactive` | Start an interactive terminal REPL session | `fusion interactive` |
-| `fusion mcp list` | List configured Model Context Protocol tool servers | `fusion mcp list` |
-
----
-
-## Configuration & Precedence
-
-Fusion loads settings hierarchically following strict precedence:
-
-```
-CLI Arguments
-  └── Project Config (.fusion/config.json)
-        └── User Config (~/.fusion/config.json)
-              └── Environment Variables (FUSION_*)
-                    └── Built-in Defaults
-```
-
-### Environment Variables
-- `FUSION_OPTIMIZATION_MODE`: `BEST_QUALITY`, `BALANCED`, `LOWEST_COST`, `FASTEST`, `LOCAL_PRIVATE`
-- `FUSION_LOG_LEVEL`: `INFO`, `DEBUG`, `WARNING`, `ERROR`
-- `FUSION_STORAGE_DIR`: Custom state directory name (default: `.fusion`)
-- `FUSION_VERIFICATION_COMMAND`: Command used to verify changes (default: `pytest`)
-- `CODEX_CLI_PATH`: Custom path to `codex` executable
-- `ANTIGRAVITY_CLI_PATH`: Custom path to `agy` executable
-
-### Example `.fusion/config.json`
-```json
-{
-  "project_name": "MyProject",
-  "optimization_mode": "BALANCED",
-  "verification_command": "pytest",
-  "agents": {
-    "codex": {
-      "provider_name": "OpenAI Codex CLI",
-      "provider_type": "codex_cli",
-      "model": "gpt-5.6-sol",
-      "extra_params": { "reasoning_effort": "medium" }
-    },
-    "antigravity": {
-      "provider_name": "Google Antigravity CLI",
-      "provider_type": "antigravity_cli",
-      "model": "gemini-3.8-flash-high",
-      "extra_params": { "effort": "high" }
-    }
-  },
-  "deliberation": {
-    "max_rounds": 3,
-    "max_repair_rounds": 2,
-    "max_provider_calls": 8,
-    "timeout_seconds": 180.0
-  }
-}
-```
-
----
-
-## Safety & Isolation Model
-
-Fusion enforces distinct safety boundaries for repository integrity and change governance. **Fusion does not provide a general OS sandbox.**
-
-- **Repository & Policy Isolation (Git Worktrees)**: Autonomous edits and candidate patches execute strictly within ephemeral Git worktrees (`git worktree add`). Your active working tree and uncommitted files are never directly modified during deliberation or repair.
-- **Execution Trust Model (Host-Trusted / Non-Adversarial)**: Native execution of tools, verifiers, and provider CLI subprocesses runs on the host system with the current user's privileges. This execution model is **host-trusted and non-adversarial** — it protects against accidental code destruction, dirty repository pollution, and merge conflicts, not malicious code execution.
-- **Optional Container Isolation**: Where stricter isolation is required, container/Docker-based isolation may be explicitly configured and supported for isolated test execution workflows.
-- **Distinct Safety Boundaries**:
-  1. **Filesystem & State Partitioning**: Fusion-owned runtime state (`.fusion/fusion.db`, `.fusion/locks/`) and project files are strictly partitioned. Safe project configuration (`.fusion/config.json`) is trackable in Git while transient databases, logs, and worktrees remain ignored.
-  2. **Mandatory Human Approval Gate**: Verified changes are never automatically merged to the base repository. A human must inspect the generated unified diff, review verification results, and explicitly confirm promotion (`[y/N]`).
-  3. **Secret Sanitization**: All terminal logs and persistence layers route through a sensitive data filter that automatically redacts API keys (`AIza...`, `sk-...`, `Bearer...`), tokens, and credentials.
-
----
-
-## Resumption & Crash Recovery
-
-If an execution is interrupted (e.g. power loss, network dropout, user cancellation):
-1. State is preserved in `.fusion/fusion.db` with checkpoint SHAs and completed step outputs.
-2. View pending tasks with `fusion status`.
-3. Resume immediately from the exact point of interruption:
-   ```bash
-   fusion resume <task-id>
-   ```
+| Command | Description |
+| :--- | :--- |
+| `fusion doctor` | Non-destructive diagnostics: Python, Git, SQLite writability, Codex/Antigravity discovery, config validation. |
+| `fusion init` | Initializes `.fusion/` directory, starter configuration, and updates `.gitignore` for runtime state. |
+| `fusion providers` | Tests and lists configured providers with real-time latency and health checks. |
+| `fusion status` | Displays active project mode, verification command, configured agents, and recent task memory. |
+| `fusion config` | Displays safe, credential-redacted configuration (`--validate` to check schema). |
+| `fusion run "<task>"` | Runs a coding task in an ephemeral worktree with automated testing, review, diff display, and human approval. |
+| `fusion resume <id>` | Resumes an interrupted task from its last persisted SQLite checkpoint. |
+| `fusion interactive` | Launches an interactive REPL session with the orchestrator. |
+| `fusion mcp` | Lists, inspects, and health-checks Model Context Protocol (MCP) tool servers. |
 
 ---
 
 ## Evaluation & Benchmark Summary (Milestone 11)
 
-In Milestone 11 Phase C, Fusion Agent was evaluated in a 63-run held-out comparative benchmark against standalone frontier models across 7 diverse software engineering tasks (3 repetitions each):
+In Milestone 11 Phase C, Fusion Agent was evaluated in a frozen, 63-run held-out comparative benchmark against standalone frontier models across 7 diverse software engineering tasks (3 repetitions each):
 
 | System | Functional Correctness | Strict Scope Oracle | Median Input Tokens | Median Duration |
 | :--- | :---: | :---: | :---: | :---: |
@@ -277,45 +160,112 @@ In Milestone 11 Phase C, Fusion Agent was evaluated in a 63-run held-out compara
 | **OpenAI Codex Alone** (`gpt-5.6-sol`) | **71.4% (15/21)** | 38.1% (8/21) | 370,525 | 248.9s |
 | **Antigravity Alone** (`gemini-3.8-flash-high`) | **71.4% (15/21)** | 47.6% (10/21) | 284,316 | 244.3s |
 
+### Benchmark Visualizations
+
+<p align="center">
+  <img src="docs/assets/benchmark_tokens.svg" alt="Median Input Token Usage" width="48%" />
+  <img src="docs/assets/benchmark_correctness.svg" alt="Functional Correctness Rate" width="48%" />
+</p>
+<p align="center">
+  <img src="docs/assets/benchmark_scope.svg" alt="Strict Scope Oracle Pass Rate" width="60%" />
+</p>
+
 ### Empirical Findings:
-- **Functional Correctness**: Standalone single-model baselines achieved higher overall functional correctness on the benchmark suite (Codex 15/21, Antigravity 15/21 vs. Fusion 13/21). Multi-step sequential planning remains susceptible to interface drift across step boundaries.
-- **Input Context Efficiency**: Fusion used approximately **81.9% fewer median input tokens than Codex** (66,980 vs. 370,525) and approximately **76.4% fewer median input tokens than Antigravity** (66,980 vs. 284,316) by extracting bounded symbol and dependency graphs rather than ingesting entire workspaces.
-- **Scope Discipline & Governance**: Standalone systems frequently modified pre-existing test suites or generated unrequested peripheral files. Fusion's scope contract enforced strict change control (Fusion 12/21 vs. Codex 8/21 and Antigravity 10/21). *Caveat: Raw strict-scope differences were partly affected by uncommunicated protected-path policies for standalone systems.*
-- **Demonstrated Strengths**: Substantially reduced input context, centralized scope/change control, review/repair capability, recoverable durable orchestration, and vendor-agnostic provider abstraction.
+- **Input Context Efficiency**: Fusion consumed **81.9% fewer median input tokens than Codex** (66,980 vs. 370,525) and **76.4% fewer median input tokens than Antigravity** (66,980 vs. 284,316) by extracting bounded symbol call graphs rather than ingesting entire repositories.
+- **Functional Correctness Trade-off**: Standalone single-model baselines achieved higher overall functional pass rates on this suite (Codex 15/21, Antigravity 15/21 vs. Fusion 13/21). While multi-agent deliberation caught defects, sequential multi-step planning introduced **interface drift** across step boundaries.
+- **Scope Discipline & Governance**: Standalone systems frequently modified pre-existing test suites or generated unrequested helper files. Fusion's scope contract enforced strict change control (Fusion 12/21 vs. Codex 8/21 and Antigravity 10/21).
+- **Strict Scope Caveat**: Raw strict-scope differences were partly affected by uncommunicated protected-path policies for standalone systems, which had no prompt-level instruction forbidding test modification.
+- **Reproducibility**: All chart assets are reproducible via `python docs/assets/generate_charts.py`.
 
 ---
 
-## Demo Fixture
+## Configuration & Precedence
 
-To safely test Fusion Agent without touching a production repository, explore the included calculator example:
+Fusion resolves configuration deterministically using a 5-tier precedence hierarchy:
+
+```
+1. CLI Arguments (--dir, --debug, --no-promote)
+     └── 2. Project Config (.fusion/config.json)
+           └── 3. User Config (~/.fusion/config.json)
+                 └── 4. Environment Variables (FUSION_*, CODEX_CLI_PATH, ANTIGRAVITY_CLI_PATH)
+                       └── 5. Built-in Defaults
+```
+
+### Separation of Project Config & Runtime State
+- **Committed to Version Control**: `.fusion/config.json` contains shared team settings (project name, optimization mode, verification command, logical provider names, models, turn budgets).
+- **Ignored from Version Control**: `.fusion/fusion.db`, `.fusion/*.log`, `.fusion/worktrees/`, `.fusion/temp/`, `.fusion/locks/`.
+- **Machine-Specific Paths & Secrets**: Executable paths (`CODEX_CLI_PATH`) and sensitive tokens belong in user-global config (`~/.fusion/config.json`) or environment variables, keeping project configs portable and safe.
+
+---
+
+## Safety & Isolation Boundaries
+
+Fusion enforces distinct safety boundaries for repository integrity and change governance. **Fusion does not provide a general OS sandbox.**
+
+- **Repository & Policy Isolation (Git Worktrees)**: Autonomous edits execute strictly within ephemeral Git worktrees (`git worktree add`). Your active working tree and uncommitted files are never directly modified during deliberation or repair.
+- **Execution Trust Model (Host-Trusted / Non-Adversarial)**: Native execution of verifiers (e.g. `pytest`) and provider CLI subprocesses runs on the host system with the current user's privileges. This execution model is **host-trusted and non-adversarial** — it protects against accidental code destruction, dirty working tree pollution, and merge conflicts, not malicious adversarial code execution.
+- **Optional Container Isolation**: Where untrusted code execution protection is required, container/Docker-based isolation can be explicitly configured and supported for isolated test execution.
+- **Distinct Safety Boundaries**:
+  1. **Filesystem & State Partitioning**: Fusion-owned runtime state (`.fusion/fusion.db`, `.fusion/locks/`) and project files are strictly partitioned.
+  2. **Mandatory Human Approval Gate**: Verified changes are never automatically merged to the base repository. A human must inspect the generated unified diff, review verification results, and explicitly confirm promotion (`[y/N]`).
+  3. **Secret Sanitization**: All terminal logs and persistence layers route through a sensitive data filter that automatically redacts API keys (`AIza...`, `sk-...`, `Bearer...`), tokens, and credentials.
+
+---
+
+## Architecture / Repository Tour
+
+For engineering reviewers navigating the codebase:
+
+| Subsystem | Directory / File | Description |
+| :--- | :--- | :--- |
+| **Router & Assessment** | [`fusion_agent/core/router.py`](fusion_agent/core/router.py) | Analyzes task complexity, evaluates risk levels, and assigns dynamic implementer/reviewer roles. |
+| **Core Orchestrator** | [`fusion_agent/core/orchestrator.py`](fusion_agent/core/orchestrator.py) | Coordinates multi-agent deliberation, single-agent fast paths, bounded repair loops, and budget control. |
+| **Repository Intelligence** | [`fusion_agent/repository/`](fusion_agent/repository/) | Extracts 3-tier bounded CodeContext (AST definitions, symbol call graphs, dependency graphs, secret filtering). |
+| **Workspace & Editing** | [`fusion_agent/workspace/editor.py`](fusion_agent/workspace/editor.py) | Ephemeral Git worktree allocation, AST patch validation, and atomic filesystem changes. |
+| **Verification Runner** | [`fusion_agent/workspace/verifier.py`](fusion_agent/workspace/verifier.py) | Executes local automated test commands within isolated worktrees and captures structured failure signals. |
+| **Scope Contract Oracle** | [`fusion_agent/workspace/scope_contract.py`](fusion_agent/workspace/scope_contract.py) | Enforces boundary contracts forbidding unrequested file edits or test suite mutation. |
+| **Durable State & Memory** | [`fusion_agent/memory/`](fusion_agent/memory/) | SQLite WAL database schema, migrations, task state transitions, and checkpoint resumption. |
+| **Provider Adapters** | [`fusion_agent/providers/`](fusion_agent/providers/) | Pluggable interfaces for OpenAI Codex CLI, Google Antigravity CLI, Google Gemini CLI, and hermetic MockProvider. |
+| **Controlled MCP Gateway** | [`fusion_agent/mcp/`](fusion_agent/mcp/) | Model Context Protocol tool registry with strict capability boundaries, audit logging, and health checks. |
+| **CLI & Diagnostics** | [`fusion_agent/cli/`](fusion_agent/cli/) | CLI command parsing, `fusion doctor` diagnostics, formatted error reporting, and interactive promotion gate. |
+
+---
+
+## Demo Workflow
+
+To test Fusion Agent safely without modifying production code, use the included calculator example:
 
 ```bash
 cd examples/demo_calculator
+
+# 1. Run doctor checks
 fusion doctor
+
+# 2. Initialize project state
 fusion init
-fusion run "Add power(base, exponent) function to src/calculator.py and tests in tests/test_calculator.py"
+
+# 3. Execute a feature addition task
+fusion run "Add power(base, exponent) function to src/calculator.py and test coverage in tests/test_calculator.py"
 ```
 
-See [examples/demo_calculator/README.md](examples/demo_calculator/README.md) for full instructions.
+For the full turn-by-turn video recording guide and narration script, see [**`docs/DEMO.md`**](docs/DEMO.md).
 
 ---
 
-## Development & Testing
+## Engineering Deep-Dive & Interview Materials
 
-Run the test suite:
-```bash
-pytest -q
-```
+- [**`docs/ENGINEERING.md`**](docs/ENGINEERING.md): In-depth architectural trade-offs, design rationale (why SQLite, why no vector DB, why dynamic roles, why worktrees are not OS sandboxes).
+- [**`docs/PORTFOLIO.md`**](docs/PORTFOLIO.md): 30-second pitch, 2-minute technical walkthrough, 5 technical interview Q&As, and quantified resume bullets.
 
-Run release-readiness tests:
-```bash
-pytest tests/test_m12_release.py -v
-```
+---
 
-Check Git cleanliness:
-```bash
-git diff --check
-```
+## Known Limitations
+
+- **Raw Model Correctness**: Fusion bounds context and orchestrates review, but cannot compensate for fundamental reasoning failures of underlying foundation models on novel complex algorithms.
+- **Interface Drift in Multi-Step Planning**: Decomposing complex tasks into sequential multi-step plans can lead to signature mismatches across step boundaries.
+- **Native Host Execution Trust**: Subprocesses execute with user privileges; host-trusted execution protects against accidental damage, not adversarial code.
+- **Provider Quotas**: Upstream LLM usage limits and token rate limits still apply to underlying CLI tools.
+- **Evaluation Scope**: Milestone 11 evaluated 63 runs across 7 tasks; broader evaluation across diverse languages is part of future research.
 
 ---
 
@@ -326,6 +276,8 @@ git diff --check
 
 ---
 
-## License
+## License & Project Metadata
 
-Apache-2.0. See LICENSE for details.
+- **Suggested GitHub Description**: `Provider-agnostic AI coding-agent control plane that dynamically orchestrates multi-model collaboration with worktree isolation, automated verification, and human approval.`
+- **Suggested Topics**: `ai-agent`, `coding-assistant`, `multi-agent-orchestration`, `llm-orchestration`, `codex`, `antigravity`, `developer-tools`, `git-worktree`, `sqlite`, `mcp`
+- **License Status**: *License selection is currently pending maintainer decision. No license has been finalized for the public release.*
