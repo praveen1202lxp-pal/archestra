@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -75,19 +76,42 @@ def cmd_init(args) -> int:
     db.connect()
     db.close()
 
-    # Update or create .gitignore to protect runtime state
+    # Update or create .gitignore to protect transient runtime state while keeping project config trackable
     gitignore_path = target_dir / ".gitignore"
     gitignore_msg = ""
+    runtime_ignore_rules = (
+        "\n# Fusion Agent runtime state (database, logs, worktrees, locks)\n"
+        ".fusion/*.db\n"
+        ".fusion/*.db-wal\n"
+        ".fusion/*.db-shm\n"
+        ".fusion/*.log\n"
+        ".fusion/logs/\n"
+        ".fusion/worktrees/\n"
+        ".fusion/temp/\n"
+        ".fusion/locks/\n"
+        ".fusion/cache/\n"
+    )
+
     if gitignore_path.exists():
         content = gitignore_path.read_text(encoding="utf-8", errors="replace")
-        if ".fusion" not in content:
+        # If legacy whole-directory ignore '.fusion/' is present, replace it so .fusion/config.json is trackable
+        if re.search(r"^\.fusion/?\s*$", content, flags=re.MULTILINE):
+            new_content = re.sub(
+                r"(?:# Fusion Agent (?:local|runtime) state\s*\n)?^\.fusion/?\s*\n?",
+                runtime_ignore_rules.lstrip("\n"),
+                content,
+                flags=re.MULTILINE,
+            )
+            gitignore_path.write_text(new_content, encoding="utf-8")
+            gitignore_msg = " (updated .gitignore to allow tracking .fusion/config.json)"
+        elif ".fusion/*.db" not in content:
             with open(gitignore_path, "a", encoding="utf-8") as f:
-                f.write("\n# Fusion Agent runtime state\n.fusion/\n")
-            gitignore_msg = " (added .fusion/ to existing .gitignore)"
+                f.write(runtime_ignore_rules)
+            gitignore_msg = " (added .fusion runtime ignores to .gitignore)"
     elif (target_dir / ".git").exists():
         with open(gitignore_path, "w", encoding="utf-8") as f:
-            f.write("# Fusion Agent runtime state\n.fusion/\n")
-        gitignore_msg = " (created .gitignore with .fusion/)"
+            f.write(runtime_ignore_rules.lstrip("\n"))
+        gitignore_msg = " (created .gitignore with .fusion runtime ignores)"
 
     print(f"{GREEN}{ICON_OK} Initialized Fusion Agent project: {BOLD}{project_name}{RESET}")
     print(f"  Configuration: {fusion_dir / 'config.json'}")

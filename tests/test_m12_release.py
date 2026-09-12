@@ -147,9 +147,12 @@ def test_config_masking():
 
 
 def test_init_creates_state_and_updates_gitignore(tmp_path: Path):
-    """Verify fusion init creates .fusion/ and updates .gitignore safely."""
-    # Simulate git repo with existing .gitignore
-    (tmp_path / ".git").mkdir()
+    """Verify fusion init creates .fusion/, selective .gitignore entries, and keeps config.json trackable."""
+    # Initialize a real git repository
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "TestUser"], cwd=str(tmp_path), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(tmp_path), check=True)
+
     gitignore = tmp_path / ".gitignore"
     gitignore.write_text("*.pyc\n__pycache__/\n", encoding="utf-8")
 
@@ -160,13 +163,84 @@ def test_init_creates_state_and_updates_gitignore(tmp_path: Path):
     assert (tmp_path / ".fusion" / "config.json").exists()
     assert (tmp_path / ".fusion" / "fusion.db").exists()
 
-    # Check gitignore was updated
+    # Check gitignore was updated with selective runtime rules
     gi_content = gitignore.read_text(encoding="utf-8")
-    assert ".fusion/" in gi_content
+    assert ".fusion/*.db" in gi_content
+    assert ".fusion/*.log" in gi_content
+    assert ".fusion/logs/" in gi_content
+    assert ".fusion/worktrees/" in gi_content
+    assert ".fusion/locks/" in gi_content
+    # The entire .fusion/ directory should NOT be ignored
+    assert "\n.fusion/\n" not in gi_content
 
-    # Running init again without force should be idempotent and not overwrite
+    # Verify Git ignore status via git check-ignore
+    # 1. .fusion/config.json MUST NOT be ignored (exit code != 0)
+    res_cfg = subprocess.run(
+        ["git", "check-ignore", ".fusion/config.json"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert res_cfg.returncode != 0, ".fusion/config.json should NOT be ignored by git"
+
+    # 2. Runtime DB, WAL, SHM MUST be ignored
+    for runtime_file in [
+        ".fusion/fusion.db",
+        ".fusion/fusion.db-wal",
+        ".fusion/fusion.db-shm",
+        ".fusion/test.log",
+        ".fusion/logs/run.log",
+        ".fusion/worktrees/task-1",
+        ".fusion/locks/task.lock",
+        ".fusion/temp/scratch",
+        ".fusion/cache/data",
+    ]:
+        res_ign = subprocess.run(
+            ["git", "check-ignore", runtime_file],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+        )
+        assert res_ign.returncode == 0, f"{runtime_file} should be ignored by git"
+
+    # 3. Verify git status tracks config.json but ignores DB
+    status_res = subprocess.run(
+        ["git", "status", "--porcelain", "-u"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    # config.json and .gitignore should appear in untracked/modified
+    assert ".fusion/config.json" in status_res.stdout
+    assert "fusion.db" not in status_res.stdout
+
+    # Running init again without force should be idempotent
     rc2 = cmd_init(args)
     assert rc2 == 0
+
+
+def test_init_migrates_legacy_whole_directory_gitignore(tmp_path: Path):
+    """Verify fusion init updates legacy whole-directory .fusion/ entries so config.json is trackable."""
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("# Old ignore\n.fusion/\n*.tmp\n", encoding="utf-8")
+
+    args = argparse.Namespace(dir=str(tmp_path), name="MigrateTest", force=False)
+    rc = cmd_init(args)
+    assert rc == 0
+
+    gi_content = gitignore.read_text(encoding="utf-8")
+    assert "\n.fusion/\n" not in gi_content
+    assert ".fusion/*.db" in gi_content
+
+    # Verify config.json is not ignored after migration
+    res_cfg = subprocess.run(
+        ["git", "check-ignore", ".fusion/config.json"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert res_cfg.returncode != 0
 
 
 def test_error_formatting_without_tracebacks():

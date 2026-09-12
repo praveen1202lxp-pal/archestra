@@ -30,8 +30,16 @@ ENV/
 .coverage
 htmlcov/
 
-# Fusion Agent local state
-.fusion/
+# Fusion Agent runtime state (config.json remains trackable)
+.fusion/*.db
+.fusion/*.db-wal
+.fusion/*.db-shm
+.fusion/*.log
+.fusion/logs/
+.fusion/worktrees/
+.fusion/temp/
+.fusion/locks/
+.fusion/cache/
 *.db
 *.sqlite3
 

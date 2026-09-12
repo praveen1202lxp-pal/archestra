@@ -15,7 +15,7 @@ Standalone single-model coding agents frequently suffer from two common failure 
 Fusion Agent addresses these challenges through:
 - **One Unified Persona, Multiple Specialized Contributors**: You interact with Fusion as a single intelligent peer. Multi-agent planning, implementation, and peer review take place autonomously under the hood.
 - **Strict Scope Discipline & Confinement**: Modifications are bounded to isolated Git worktrees. Protected files and test suites cannot be arbitrarily mutated.
-- **80%+ Token Efficiency**: 3-tier contextual snapshotting extracts only relevant symbols, dependency graphs, and recent execution state, eliminating massive redundant context dumps.
+- **Substantially Reduced Input Context**: 3-tier contextual snapshotting extracts only relevant symbols, dependency graphs, and recent execution state, eliminating massive redundant context dumps.
 - **Automated Peer Review & Repair Loops**: Implementation patches are critiqued and verified by a secondary model before human review.
 - **Mandatory Human-in-the-Loop Gate**: No code is ever promoted to your working branch without passing automated verification, passing peer review, and receiving explicit human confirmation.
 - **Durable Crash Recovery**: Execution state and checkpoints persist in a local SQLite database (`.fusion/fusion.db`), allowing interrupted tasks to be resumed instantly.
@@ -241,12 +241,17 @@ CLI Arguments
 
 ---
 
-## Safety & Security Model
+## Safety & Isolation Model
 
-- **Zero-Touch Working Tree**: Autonomous edits occur inside ephemeral Git worktrees (`git worktree add`). Your active uncommitted code is never touched or overwritten.
-- **Clean Tree Enforcement**: Fusion refuses to run on dirty working trees to prevent merge conflicts or accidental data loss.
-- **Secret Sanitization**: All terminal logs and persistence layers route through a sensitive data filter that automatically masks API keys (`AIza...`, `sk-...`, `Bearer...`).
-- **No Autonomous Auto-Promote**: The human promotion confirmation gate cannot be bypassed by LLM prompts. Only verified, test-passing, peer-reviewed patches can be approved.
+Fusion enforces distinct safety boundaries for repository integrity and change governance. **Fusion does not provide a general OS sandbox.**
+
+- **Repository & Policy Isolation (Git Worktrees)**: Autonomous edits and candidate patches execute strictly within ephemeral Git worktrees (`git worktree add`). Your active working tree and uncommitted files are never directly modified during deliberation or repair.
+- **Execution Trust Model (Host-Trusted / Non-Adversarial)**: Native execution of tools, verifiers, and provider CLI subprocesses runs on the host system with the current user's privileges. This execution model is **host-trusted and non-adversarial** — it protects against accidental code destruction, dirty repository pollution, and merge conflicts, not malicious code execution.
+- **Optional Container Isolation**: Where stricter isolation is required, container/Docker-based isolation may be explicitly configured and supported for isolated test execution workflows.
+- **Distinct Safety Boundaries**:
+  1. **Filesystem & State Partitioning**: Fusion-owned runtime state (`.fusion/fusion.db`, `.fusion/locks/`) and project files are strictly partitioned. Safe project configuration (`.fusion/config.json`) is trackable in Git while transient databases, logs, and worktrees remain ignored.
+  2. **Mandatory Human Approval Gate**: Verified changes are never automatically merged to the base repository. A human must inspect the generated unified diff, review verification results, and explicitly confirm promotion (`[y/N]`).
+  3. **Secret Sanitization**: All terminal logs and persistence layers route through a sensitive data filter that automatically redacts API keys (`AIza...`, `sk-...`, `Bearer...`), tokens, and credentials.
 
 ---
 
@@ -264,7 +269,7 @@ If an execution is interrupted (e.g. power loss, network dropout, user cancellat
 
 ## Evaluation & Benchmark Summary (Milestone 11)
 
-In Milestone 11 Phase C, Fusion Agent was subjected to a rigorous, 63-run held-out comparative evaluation against standalone frontier models across 7 diverse software engineering tasks (3 repetitions each):
+In Milestone 11 Phase C, Fusion Agent was evaluated in a 63-run held-out comparative benchmark against standalone frontier models across 7 diverse software engineering tasks (3 repetitions each):
 
 | System | Functional Correctness | Strict Scope Oracle | Median Input Tokens | Median Duration |
 | :--- | :---: | :---: | :---: | :---: |
@@ -273,9 +278,10 @@ In Milestone 11 Phase C, Fusion Agent was subjected to a rigorous, 63-run held-o
 | **Antigravity Alone** (`gemini-3.8-flash-high`) | **71.4% (15/21)** | 47.6% (10/21) | 284,316 | 244.3s |
 
 ### Empirical Findings:
-- **Scope Discipline Advantage**: Standalone models frequently passed visible unit tests by mutating the test suites themselves. Fusion's scope contract and change boundary enforced strict oracle compliance, winning **7 head-to-head pairs vs Codex** and **6 vs Antigravity**.
-- **81.9% Input Token Reduction**: Through 3-tier contextual snapshotting and bounded prompts, Fusion consumed a median of 67k input tokens versus 371k for Codex.
-- **Known Limitations**: Standalone models demonstrated higher raw single-step code generation accuracy on complex multi-service refactoring tasks (`TASK-06`). Multi-step sequential planning remains susceptible to interface drift, which is an active focus for future iterations.
+- **Functional Correctness**: Standalone single-model baselines achieved higher overall functional correctness on the benchmark suite (Codex 15/21, Antigravity 15/21 vs. Fusion 13/21). Multi-step sequential planning remains susceptible to interface drift across step boundaries.
+- **Input Context Efficiency**: Fusion used approximately **81.9% fewer median input tokens than Codex** (66,980 vs. 370,525) and approximately **76.4% fewer median input tokens than Antigravity** (66,980 vs. 284,316) by extracting bounded symbol and dependency graphs rather than ingesting entire workspaces.
+- **Scope Discipline & Governance**: Standalone systems frequently modified pre-existing test suites or generated unrequested peripheral files. Fusion's scope contract enforced strict change control (Fusion 12/21 vs. Codex 8/21 and Antigravity 10/21). *Caveat: Raw strict-scope differences were partly affected by uncommunicated protected-path policies for standalone systems.*
+- **Demonstrated Strengths**: Substantially reduced input context, centralized scope/change control, review/repair capability, recoverable durable orchestration, and vendor-agnostic provider abstraction.
 
 ---
 
@@ -310,6 +316,13 @@ Check Git cleanliness:
 ```bash
 git diff --check
 ```
+
+---
+
+## Roadmap
+
+- **Milestone 13**: Portfolio showcase, public demonstration fixtures, comparative evaluation presentation, and developer onboarding materials.
+- **Future Backlog (Post-M13)**: Direct remote cloud REST/gRPC service adapters (bypassing local CLI wrappers), containerized worker execution pools, and IDE plugins.
 
 ---
 
