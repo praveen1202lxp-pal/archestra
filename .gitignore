@@ -52,3 +52,6 @@ benchmarks/results/
 
 # Scratch directory
 scratch/
+
+# Angular cache
+.angular/

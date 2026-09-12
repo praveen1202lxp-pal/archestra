@@ -151,6 +151,7 @@ class IgnoreManager:
         "build",
         ".mypy_cache",
         ".ruff_cache",
+        ".angular",
     }
 
     def __init__(self, repo_root: Union[str, Path]):
