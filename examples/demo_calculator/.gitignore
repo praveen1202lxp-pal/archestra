@@ -1,0 +1,7 @@
+# Fusion Agent runtime state
+.fusion/
+
+# Python cache & testing
+__pycache__/
+*.pyc
+.pytest_cache/

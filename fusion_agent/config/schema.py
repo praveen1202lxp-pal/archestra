@@ -85,6 +85,79 @@ class FusionConfig:
         data["optimization_mode"] = self.optimization_mode.value
         return data
 
+    def to_safe_dict(self) -> Dict[str, Any]:
+        """Convert configuration to a dict with all sensitive fields redacted."""
+        raw = self.to_dict()
+        sensitive_patterns = ("key", "token", "secret", "password", "auth", "credential")
+
+        def _sanitize(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                clean = {}
+                for k, v in obj.items():
+                    if any(p in k.lower() for p in sensitive_patterns) and isinstance(v, str) and v:
+                        clean[k] = "[REDACTED]"
+                    else:
+                        clean[k] = _sanitize(v)
+                return clean
+            elif isinstance(obj, list):
+                return [_sanitize(item) for item in obj]
+            return obj
+
+        return _sanitize(raw)
+
+    @classmethod
+    def default_starter_config(cls, project_name: str = "MyProject") -> "FusionConfig":
+        """Generate a production-ready starter configuration detecting installed CLIs."""
+        import shutil
+        agents = {}
+        has_codex = shutil.which("codex") is not None
+        has_agy = shutil.which("agy") is not None
+
+        if has_codex or has_agy:
+            if has_codex:
+                agents["codex"] = AgentConfig(
+                    provider_name="OpenAI Codex CLI",
+                    provider_type="codex_cli",
+                    model="gpt-5.6-sol",
+                    extra_params={"reasoning_effort": "medium"},
+                )
+            if has_agy:
+                agents["antigravity"] = AgentConfig(
+                    provider_name="Google Antigravity CLI",
+                    provider_type="antigravity_cli",
+                    model="gemini-3.8-flash-high",
+                    extra_params={"effort": "high"},
+                )
+        else:
+            # Fallback to mock providers if neither CLI is found
+            agents = {
+                "primary": AgentConfig(
+                    provider_name="Primary Agent",
+                    provider_type="mock",
+                    model="mock-reasoning-v1",
+                ),
+                "secondary": AgentConfig(
+                    provider_name="Reviewer Agent",
+                    provider_type="mock",
+                    model="mock-critic-v1",
+                ),
+            }
+
+        return cls(
+            project_name=project_name,
+            project_root=".",
+            storage_dir=".fusion",
+            optimization_mode=OptimizationMode.BALANCED,
+            agents=agents,
+            deliberation=DeliberationConfig(
+                max_rounds=3,
+                max_repair_rounds=2,
+                max_provider_calls=8,
+                timeout_seconds=180.0,
+                max_task_duration_seconds=300.0,
+            ),
+        )
+
     @classmethod
     def default_mock_config(cls, project_name: str = "DemoProject") -> "FusionConfig":
         """Generate a default configuration using mock providers for testing."""

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project_name": "MyProject",
+  "project_root": ".",
+  "storage_dir": ".fusion",
+  "optimization_mode": "BALANCED",
+  "verification_command": "pytest",
+  "log_level": "INFO",
+  "agents": {
+    "codex": {
+      "provider_name": "OpenAI Codex CLI",
+      "provider_type": "codex_cli",
+      "model": "gpt-5.6-sol",
+      "extra_params": {
+        "reasoning_effort": "medium"
+      }
+    },
+    "antigravity": {
+      "provider_name": "Google Antigravity CLI",
+      "provider_type": "antigravity_cli",
+      "model": "gemini-3.8-flash-high",
+      "extra_params": {
+        "effort": "high"
+      }
+    }
+  },
+  "deliberation": {
+    "max_rounds": 3,
+    "max_repair_rounds": 2,
+    "max_provider_calls": 8,
+    "timeout_seconds": 180.0,
+    "max_task_duration_seconds": 300.0,
+    "auto_synthesize": true,
+    "skip_peer_review_for_low_risk": true
+  },
+  "mcp_servers": {}
+}

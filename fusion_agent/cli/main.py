@@ -1,11 +1,15 @@
 """Command Line Interface for Fusion Agent."""
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 from typing import Optional
 
+import fusion_agent
+from fusion_agent.cli.doctor import print_doctor_report, run_doctor
+from fusion_agent.cli.errors import format_cli_error
 from fusion_agent.config.loader import ConfigLoader
 from fusion_agent.config.schema import AgentConfig, FusionConfig, OptimizationMode
 from fusion_agent.core.orchestrator import FusionOrchestrator
@@ -44,24 +48,24 @@ ICON_ARROW = "->"
 def print_banner():
     print(f"{BOLD}{CYAN}==================================================={RESET}")
     print(f"{BOLD}{CYAN}               FUSION AGENT                        {RESET}")
-    print(f"{BOLD} Multi-Model Coding Agent Orchestrator (v0.1.0)     {RESET}")
+    print(f"{BOLD} Multi-Model Coding Agent Orchestrator (v{fusion_agent.__version__}) {RESET}")
     print(f"{BOLD}{CYAN}==================================================={RESET}")
 
 
 def cmd_init(args) -> int:
-    """Initialize a new Fusion Agent project."""
+    """Initialize a new Fusion Agent project in the target directory."""
     target_dir = Path(args.dir).resolve()
     fusion_dir = target_dir / ".fusion"
 
-    if (fusion_dir / "config.json").exists() and not args.force:
+    if (fusion_dir / "config.json").exists() and not getattr(args, "force", False):
         print(f"{YELLOW}Project already initialized at: {fusion_dir}{RESET}")
         print("Use --force to overwrite configuration.")
         return 0
 
-    project_name = args.name or target_dir.name
-    goal = args.goal or "Build software using provider-agnostic multi-agent orchestration"
+    project_name = getattr(args, "name", None) or target_dir.name
 
-    config = FusionConfig.default_mock_config(project_name=project_name)
+    # Create detected starter configuration
+    config = FusionConfig.default_starter_config(project_name=project_name)
     config.project_root = str(target_dir)
 
     ConfigLoader.save(config, target_dir)
@@ -71,30 +75,50 @@ def cmd_init(args) -> int:
     db.connect()
     db.close()
 
+    # Update or create .gitignore to protect runtime state
+    gitignore_path = target_dir / ".gitignore"
+    gitignore_msg = ""
+    if gitignore_path.exists():
+        content = gitignore_path.read_text(encoding="utf-8", errors="replace")
+        if ".fusion" not in content:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                f.write("\n# Fusion Agent runtime state\n.fusion/\n")
+            gitignore_msg = " (added .fusion/ to existing .gitignore)"
+    elif (target_dir / ".git").exists():
+        with open(gitignore_path, "w", encoding="utf-8") as f:
+            f.write("# Fusion Agent runtime state\n.fusion/\n")
+        gitignore_msg = " (created .gitignore with .fusion/)"
+
     print(f"{GREEN}{ICON_OK} Initialized Fusion Agent project: {BOLD}{project_name}{RESET}")
     print(f"  Configuration: {fusion_dir / 'config.json'}")
     print(f"  Shared Brain:  {fusion_dir / 'fusion.db'}")
-    print(f"  Optimization:  {config.optimization_mode.value}")
-    print(f"\nRun {BOLD}fusion status{RESET} to view configured providers.")
+    print(f"  Optimization:  {config.optimization_mode.value}{gitignore_msg}")
+    print(f"\nNext steps:")
+    print(f"  1. Run {BOLD}fusion doctor{RESET} to verify provider CLI installations")
+    print(f"  2. Run {BOLD}fusion providers{RESET} to inspect provider health")
+    print(f"  3. Run {BOLD}fusion run \"Your coding task\"{RESET} to execute work")
     return 0
 
 
-def cmd_status(args) -> int:
-    """Display project status, providers, and recent activity."""
-    config_file = ConfigLoader.find_config_file(args.dir)
-    if not config_file:
-        print(f"{YELLOW}No Fusion Agent project found. Run 'fusion init' first.{RESET}")
-        return 1
+def cmd_doctor(args) -> int:
+    """Run non-destructive diagnostics on environment, tooling, and providers."""
+    report = run_doctor(project_dir=args.dir, verbose=getattr(args, "verbose", False))
+    print_doctor_report(report)
+    return 0 if report.is_healthy else 1
 
-    config = ConfigLoader.load(config_file)
-    db = Database(Path(config.project_root) / config.storage_dir / "fusion.db")
-    
-    print_banner()
-    print(f"{BOLD}Project:{RESET}      {config.project_name}")
-    print(f"{BOLD}Directory:{RESET}    {config.project_root}")
-    print(f"{BOLD}Mode:{RESET}         {config.optimization_mode.value}")
-    print(f"\n{BOLD}Configured Providers:{RESET}")
 
+def cmd_providers(args) -> int:
+    """List configured providers and test their availability non-destructively."""
+    config = ConfigLoader.load_hierarchical(project_dir=args.dir)
+
+    print(f"\n{BOLD}Configured Providers for {config.project_name}:{RESET}\n")
+
+    if not config.agents:
+        print("  No providers configured in project or user configuration.")
+        print(f"  Run '{BOLD}fusion init{RESET}' to generate a starter configuration.")
+        return 0
+
+    all_ready = True
     for agent_id, agent_cfg in config.agents.items():
         try:
             prov = ProviderRegistry.create(
@@ -105,35 +129,114 @@ def cmd_status(args) -> int:
             prov.initialize()
             health = prov.health_check()
             status_icon = f"{GREEN}{ICON_OK}{RESET}" if health.healthy else f"{YELLOW}{ICON_FAIL}{RESET}"
-            print(f"  {status_icon} [{agent_id}] {agent_cfg.provider_name} ({agent_cfg.provider_type}) - {health.message}")
+            model_info = f" [model: {agent_cfg.model}]" if agent_cfg.model else ""
+            print(f"  {status_icon} [{agent_id}] {agent_cfg.provider_name} ({agent_cfg.provider_type}){model_info}")
+            print(f"     Status: {health.message} ({health.latency_ms:.1f}ms)")
+            if not health.healthy:
+                all_ready = False
         except Exception as e:
-            print(f"  {YELLOW}{ICON_FAIL}{RESET} [{agent_id}] {agent_cfg.provider_name} - Error: {e}")
+            print(f"  {RED}{ICON_FAIL}{RESET} [{agent_id}] {agent_cfg.provider_name} - Error: {e}")
+            all_ready = False
+
+    print("")
+    return 0 if all_ready else 1
+
+
+def cmd_status(args) -> int:
+    """Display project status, providers summary, and recent activity."""
+    config_file = ConfigLoader.find_config_file(args.dir)
+    if not config_file:
+        print(f"{YELLOW}No Fusion Agent project found in {args.dir}. Run 'fusion init' first.{RESET}")
+        return 1
+
+    config = ConfigLoader.load(config_file)
+    db = Database(Path(config.project_root) / config.storage_dir / "fusion.db")
+
+    print_banner()
+    print(f"{BOLD}Project:{RESET}      {config.project_name}")
+    print(f"{BOLD}Directory:{RESET}    {config.project_root}")
+    print(f"{BOLD}Mode:{RESET}         {config.optimization_mode.value}")
+    print(f"{BOLD}Verification:{RESET} {config.verification_command or 'default (pytest)'}")
+
+    # Configured providers summary
+    print(f"\n{BOLD}Configured Providers:{RESET}")
+    for agent_id, agent_cfg in config.agents.items():
+        model_str = f" ({agent_cfg.model})" if agent_cfg.model else ""
+        print(f"  - {agent_id}: {agent_cfg.provider_name}{model_str}")
 
     # Display recoverable tasks
-    conn = db.connect()
-    rec_tasks = conn.execute(
-        "SELECT id, title, status, last_checkpoint_sha FROM tasks WHERE status IN ('RUNNING', 'INTERRUPTED', 'RECOVERABLE', 'RESUMING') ORDER BY created_at DESC LIMIT 10;"
-    ).fetchall()
-    if rec_tasks:
-        print(f"\n{BOLD}{YELLOW}Recoverable Tasks:{RESET}")
-        for rt in rec_tasks:
-            chk = f"checkpoint: {rt['last_checkpoint_sha'][:8]}" if rt['last_checkpoint_sha'] else "no checkpoint"
-            print(f"  - [{rt['status']}] {BOLD}{rt['id']}{RESET}: {rt['title']} ({chk})")
-        print(f"  Run {BOLD}fusion resume <task-id>{RESET} to resume execution.")
+    try:
+        conn = db.connect()
+        rec_tasks = conn.execute(
+            "SELECT id, title, status, last_checkpoint_sha FROM tasks WHERE status IN ('RUNNING', 'INTERRUPTED', 'RECOVERABLE', 'RESUMING') ORDER BY created_at DESC LIMIT 10;"
+        ).fetchall()
+        if rec_tasks:
+            print(f"\n{BOLD}{YELLOW}Recoverable Tasks:{RESET}")
+            for rt in rec_tasks:
+                chk = f"checkpoint: {rt['last_checkpoint_sha'][:8]}" if rt['last_checkpoint_sha'] else "no checkpoint"
+                print(f"  - [{rt['status']}] {BOLD}{rt['id']}{RESET}: {rt['title']} ({chk})")
+            print(f"  Run {BOLD}fusion resume <task-id>{RESET} to resume execution.")
 
-    # Display recent tasks
-    tasks = conn.execute(
-        "SELECT title, status, selected_strategy, created_at FROM tasks ORDER BY created_at DESC LIMIT 5;"
-    ).fetchall()
-    
-    print(f"\n{BOLD}Recent Tasks in Memory:{RESET}")
-    if not tasks:
-        print("  (No tasks recorded yet)")
-    else:
-        for t in tasks:
-            print(f"  - [{t['status']}] {t['title']} ({t['selected_strategy'] or 'N/A'})")
+        # Display recent tasks
+        tasks = conn.execute(
+            "SELECT title, status, selected_strategy, created_at FROM tasks ORDER BY created_at DESC LIMIT 5;"
+        ).fetchall()
 
-    db.close()
+        print(f"\n{BOLD}Recent Tasks in Memory:{RESET}")
+        if not tasks:
+            print("  (No tasks recorded yet)")
+        else:
+            for t in tasks:
+                print(f"  - [{t['status']}] {t['title']} ({t['selected_strategy'] or 'N/A'})")
+
+        db.close()
+    except Exception:
+        pass
+
+    return 0
+
+
+def cmd_config(args) -> int:
+    """Inspect or validate active configuration."""
+    project_dir = getattr(args, "dir", ".") or "."
+    cfg_file = ConfigLoader.find_config_file(project_dir)
+
+    if getattr(args, "path", False):
+        if cfg_file:
+            print(str(cfg_file.resolve()))
+            return 0
+        else:
+            print(f"{YELLOW}No project config found. User config: {ConfigLoader.get_user_config_path()}{RESET}")
+            return 1
+
+    try:
+        config = ConfigLoader.load_hierarchical(project_dir=project_dir)
+    except Exception as exc:
+        print(format_cli_error(exc, debug=getattr(args, "debug", False)))
+        return 1
+
+    if getattr(args, "validate", False):
+        print(f"{GREEN}✓ Configuration is valid (project: {config.project_name}, mode: {config.optimization_mode.value}){RESET}")
+        return 0
+
+    if getattr(args, "get", None):
+        key = args.get
+        val = getattr(config, key, None)
+        if val is not None:
+            if isinstance(val, (dict, list)):
+                print(json.dumps(val, indent=2))
+            else:
+                print(val)
+            return 0
+        else:
+            print(f"{RED}Unknown configuration key: {key}{RESET}")
+            return 1
+
+    # Default: display safe redacted JSON
+    safe_data = config.to_safe_dict()
+    print(f"\n{BOLD}Active Fusion Configuration ({config.project_name}):{RESET}")
+    print(json.dumps(safe_data, indent=2))
+    print("")
     return 0
 
 
@@ -146,7 +249,7 @@ def _inspect_and_promote(result, orchestrator: FusionOrchestrator, args) -> int:
         review = result.review_result
         promo = PromotionEngine()
 
-        print(f"{BOLD}{CYAN}=== ISOLATED REPOSITORY EDIT INSPECTION ==={RESET}")
+        print(f"\n{BOLD}{CYAN}=== ISOLATED REPOSITORY EDIT INSPECTION ==={RESET}")
         print(f"Task Branch:  {session.task_branch}")
         print(f"Base Commit:  {session.base_commit[:8] if session.base_commit else 'unknown'}")
 
@@ -228,11 +331,19 @@ def cmd_run(args) -> int:
     """Run a single task through Fusion Agent."""
     config_file = ConfigLoader.find_config_file(args.dir)
     if not config_file:
-        print(f"{YELLOW}No Fusion Agent project found. Initializing with defaults...{RESET}")
+        print(f"{YELLOW}No Fusion Agent project found. Initializing with detected defaults...{RESET}")
         cmd_init(args)
         config_file = ConfigLoader.find_config_file(args.dir)
 
-    config = ConfigLoader.load(config_file)
+    try:
+        if config_file:
+            config = ConfigLoader.load(config_file)
+        else:
+            config = ConfigLoader.load_hierarchical(project_dir=args.dir)
+    except Exception as exc:
+        print(format_cli_error(exc, debug=getattr(args, "debug", False)))
+        return 1
+
     db = Database(Path(config.project_root) / config.storage_dir / "fusion.db")
     orchestrator = FusionOrchestrator(config=config, database=db)
 
@@ -249,22 +360,23 @@ def cmd_run(args) -> int:
             impl = roles.get("implementer") or data.get("primary")
             rev = roles.get("reviewer") or data.get("secondary")
             print(f"  {CYAN}{ICON_ARROW} Strategy: {data.get('strategy')} | Implementer: {impl} | Reviewer: {rev or 'None'}{RESET}")
-            if data.get("task_assessment"):
+            if data.get("task_assessment") and getattr(args, "debug", False):
                 ass = data["task_assessment"]
                 print(f"    {GRAY}Assessment: {ass.get('task_type')} | Complexity: {ass.get('complexity')} | Scope: {ass.get('estimated_scope')} | Risk: {ass.get('review_risk')}{RESET}")
-            print(f"    {GRAY}Rationale: {data.get('rationale')}{RESET}")
-        elif event_type == "routing" and args.debug:
+            if data.get("rationale") and getattr(args, "debug", False):
+                print(f"    {GRAY}Rationale: {data.get('rationale')}{RESET}")
+        elif event_type == "routing" and getattr(args, "debug", False):
             print(f"  {YELLOW}[DEBUG Router]{RESET} Strategy: {data.get('strategy')} | Complexity: {data.get('complexity')}")
             print(f"    Rationale: {data.get('rationale')}")
 
     try:
         result = orchestrator.run_task(args.task, on_status=handle_status_event)
     except Exception as exc:
-        print(f"\n{BOLD}{YELLOW}[ERROR]{RESET} Fusion Agent failed to process task: {exc}\n")
+        print(format_cli_error(exc, debug=getattr(args, "debug", False)))
         return 1
 
     # Output deliberation details if debug mode requested
-    if args.debug:
+    if getattr(args, "debug", False):
         print(f"\n{BOLD}{YELLOW}--- DELIBERATION INSPECTION (DEBUG) ---{RESET}")
         print(f"Strategy:    {result.deliberation.strategy_used}")
         print(f"Providers:   {', '.join(result.deliberation.participating_providers)}")
@@ -305,7 +417,12 @@ def cmd_resume(args) -> int:
         print(f"{YELLOW}No Fusion Agent project found. Run 'fusion init' first.{RESET}")
         return 1
 
-    config = ConfigLoader.load(config_file)
+    try:
+        config = ConfigLoader.load(config_file)
+    except Exception as exc:
+        print(format_cli_error(exc, debug=getattr(args, "debug", False)))
+        return 1
+
     db = Database(Path(config.project_root) / config.storage_dir / "fusion.db")
     orchestrator = FusionOrchestrator(config=config, database=db)
 
@@ -322,47 +439,12 @@ def cmd_resume(args) -> int:
             impl = roles.get("implementer") or data.get("primary")
             rev = roles.get("reviewer") or data.get("secondary")
             print(f"  {CYAN}{ICON_ARROW} Strategy: {data.get('strategy')} | Implementer: {impl} | Reviewer: {rev or 'None'}{RESET}")
-            if data.get("task_assessment"):
-                ass = data["task_assessment"]
-                print(f"    {GRAY}Assessment: {ass.get('task_type')} | Complexity: {ass.get('complexity')} | Scope: {ass.get('estimated_scope')} | Risk: {ass.get('review_risk')}{RESET}")
-            print(f"    {GRAY}Rationale: {data.get('rationale')}{RESET}")
-        elif event_type == "routing" and getattr(args, "debug", False):
-            print(f"  {YELLOW}[DEBUG Router]{RESET} Strategy: {data.get('strategy')} | Complexity: {data.get('complexity')}")
-            print(f"    Rationale: {data.get('rationale')}")
 
     try:
         result = orchestrator.resume_task(args.task_id, on_status=handle_status_event)
     except Exception as exc:
-        print(f"\n{BOLD}{YELLOW}[ERROR]{RESET} Fusion Agent failed to resume task: {exc}\n")
+        print(format_cli_error(exc, debug=getattr(args, "debug", False)))
         return 1
-
-    # Output deliberation details if debug mode requested
-    if getattr(args, "debug", False) and hasattr(result, "deliberation") and result.deliberation:
-        print(f"\n{BOLD}{YELLOW}--- DELIBERATION INSPECTION (DEBUG) ---{RESET}")
-        print(f"Strategy:    {result.deliberation.strategy_used}")
-        print(f"Providers:   {', '.join(result.deliberation.participating_providers)}")
-        print(f"Rounds:      {result.deliberation.rounds_executed}")
-        print(f"Duration:    {result.deliberation.duration_ms:.1f} ms")
-        in_tok_str = f"{result.deliberation.total_input_tokens:,}" if result.deliberation.total_input_tokens is not None else "unavailable"
-        out_tok_str = f"{result.deliberation.total_output_tokens:,}" if result.deliberation.total_output_tokens is not None else "unavailable"
-        print(f"Input Toks:  {in_tok_str}")
-        print(f"Output Toks: {out_tok_str}")
-        if hasattr(result, "context") and result.context and result.context.metrics:
-            m = result.context.metrics
-            print(f"Context:     Permanent: {m.get('permanent_chars', 0)}c | Current: {m.get('current_chars', 0)}c | Recent: {m.get('recent_chars', 0)}c | Peer: {m.get('peer_chars', 0)}c | Est. Tokens: ~{m.get('estimated_tokens', 0)}")
-        if hasattr(result.deliberation, "stage_metrics") and result.deliberation.stage_metrics:
-            print(f"\n{BOLD}Per-Provider Stages:{RESET}")
-            for sm in result.deliberation.stage_metrics:
-                s_in = f"{sm['input_tokens']:,}" if sm.get('input_tokens') is not None else "unavailable"
-                s_out = f"{sm['output_tokens']:,}" if sm.get('output_tokens') is not None else "unavailable"
-                print(f"  - {BOLD}{sm['stage']}{RESET} ({sm['provider']}): {sm['duration_ms']:.1f} ms | in: {s_in}, out: {s_out}")
-        for prop in getattr(result.deliberation, "proposals", []):
-            print(f"\n{BOLD}[Proposal from {prop.agent_name}]{RESET}\n{prop.content}")
-        for crit in getattr(result.deliberation, "critiques", []):
-            print(f"\n{BOLD}[Critique by {crit.reviewer_agent}]{RESET}\n{crit.content}")
-        for rev in getattr(result.deliberation, "reviews", []):
-            print(f"\n{BOLD}[Review by {rev.reviewer_agent} - {rev.status.value}]{RESET}\n{rev.comments}")
-        print(f"{BOLD}{YELLOW}---------------------------------------{RESET}\n")
 
     # Unified Single Agent Response
     print(f"\n{BOLD}{GREEN}Fusion:{RESET}")
@@ -374,11 +456,10 @@ def cmd_resume(args) -> int:
 def cmd_mcp(args) -> int:
     """Manage and inspect Model Context Protocol (MCP) servers and tools."""
     config_file = ConfigLoader.find_config_file(args.dir)
-    if not config_file:
-        print(f"{YELLOW}No Fusion Agent project found. Run 'fusion init' first.{RESET}")
-        return 1
-
-    config = ConfigLoader.load(config_file)
+    if config_file:
+        config = ConfigLoader.load(config_file)
+    else:
+        config = ConfigLoader.load_hierarchical(project_dir=args.dir)
     from fusion_agent.mcp.registry import MCPServerRegistry
 
     registry = MCPServerRegistry()
@@ -449,7 +530,10 @@ def cmd_interactive(args) -> int:
         cmd_init(args)
         config_file = ConfigLoader.find_config_file(args.dir)
 
-    config = ConfigLoader.load(config_file)
+    if config_file:
+        config = ConfigLoader.load(config_file)
+    else:
+        config = ConfigLoader.load_hierarchical(project_dir=args.dir)
     db = Database(Path(config.project_root) / config.storage_dir / "fusion.db")
     orchestrator = FusionOrchestrator(config=config, database=db)
 
@@ -477,7 +561,7 @@ def cmd_interactive(args) -> int:
 def main():
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("--dir", default=".", help="Project root directory (default: current dir)")
-    common_parser.add_argument("--debug", action="store_true", help="Show internal multi-agent deliberation details")
+    common_parser.add_argument("--debug", action="store_true", help="Show internal multi-agent deliberation and tracebacks")
 
     parser = argparse.ArgumentParser(
         prog="fusion",
@@ -485,26 +569,46 @@ def main():
         parents=[common_parser],
     )
 
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Fusion Agent v{fusion_agent.__version__}",
+        help="Show Fusion Agent version and exit",
+    )
+
     subparsers = parser.add_subparsers(dest="command")
 
     # Init
-    p_init = subparsers.add_parser("init", parents=[common_parser], help="Initialize a Fusion Agent project")
+    p_init = subparsers.add_parser("init", parents=[common_parser], help="Initialize a Fusion Agent project in the repository")
     p_init.add_argument("--name", help="Project name")
     p_init.add_argument("--goal", help="Project goal description")
     p_init.add_argument("--force", action="store_true", help="Force overwrite existing config")
 
+    # Doctor
+    p_doctor = subparsers.add_parser("doctor", parents=[common_parser], help="Check system environment, tooling, and provider availability")
+    p_doctor.add_argument("--verbose", action="store_true", help="Show detailed diagnostic output")
+
+    # Providers
+    subparsers.add_parser("providers", parents=[common_parser], help="List configured providers and verify their health")
+
     # Status
-    subparsers.add_parser("status", parents=[common_parser], help="Show project status and provider health")
+    subparsers.add_parser("status", parents=[common_parser], help="Show project status, mode, and recent task memory")
+
+    # Config
+    p_config = subparsers.add_parser("config", parents=[common_parser], help="Inspect or validate active project configuration")
+    p_config.add_argument("--validate", action="store_true", help="Validate active configuration syntax and schema")
+    p_config.add_argument("--path", action="store_true", help="Print path of the resolved configuration file")
+    p_config.add_argument("--get", metavar="KEY", help="Get a specific configuration value (e.g. optimization_mode)")
 
     # Run
-    p_run = subparsers.add_parser("run", parents=[common_parser], help="Run a single task through Fusion Agent")
-    p_run.add_argument("task", help="The programming task or question")
-    p_run.add_argument("--no-promote", action="store_true", help="Do not promote changes to base branch")
+    p_run = subparsers.add_parser("run", parents=[common_parser], help="Run a single coding task through Fusion Agent")
+    p_run.add_argument("task", help="The programming task or instruction")
+    p_run.add_argument("--no-promote", action="store_true", help="Do not promote changes to base repository")
 
     # Resume
     p_resume = subparsers.add_parser("resume", parents=[common_parser], help="Resume an interrupted Fusion Agent task")
     p_resume.add_argument("task_id", help="The task ID to resume")
-    p_resume.add_argument("--no-promote", action="store_true", help="Do not promote changes to base branch")
+    p_resume.add_argument("--no-promote", action="store_true", help="Do not promote changes to base repository")
 
     # Interactive
     subparsers.add_parser("interactive", parents=[common_parser], help="Start an interactive session")
@@ -520,13 +624,19 @@ def main():
     args = parser.parse_args()
 
     if not args.command:
-        # Default to interactive if no command given
-        return cmd_interactive(args)
+        parser.print_help()
+        return 0
 
     if args.command == "init":
         return cmd_init(args)
+    elif args.command == "doctor":
+        return cmd_doctor(args)
+    elif args.command == "providers":
+        return cmd_providers(args)
     elif args.command == "status":
         return cmd_status(args)
+    elif args.command == "config":
+        return cmd_config(args)
     elif args.command == "run":
         return cmd_run(args)
     elif args.command == "resume":
