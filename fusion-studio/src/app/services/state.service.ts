@@ -169,17 +169,22 @@ export class StateService {
   }
 
   // --- Project & Files ---
-  public async loadProject(path: string) {
-    const res = await this.bridge.openProject(path);
-    if (res.success) {
+  public async loadProject(path?: string) {
+    let res;
+    if (path) {
+      res = await this.bridge.openProject(path);
+    } else {
+      res = await this.bridge.getProjectStatus();
+    }
+    if (res && res.success && res.data) {
       this.project.set({
         opened: true,
-        path: res.data.path,
-        name: res.data.name,
+        path: res.data.path || res.data.project_root || '',
+        name: res.data.name || res.data.project_name || 'Fusion Studio',
         initialized: res.data.initialized,
         version: res.data.version,
-        optimization_mode: 'BALANCED',
-        verification_command: 'pytest',
+        optimization_mode: res.data.optimization_mode || 'BALANCED',
+        verification_command: res.data.verification_command || 'pytest',
         git_clean: res.data.git_clean,
       });
       await this.refreshFiles();

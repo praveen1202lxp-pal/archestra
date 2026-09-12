@@ -34,7 +34,12 @@ export class AppComponent implements OnInit {
 
   ngOnInit(): void {
     // Load initial project status from local server
-    this.state.loadProject('.');
+    this.state.loadProject().then(() => {
+      const calc = this.state.files().find(f => f.path.includes('calculator.py') && !f.is_dir);
+      if (calc) {
+        this.state.openFile(calc.path);
+      }
+    });
   }
 
   public selectTab(tab: any): void {
