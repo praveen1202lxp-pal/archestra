@@ -71,17 +71,17 @@ flowchart TD
 
 ## Why Fusion Agent?
 
-When software teams experiment with raw coding LLMs, they quickly encounter operational limits. Fusion introduces an explicit engineering control plane between the developer's codebase and external foundation models:
+Standalone benchmark arms relied primarily on provider-native behavior, while Fusion centrally owned bounded context selection, change scope, verification, checkpoints, review and promotion:
 
-| Capability | Raw Coding Model (Direct Execution) | Fusion Agent (Control Plane) |
+| Capability | Evaluated Standalone Configuration (Provider-Native) | Fusion Agent (Centrally Governed Control Plane) |
 | :--- | :--- | :--- |
-| **Context Ingestion** | Dumps full repository files into prompt; massive token spend. | **3-tier bounded snapshotting** (AST definitions, symbol call graphs, imports); **81.9% token reduction**. |
-| **Filesystem Access** | Writes directly to active working tree; risk of dirty tree pollution. | **Ephemeral Git worktrees** (`git worktree add`); active working branch is never modified during runs. |
-| **Verification Gate** | Model self-declares success based on text generation. | **Automated host test runner** (`pytest`/configured suite) executed inside isolated worktree. |
-| **Quality & Peer Review** | Single model reviews its own output (sycophancy bias). | **Adversarial cross-model peer review** with bounded repair loops (capped at 2 rounds). |
-| **Scope Discipline** | Often mutates existing unit tests to force tests to pass. | **Mathematical scope contract** forbids test mutation or unrequested file creation. |
-| **Recovery & Checkpoints** | Session lost on network disconnect, timeout, or crash. | **Durable SQLite WAL journal**; resume interrupted runs with `fusion resume <task-id>`. |
-| **Promotion Authority** | Autonomous auto-merges or manual copy-pasting. | **Mandatory human confirmation gate** with interactive unified diff inspection (`[y/N]`). |
+| **Context Ingestion** | Relied on provider-native whole-file or full-repository ingestion; higher token spend. | **3-tier bounded snapshotting** (AST definitions, symbol call graphs, imports); **81.9% token reduction**. |
+| **Filesystem Access** | Relied on direct workspace writes without external isolation; risk of dirty tree pollution. | **Ephemeral Git worktrees** (`git worktree add`); active working branch is never modified during runs. |
+| **Verification Gate** | Relied on unassisted generation or model self-reporting without automated suite execution. | **Automated host test runner** (`pytest`/configured suite) executed inside isolated worktree. |
+| **Quality & Peer Review** | Standalone models reviewed their own output or omitted review. | **Cross-model peer review / critique** with bounded repair loops (capped at 2 rounds). |
+| **Scope Discipline** | Lacked central scope enforcement; some runs modified test/protected paths without boundary guardrails. | **Mathematical scope contract** forbidding test mutation or unrequested file creation. |
+| **Recovery & Checkpoints** | Relied on provider-native session persistence without external state engine. | **Durable SQLite WAL journal**; durable task resumption across checkpointed and crash-injection scenarios (`fusion resume <task-id>`). |
+| **Promotion Authority** | Direct commits or manual diff inspection without centralized gate. | **Mandatory human confirmation gate** with interactive unified diff inspection (`[y/N]`). |
 
 > **Important**: Fusion does not claim to make underlying model weights smarter. Rather, it provides the deterministic scaffolding, state management, and safety boundaries necessary to run autonomous coding tasks reliably.
 
@@ -130,6 +130,20 @@ fusion --version
 # Output: Fusion Agent v0.12.0
 ```
 
+### Running Tests
+To run the automated regression test suite:
+```bash
+python -m pytest -q
+```
+
+### Development & Contributing
+Contributions and local enhancements are welcome:
+1. Clone the repository and create a virtual environment (`python -m venv .venv`).
+2. Install in editable mode with development dependencies: `pip install -e .`
+3. Execute tests before submitting changes: `python -m pytest -q`
+4. Verify code formatting and whitespace cleanliness: `git diff --check`
+5. Adhere to core architecture invariants: host-trusted non-adversarial execution, Git worktree isolation, SQLite durable checkpointing, and structured model edit generation.
+
 ---
 
 ## CLI Reference
@@ -154,11 +168,15 @@ Fusion provides a clean, predictable command-line interface:
 
 In Milestone 11 Phase C, Fusion Agent was evaluated in a frozen, 63-run held-out comparative benchmark against standalone frontier models across 7 diverse software engineering tasks (3 repetitions each):
 
-| System | Functional Correctness | Strict Scope Oracle | Median Input Tokens | Median Duration |
-| :--- | :---: | :---: | :---: | :---: |
-| **Fusion Agent** | 61.9% (13/21) | **57.1% (12/21)** | **66,980** | **70.4s** |
-| **OpenAI Codex Alone** (`gpt-5.6-sol`) | **71.4% (15/21)** | 38.1% (8/21) | 370,525 | 248.9s |
-| **Antigravity Alone** (`gemini-3.8-flash-high`) | **71.4% (15/21)** | 47.6% (10/21) | 284,316 | 244.3s |
+| System | Functional Correctness | Strict Scope Oracle | Median Input Tokens |
+| :--- | :---: | :---: | :---: |
+| **Fusion Agent** | 61.9% (13/21) | **57.1% (12/21)** | **66,980** |
+| **OpenAI Codex Alone** (`gpt-5.6-sol`) | **71.4% (15/21)** | 38.1% (8/21)* | 370,525 |
+| **Antigravity Alone** (`gemini-3.8-flash-high`) | **71.4% (15/21)** | 47.6% (10/21)* | 284,316 |
+
+*(Timing Note: Task durations are omitted from headline comparisons because execution substrates differed across evaluation arms—including containerized execution for Antigravity versus host execution for Codex and Fusion—rendering duration exploratory and non-apples-to-apples. Do not present timing numbers as evidence that Fusion is intrinsically 3–4× faster).*
+
+*(Scope Oracle Note: Some standalone runs modified test/protected paths disallowed by the frozen scope oracle. The strict-score comparison is confounded by those protections not being communicated in standalone task prompts).*
 
 ### Benchmark Visualizations
 
@@ -173,8 +191,8 @@ In Milestone 11 Phase C, Fusion Agent was evaluated in a frozen, 63-run held-out
 ### Empirical Findings:
 - **Input Context Efficiency**: Fusion consumed **81.9% fewer median input tokens than Codex** (66,980 vs. 370,525) and **76.4% fewer median input tokens than Antigravity** (66,980 vs. 284,316) by extracting bounded symbol call graphs rather than ingesting entire repositories.
 - **Functional Correctness Trade-off**: Standalone single-model baselines achieved higher overall functional pass rates on this suite (Codex 15/21, Antigravity 15/21 vs. Fusion 13/21). While multi-agent deliberation caught defects, sequential multi-step planning introduced **interface drift** across step boundaries.
-- **Scope Discipline & Governance**: Standalone systems frequently modified pre-existing test suites or generated unrequested helper files. Fusion's scope contract enforced strict change control (Fusion 12/21 vs. Codex 8/21 and Antigravity 10/21).
-- **Strict Scope Caveat**: Raw strict-scope differences were partly affected by uncommunicated protected-path policies for standalone systems, which had no prompt-level instruction forbidding test modification.
+- **Scope Discipline & Governance**: Standalone benchmark arms relied primarily on provider-native behavior, while Fusion centrally owned bounded context selection, change scope, verification, checkpoints, review and promotion. Some standalone runs modified test/protected paths disallowed by the frozen scope oracle. The strict-score comparison is confounded by those protections not being communicated in standalone task prompts.
+- **Exploratory Timing Substrate Caveat**: Median durations (Fusion 70.4s, Codex 248.9s, Antigravity 244.3s) were measured across differing execution substrates (including containerized Antigravity versus host execution for other arms) and are strictly exploratory, not evidence of an intrinsic speed advantage.
 - **Reproducibility**: All chart assets are reproducible via `python docs/assets/generate_charts.py`.
 
 ---

@@ -20,7 +20,7 @@ This guide is designed for engineering hiring managers, technical interviewers, 
 > 
 > 3. ***Worktree Isolation & Structured Editing***: Edits execute inside ephemeral Git worktrees (`git worktree add`). The primary model generates structured edit specifications, which Fusion's `WorkspaceEditor` validates against AST syntax trees and scope boundaries before writing to disk.
 > 
-> 4. ***Automated Verification & Adversarial Peer Review***: Fusion immediately executes the repository's test suite inside the worktree. Upon test pass, a secondary model reviews the unified diff as an adversarial peer. If defects or regressions are detected, the implementer enters a bounded repair loop (capped at 2 rounds) to prevent runaway token spend.
+> 4. ***Automated Verification & Cross-Model Peer Review / Critique***: Fusion immediately executes the repository's test suite inside the worktree. Upon test pass, a secondary model reviews the unified diff for cross-model peer critique. If defects or regressions are detected, the implementer enters a bounded repair loop (capped at 2 rounds) to prevent runaway token spend.
 > 
 > 5. ***Durable SQLite Recovery***: Every stage, critique, token count, and git commit SHA is journaled in an embedded SQLite database using WAL mode. If a process is killed mid-task, `fusion resume <task-id>` resumes execution from the exact checkpoint without re-running completed stages.
 > 
@@ -48,13 +48,14 @@ In a frozen, 63-run held-out comparative evaluation across 7 software engineerin
 | **Median Input Tokens** | **66,980** | **370,525** | **284,316** |
 | **Input Token Reduction** | *Baseline* | **-81.9%** | **-76.4%** |
 | **Strict Scope Oracle** | **57.1%** (12/21) | **38.1%** (8/21)* | **47.6%** (10/21)* |
-| **Median Task Duration** | **70.4s** | **248.9s** | **244.3s** |
 
-*\*Caveat: Standalone systems were partly affected by uncommunicated protected-path policies that were not explicitly stated in task-visible prompts.*
+*(Timing Note: Task durations are omitted from headline comparisons because execution substrates differed across evaluation arms—including containerized execution for Antigravity versus host execution for Codex and Fusion—rendering duration exploratory and non-apples-to-apples. Do not present timing numbers as evidence that Fusion is intrinsically 3–4× faster).*
+
+*(Scope Oracle Caveat: Some standalone runs modified test/protected paths disallowed by the frozen scope oracle. The strict-score comparison is confounded by those protections not being communicated in standalone task prompts).*
 
 ### Honest Engineering Takeaways:
 - **Where Standalone Models Won**: Standalone models demonstrated higher single-step code synthesis accuracy on complex multi-service refactoring tasks.
-- **Where Fusion Won**: Massive context reduction (81.9% savings vs Codex), governance over scope boundaries, prevention of test-suite corruption, and automated peer review/repair cycles.
+- **Where Fusion Won**: Massive context reduction (81.9% savings vs Codex), governance over scope boundaries (standalone benchmark arms relied primarily on provider-native behavior, while Fusion centrally owned bounded context selection, change scope, verification, checkpoints, review and promotion), prevention of test-suite corruption, and automated peer review/repair cycles.
 - **Identified Weakness**: Multi-step sequential planning in Fusion remains susceptible to interface drift between plan steps.
 
 ---
@@ -82,4 +83,10 @@ In a frozen, 63-run held-out comparative evaluation across 7 software engineerin
 
 - **Architected a provider-agnostic multi-model AI coding-agent orchestrator** in Python that dynamically routes tasks across OpenAI Codex and Google Antigravity, implementing ephemeral Git worktree isolation, automated test verification, and cross-model peer review.
 - **Engineered a 3-tier deterministic repository context engine** (AST definitions, symbol call graphs, dependency imports) that reduced median input token consumption by **81.9% vs. standalone Codex** (66,980 vs. 370,525 tokens) across a frozen 63-run held-out evaluation suite.
-- **Implemented a durable checkpoint and recovery system** using SQLite WAL mode and atomic state transitions, enabling zero-loss task resumption and enforcing a mandatory interactive human promotion gate with unified diff inspection.
+- **Implemented a durable checkpoint and recovery system** using SQLite WAL mode and atomic state transitions, enabling durable task resumption across checkpointed and crash-injection scenarios and enforcing a mandatory interactive human promotion gate with unified diff inspection.
+
+---
+
+## 7. License & Status
+
+*No license has yet been selected for this repository. License selection is currently pending maintainer decision.*

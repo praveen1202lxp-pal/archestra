@@ -17,7 +17,7 @@ Model providers are strictly confined to generating structured textual edit spec
 
 ## 2. Why SQLite is Sufficient for Durable Orchestration State
 ### Decision:
-Fusion uses local SQLite (`.fusion/fusion.db`) via WAL mode (`journal_mode=WAL`) and Python's standard `sqlite3` module with an embedded migration engine for all task checkpoints, deliberation logs, token metrics, and promotion history.
+SQLite WAL was selected as a sufficient, low-operational-overhead durable state store for Fusion's local control plane. Fusion uses local SQLite (`.fusion/fusion.db`) via WAL mode (`journal_mode=WAL`) and Python's standard `sqlite3` module with an embedded migration engine for all task checkpoints, deliberation logs, token metrics, and promotion history.
 
 ### Rationale:
 - **Zero External Infrastructure**: Developers and CI runners should not require Docker, PostgreSQL, Redis, or cloud daemon setup to execute a coding task.

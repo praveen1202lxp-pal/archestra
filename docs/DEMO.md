@@ -77,10 +77,10 @@ This recording guide provides a turn-by-turn script, visual cues, terminal comma
     * Pre-flight check: verifying repository working tree is clean...
     * Allocated isolated worktree on task branch 'fusion/task-8f3b21'.
     * Indexing repository and selecting relevant files deterministically...
-    * Constructed bounded CodeContext (2 files: src/calculator.py, tests/test_calculator.py, ~420 tokens).
+    * Constructed bounded CodeContext (2 files: src/calculator.py, tests/test_calculator.py, bounded repository context extraction).
   ```
 - **Narration (Spoken)**:
-  > *"We give Fusion a concrete task. Notice what happens immediately: Fusion assesses the task as a low-risk single-file modification. Instead of sending our entire project tree, Fusion's repository indexer constructs a bounded context of just 420 tokens. Edits do not touch our active branch—Fusion provisions an isolated Git worktree on an ephemeral branch."*
+  > *"We give Fusion a concrete task. Notice what happens immediately: Fusion assesses the task as a low-risk single-file modification. Instead of sending our entire project tree, Fusion's repository indexer constructs a bounded repository context extraction. Edits do not touch our active branch—Fusion provisions an isolated Git worktree on an ephemeral branch."*
 
 ---
 
@@ -96,7 +96,7 @@ This recording guide provides a turn-by-turn script, visual cues, terminal comma
     * Peer review approved: "Clean implementation using Python ** operator with proper type annotations and test coverage."
   ```
 - **Narration (Spoken)**:
-  > *"Codex generates the implementation patch in the worktree. Fusion immediately executes the test suite. Once tests pass, the secondary model—here Antigravity running Gemini—acts as an adversarial peer reviewer, inspecting the unified diff to ensure no unrequested changes or test mutations occurred."*
+  > *"Codex generates the implementation patch in the worktree. Fusion immediately executes the test suite. Once tests pass, the secondary model—here Antigravity running Gemini—provides cross-model peer review / critique, inspecting the unified diff to ensure no unrequested changes or test mutations occurred."*
 
 ---
 
@@ -157,4 +157,4 @@ This recording guide provides a turn-by-turn script, visual cues, terminal comma
 
 ## Troubleshooting & Edge-Case Demos
 - **Demonstrating Rollback**: Reject the prompt with `N` or Enter to show clean worktree teardown.
-- **Demonstrating Resumption**: Kill the process with `Ctrl+C` mid-task, then run `fusion resume <task-id>` to demonstrate zero-loss resumption from the last recorded SQLite checkpoint.
+- **Demonstrating Resumption**: Kill the process with `Ctrl+C` mid-task, then run `fusion resume <task-id>` to demonstrate durable task resumption across checkpointed and crash-injection scenarios.

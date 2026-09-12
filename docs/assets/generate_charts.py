@@ -157,8 +157,8 @@ def generate_scope_chart(output_path: Path):
   <text x="413" y="197" class="val">38.1% (8/21)</text>
 
   <!-- Important Caveat Note -->
-  <text x="30" y="292" class="note">⚠ Caveat: Raw scope differences were partly affected by uncommunicated protected-path policies</text>
-  <text x="30" y="307" class="note">   for standalone systems, which had no external contract forbidding test modifications.</text>
+  <text x="30" y="292" class="note">⚠ Caveat: Some standalone runs modified test/protected paths disallowed by the frozen scope oracle.</text>
+  <text x="30" y="307" class="note">   The strict-score comparison is confounded by those protections not being communicated in standalone task prompts.</text>
 </svg>
 """
     output_path.write_text(svg, encoding="utf-8")
