@@ -21,8 +21,11 @@
       "base_url": null,
       "env_api_key": null,
       "extra_params": {
-        "effort": "high"
-      }
+        "effort": "low"
+      },
+      "flags": [
+        "--dangerously-skip-permissions"
+      ]
     }
   },
   "deliberation": {
