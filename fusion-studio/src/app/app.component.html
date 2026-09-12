@@ -1,0 +1,158 @@
+<div class="studio-app">
+  <!-- Top Navigation / Header Bar -->
+  <header class="top-header">
+    <div class="header-left">
+      <div class="brand">
+        <span class="logo-icon">⚡</span>
+        <span class="brand-title">Fusion Studio</span>
+      </div>
+      <div class="repo-badge" title="Active Project">
+        <span class="folder-icon">📂</span>
+        <span class="repo-name">{{ state.project().name }}</span>
+        @if (state.project().path) {
+          <span class="repo-path">({{ state.project().path }})</span>
+        }
+      </div>
+    </div>
+
+    <div class="header-right">
+      <!-- Provider Health Pills -->
+      <div class="provider-pills">
+        @for (p of state.providers(); track p.id) {
+          <div
+            class="pill"
+            [class.healthy]="p.healthy"
+            [class.unhealthy]="!p.healthy"
+            (click)="state.diagnosticsDrawerOpen.set(true)"
+            title="Click for provider diagnostics"
+          >
+            <span class="dot">●</span>
+            <span class="pill-name">{{ p.name.split(' ')[1] || p.id }}</span>
+            <span class="pill-status">{{ p.healthy ? '✓' : '✗' }}</span>
+          </div>
+        }
+      </div>
+
+      <!-- Quick Action Buttons -->
+      <button class="header-btn" (click)="state.diagnosticsDrawerOpen.set(true)" title="Run Doctor & Diagnostics">
+        🩺 Doctor
+      </button>
+      <button class="header-btn" (click)="showSettings = true" title="Project Configuration">
+        ⚙️ Settings
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Body Layout -->
+  <div class="studio-main-body">
+    <!-- Left Sidebar: Explorer & Task History -->
+    <aside class="left-sidebar">
+      <div class="sidebar-top">
+        <app-project-explorer></app-project-explorer>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-bottom">
+        <app-history-panel></app-history-panel>
+      </div>
+    </aside>
+
+    <!-- Center Workspace: Tabs & Monaco Editor -->
+    <main class="center-workspace">
+      <!-- Editor Tab Bar -->
+      <div class="tabs-bar">
+        @for (tab of state.openTabs(); track tab.id) {
+          <div
+            class="tab-item"
+            [class.active]="state.activeTab()?.id === tab.id && state.activeMainView() === 'editor'"
+            (click)="selectTab(tab)"
+          >
+            <span class="tab-name">{{ tab.name }}</span>
+            @if (tab.isDirty) {
+              <span class="dirty-indicator" title="Unsaved changes">●</span>
+            }
+            <span class="tab-close" (click)="closeTab(tab.id, $event)">✕</span>
+          </div>
+        }
+
+        @if (state.activeTask().diff) {
+          <div
+            class="tab-item diff-tab"
+            [class.active]="state.activeMainView() === 'diff'"
+            (click)="state.activeMainView.set('diff')"
+          >
+            <span class="tab-icon">⚖️</span>
+            <span class="tab-name">Unified Diff Inspection</span>
+          </div>
+        }
+      </div>
+
+      <!-- Main View Switcher -->
+      <div class="editor-view-container">
+        @if (state.activeMainView() === 'editor') {
+          @if (state.activeTab(); as curTab) {
+            <app-monaco-editor
+              mode="code"
+              [content]="curTab.content"
+              [language]="curTab.language"
+            ></app-monaco-editor>
+          } @else {
+            <div class="empty-editor-watermark">
+              <div class="watermark-content">
+                <div class="watermark-logo">⚡</div>
+                <h2>Fusion Studio</h2>
+                <p>AI-Native Coding IDE Control Plane</p>
+                <div class="shortcuts">
+                  <div>Select a file from the explorer on the left to edit.</div>
+                  <div>Use the Task Panel on the right to prompt autonomous runs.</div>
+                </div>
+              </div>
+            </div>
+          }
+        } @else if (state.activeMainView() === 'diff') {
+          <div class="diff-wrapper">
+            <app-task-panel></app-task-panel>
+          </div>
+        }
+      </div>
+    </main>
+
+    <!-- Right Workspace: Fusion Task Panel & Stepper -->
+    @if (state.activeMainView() !== 'diff') {
+      <aside class="right-task-panel">
+        <app-task-panel></app-task-panel>
+      </aside>
+    }
+  </div>
+
+  <!-- Bottom Status Bar -->
+  <app-status-bar></app-status-bar>
+
+  <!-- Modals & Drawers -->
+  @if (state.diagnosticsDrawerOpen()) {
+    <app-diagnostics-drawer></app-diagnostics-drawer>
+  }
+
+  @if (showSettings) {
+    <app-settings-dialog (close)="showSettings = false"></app-settings-dialog>
+  }
+
+  <!-- First-Run Overlay (if not opened) -->
+  @if (!state.project().opened) {
+    <div class="welcome-overlay">
+      <div class="welcome-card">
+        <div class="welcome-logo">⚡</div>
+        <h1>Welcome to Fusion Studio</h1>
+        <p>Open a repository to start multi-model autonomous orchestration.</p>
+        <div class="open-input-row">
+          <input
+            type="text"
+            placeholder="Path to Git repository (e.g. . or /path/to/project)..."
+            [(ngModel)]="openRepoPath"
+            (keyup.enter)="openProject()"
+          />
+          <button class="open-btn" (click)="openProject()">Open Repository</button>
+        </div>
+      </div>
+    </div>
+  }
+</div>

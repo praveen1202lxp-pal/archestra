@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Fusion Studio",
+  "version": "0.12.0",
+  "identifier": "com.fusionagent.studio",
+  "build": {
+    "beforeDevCommand": "npm run start",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:4200",
+    "frontendDist": "../dist/fusion-studio/browser"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Fusion Studio",
+        "width": 1300,
+        "height": 850,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}

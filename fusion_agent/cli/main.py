@@ -545,6 +545,14 @@ def cmd_mcp(args) -> int:
     return 0
 
 
+def cmd_studio_bridge(args) -> int:
+    """Start the JSON-RPC stdio UI bridge server for Fusion Studio desktop app."""
+    from fusion_agent.ui_bridge.server import UIBridgeServer
+    server = UIBridgeServer(initial_project_root=args.dir)
+    server.run()
+    return 0
+
+
 def cmd_interactive(args) -> int:
     """Start an interactive REPL session with Fusion Agent."""
     print_banner()
@@ -637,6 +645,9 @@ def main():
     # Interactive
     subparsers.add_parser("interactive", parents=[common_parser], help="Start an interactive session")
 
+    # Studio Bridge
+    subparsers.add_parser("studio-bridge", parents=[common_parser], help="Start stdio JSON-RPC UI bridge server for Fusion Studio")
+
     # MCP
     p_mcp = subparsers.add_parser("mcp", parents=[common_parser], help="Manage and inspect MCP tool servers")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_action")
@@ -667,6 +678,8 @@ def main():
         return cmd_resume(args)
     elif args.command == "interactive":
         return cmd_interactive(args)
+    elif args.command == "studio-bridge":
+        return cmd_studio_bridge(args)
     elif args.command == "mcp":
         return cmd_mcp(args)
     else:
