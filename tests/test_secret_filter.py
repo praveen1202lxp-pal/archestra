@@ -223,11 +223,21 @@ def test_repository_indexer_pre_m14_ignore_behavior(tmp_path):
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir / "app.py").write_text("print('hello')", encoding="utf-8")
 
+    cache_dir = tmp_path / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "data.txt").write_text("cached content", encoding="utf-8")
+
     indexer = RepositoryIndexer()
     proj_index = indexer.index_project(tmp_path)
-    indexed_paths = list(proj_index.file_tree.keys())
 
-    # Indexer discovers .fusion-notes/notes.md and src/app.py, but not .fusion/fusion.db
-    assert any(".fusion-notes/notes.md" in p for p in indexed_paths)
-    assert any("src/app.py" in p for p in indexed_paths)
-    assert not any(".fusion/fusion.db" in p for p in indexed_paths)
+    # Indexer discovers .fusion-notes/notes.md, src/app.py, and .cache/data.txt, but not .fusion/fusion.db
+    assert ".fusion-notes/notes.md" in proj_index.file_tree
+    assert "src/app.py" in proj_index.file_tree
+    assert ".cache/data.txt" in proj_index.file_tree
+    assert ".fusion/fusion.db" not in proj_index.file_tree
+    assert not any(p.startswith(".fusion/") or p == ".fusion" for p in proj_index.file_tree)
+
+    # And Studio explorer hides .cache/data.txt while keeping .fusion-notes/notes.md and src/app.py visible
+    assert mgr.should_ignore_explorer(".cache/data.txt")
+    assert not mgr.should_ignore_explorer(".fusion-notes/notes.md")
+    assert not mgr.should_ignore_explorer("src/app.py")
